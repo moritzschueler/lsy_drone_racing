@@ -8,7 +8,6 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
  
 from lsy_drone_racing.control import Controller
-
 from lsy_drone_racing.control.astar import astar_3d
 
 
