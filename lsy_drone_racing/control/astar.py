@@ -1,7 +1,7 @@
 """3D A* Pathfinding.
 
 Finds a collision-free path between two 3D coordinates on a voxel grid,
-avoiding a given set of obstacle voxel.
+avoiding a given set of obstacle voxels.
 """
 
 import heapq
