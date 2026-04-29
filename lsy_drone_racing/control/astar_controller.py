@@ -1,15 +1,29 @@
+"""A* based drone racing controller."""
+
+from typing import Any
+
 import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from crazyflow.sim.visualize import draw_line, draw_points
 
-from lsy_drone_racing.control.astar import astar_3d
 from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control.astar import astar_3d
+
 
 class PIDTracker:
     """Per-axis PID that outputs a correction in that axis."""
-    def __init__(self, kp, ki, kd, max_integral=2.0, max_output=5.0):
+
+    def __init__(
+        self,
+        kp: float,
+        ki: float,
+        kd: float,
+        max_integral: float = 2.0,
+        max_output: float = 5.0,
+    ):
+        """Initialize the PID tracker with gains and limits."""
         self.kp           = kp
         self.ki           = ki
         self.kd           = kd
@@ -19,12 +33,14 @@ class PIDTracker:
         self._last_error  = np.zeros(3)
         self._first       = True
 
-    def reset(self):
+    def reset(self) -> None:
+        """Reset integrator and derivative state."""
         self._integral   = np.zeros(3)
         self._last_error = np.zeros(3)
         self._first      = True
 
     def update(self, error: np.ndarray, dt: float) -> np.ndarray:
+        """Compute PID output given the current error and timestep."""
         self._integral += error * dt
         self._integral  = np.clip(self._integral, -self.max_integral, self.max_integral)
         if self._first:
@@ -36,8 +52,12 @@ class PIDTracker:
         output = self.kp * error + self.ki * self._integral + self.kd * derivative
         return np.clip(output, -self.max_output, self.max_output)
 
+
 class AstarController(Controller):
-    def __init__(self, obs, info, config):
+    """Drone racing controller using A* path planning and a cubic spline trajectory."""
+
+    def __init__(self, obs: dict, info: dict, config: Any):
+        """Initialize the A* controller, build the initial spline trajectory."""
         super().__init__(obs, info, config)
 
         self._freq     = config.env.freq
@@ -45,7 +65,7 @@ class AstarController(Controller):
         self._finished = False
         self.dt        = 1.0 / config.env.freq
 
-        self.cruise_speed    = 0.4 
+        self.cruise_speed    = 0.4
         self.look_ahead_dist = 0.0
 
         self.current_s   = 0.0
@@ -57,7 +77,7 @@ class AstarController(Controller):
         self.gate_offset       = 0.21
         self.gate_half_opening = 0.22
         self.max_obstacle_dist = 2
-                                      
+
         self._gate_corners = []
 
         self.pid_pos = PIDTracker(0.5, 0.01, 0.40, max_integral=1.0, max_output=3.0)
@@ -71,11 +91,10 @@ class AstarController(Controller):
 
         self.voxel_size = 0.1
 
-
         self._build_spline(obs)
 
-
-    def _build_arc_length_table(self, n_samples: int = 500):
+    def _build_arc_length_table(self, n_samples: int = 500) -> None:
+        """Build a lookup table mapping arc length to spline parameter t."""
         t_samp   = np.linspace(0, self._t_total, n_samples)
         pts      = self.spline(t_samp)
         seg_lens = np.linalg.norm(np.diff(pts, axis=0), axis=1)
@@ -85,11 +104,14 @@ class AstarController(Controller):
         self._s_to_t     = CubicSpline(arc_s, t_samp)
 
     def _s_to_spline(self, s: float) -> float:
+        """Convert an arc-length value to a spline parameter t."""
         s = float(np.clip(s, 0.0, self._arc_length))
         return float(np.clip(float(self._s_to_t(s)), 0.0, self._t_total))
 
-
-    def _gate_frame_obstacles(self, gates_pos, gates_quat):
+    def _gate_frame_obstacles(
+        self, gates_pos: np.ndarray, gates_quat: np.ndarray
+    ) -> list:
+        """Generate virtual obstacle points around gate frames to guide A* around them."""
         virtual_obs = []
         self._gate_corners = []
         GATE_INNER_HALF = 0.20
@@ -129,7 +151,8 @@ class AstarController(Controller):
 
         return virtual_obs
 
-    def _build_spline(self, obs):
+    def _build_spline(self, obs: dict) -> None:
+        """Build the A*-guided cubic spline trajectory from the current position through all gates."""
         start_pos  = obs["pos"]
         gates_pos  = obs["gates_pos"]
         gates_quat = obs["gates_quat"]
@@ -137,12 +160,10 @@ class AstarController(Controller):
 
         target_gate = int(obs["target_gate"])
 
-
         remaining_pos  = gates_pos[target_gate:]
         remaining_quat = gates_quat[target_gate:]
 
         gate_points = self._gate_frame_obstacles(gates_pos, gates_quat)
-
 
         sampled_rods = []
         ROD_MAX_HEIGHT = 2.0
@@ -172,7 +193,6 @@ class AstarController(Controller):
             raw_post_gate_waypoints.append(post_wp)
             gate_normals.append(gate_normal)
 
-
         final_waypoints = []
 
         for j, point in enumerate(astar_3d(
@@ -187,8 +207,6 @@ class AstarController(Controller):
                 final_waypoints.append(point)
         final_waypoints.append(raw_waypoints[0])
 
-
-
         for i in range(1, len(remaining_pos)):
             start = raw_post_gate_waypoints[i-1]
             end_pos   = raw_pre_gate_waypoints[i]
@@ -198,7 +216,11 @@ class AstarController(Controller):
                 obstacles=all_obstacles,
                 voxel_size=self.voxel_size,
                 obstacle_clearance=self.detour_margin,
-                gate_normal= (gate_normals[i-1], None) if i == len(remaining_pos) else (gate_normals[i-1], gate_normals[i]),
+                gate_normal=(
+                    (gate_normals[i-1], None)
+                    if i == len(remaining_pos)
+                    else (gate_normals[i-1], gate_normals[i])
+                ),
             )):
                 if k % 3 == 0:
                     final_waypoints.append(point)
@@ -209,7 +231,6 @@ class AstarController(Controller):
         waypoints     = np.vstack(final_waypoints)
         self._t_total = len(waypoints) - 1
         t_steps       = np.arange(len(waypoints))
-
 
         current_vel = np.array(obs.get("vel", [0.0, 0.0, 0.0]))
         speed = np.linalg.norm(current_vel)
@@ -224,9 +245,8 @@ class AstarController(Controller):
         self._build_arc_length_table()
         self._visual_trajectory = self.spline(np.linspace(0, self._t_total, 800))
 
-
-
-    def _state_changed(self, obs):
+    def _state_changed(self, obs: dict) -> bool:
+        """Return True if the relevant environment state has changed enough to warrant replanning."""
         if self._last_gates_pos is None:
             return True
 
@@ -250,14 +270,15 @@ class AstarController(Controller):
 
         return False
 
-    def _cache_state(self, obs):
+    def _cache_state(self, obs: dict) -> None:
+        """Cache the current gate and obstacle state for change detection."""
         self._last_gates_pos     = obs["gates_pos"].copy()
         self._last_gates_quat    = obs["gates_quat"].copy()
         self._last_obstacles_pos = obs["obstacles_pos"].copy()
         self._last_target_gate   = int(obs["target_gate"])
 
-
-    def compute_control(self, obs, info=None):
+    def compute_control(self, obs: dict, info: dict | None = None) -> np.ndarray:
+        """Compute the control action for the current timestep."""
         if self._state_changed(obs):
             actual_pos_before = np.array(obs["pos"])
             try:
@@ -270,7 +291,7 @@ class AstarController(Controller):
                 dists    = np.linalg.norm(pts - actual_pos_before, axis=1)
                 self.current_s = float(s_search[np.argmin(dists)])
 
-            except Exception as e:
+            except Exception:  # noqa: BLE001
                 pass
 
         target_s = min(self.current_s + self.look_ahead_dist, self._arc_length)
@@ -299,9 +320,16 @@ class AstarController(Controller):
             0, 0, 0,
         ], dtype=np.float32)
 
-
-
-    def step_callback(self, action, obs, reward, terminated, truncated, info):
+    def step_callback(
+        self,
+        action: np.ndarray,
+        obs: dict,
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Update the arc-length progress and check for episode completion."""
         drone_pos = np.array(obs["pos"])
 
         s_search = np.linspace(
@@ -326,7 +354,8 @@ class AstarController(Controller):
         self._tick += 1
         return self._finished
 
-    def episode_reset(self):
+    def episode_reset(self) -> None:
+        """Reset controller state at the start of a new episode."""
         self._tick     = 0
         self._finished = False
         self.current_s = 0.0
@@ -338,8 +367,8 @@ class AstarController(Controller):
         self._last_obstacles_pos = None
         self._last_target_gate   = -2
 
-
-    def render_callback(self, sim):
+    def render_callback(self, sim: Any) -> None:
+        """Draw the planned trajectory and current setpoint in the visualizer."""
         draw_line(sim, self._visual_trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
 
         t_now    = self._s_to_spline(

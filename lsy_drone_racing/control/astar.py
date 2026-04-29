@@ -1,6 +1,5 @@
-"""
-3D A* Pathfinding
------------------
+"""3D A* Pathfinding.
+
 Finds a collision-free path between two 3D coordinates on a voxel grid,
 avoiding a given set of obstacle voxels.
 """
@@ -8,6 +7,7 @@ avoiding a given set of obstacle voxels.
 import heapq
 import math
 from typing import Optional
+
 import numpy as np
 
 
@@ -50,7 +50,8 @@ def _heuristic(a: Voxel, b: Voxel) -> float:
 
 
 def _neighbors(voxel: Voxel) -> list[tuple[Voxel, float]]:
-    """
+    """Return all 26-connected neighbours (face, edge, and corner) together with the exact Euclidean step cost.
+
     Return all 26-connected neighbours (face, edge, and corner) together
     with the exact Euclidean step cost.
     """
@@ -70,7 +71,8 @@ def _expand_obstacles(
     blocked: set[Voxel],
     clearance_voxels: float,
 ) -> set[Voxel]:
-    """
+    """Dilate each obstacle voxel by *clearance_voxels* in all directions, returning the full set of voxels that are considered impassable.
+
     Dilate each obstacle voxel by *clearance_voxels* in all directions,
     returning the full set of voxels that are considered impassable.
 
@@ -110,7 +112,8 @@ def astar_3d(
     obstacle_clearance:  float = 0.0,
     gate_normal:        Optional[tuple[Coord3D, Coord3D]] = None,
 ) -> Optional[list[Coord3D]]:
-    """
+    """Find a path from *start* to *goal* in 3-D space, avoiding *obstacles* and keeping a minimum distance from them.
+
     Find a path from *start* to *goal* in 3-D space, avoiding *obstacles*
     and keeping a minimum distance from them.
 
@@ -129,7 +132,7 @@ def astar_3d(
                           units internally, so it should be expressed in the
                           same units as *voxel_size* and the coordinates.
 
-    Returns
+    Returns:
     -------
     A list of (x, y, z) world-space waypoints from start to goal
     (voxel centres), or ``None`` if no path exists.
@@ -154,15 +157,19 @@ def astar_3d(
         return [_to_world(start_v, voxel_size)]
 
     if start_v in blocked or goal_v in blocked:
-        
+
         if start_v in blocked:
-            start = np.array(start) - 0.2 * gate_normal[0] if gate_normal[0] is not None else np.array(start) - 0.2 * np.array([1, 0, 0])
+            start = (
+                np.array(start) - 0.2 * gate_normal[0]
+                if gate_normal[0] is not None
+                else np.array(start) - 0.2 * np.array([1, 0, 0])
+            )
             start_v = _to_voxel(start, voxel_size)
         if goal_v in blocked:
             goal = np.array(goal) + 0.2 * gate_normal[1]
-            goal_v = _to_voxel(goal, voxel_size)    
+            goal_v = _to_voxel(goal, voxel_size)
         # print("A*: Start or goal is inside an obstacle (or clearance zone).")
-        
+
 
     # Priority queue entries: (f_score, g_score, voxel)
     # g_score is included as a tiebreaker so equal f values are broken
