@@ -54,7 +54,7 @@ class AstarController(Controller):
 
         self.obstacle_radius   = 0.1
         self.detour_margin     = 0.22
-        self.gate_offset       = 0.22
+        self.gate_offset       = 0.21
         self.gate_half_opening = 0.22
         self.max_obstacle_dist = 2
                                       
