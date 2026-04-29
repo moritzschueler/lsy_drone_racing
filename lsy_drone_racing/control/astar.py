@@ -1,6 +1,5 @@
-"""
-3D A* Pathfinding
------------------
+"""3D A* Pathfinding.
+
 Finds a collision-free path between two 3D coordinates on a voxel grid,
 avoiding a given set of obstacle voxels.
 """
@@ -8,19 +7,20 @@ avoiding a given set of obstacle voxels.
 import heapq
 import math
 from typing import Optional
-import numpy as np
 
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
-Coord3D = tuple[float, float, float]   # world-space coordinates
-Voxel   = tuple[int,   int,   int]     # integer grid indices
+Coord3D = tuple[float, float, float]  # world-space coordinates
+Voxel = tuple[int, int, int]  # integer grid indices
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _to_voxel(coord: Coord3D, voxel_size: float) -> Voxel:
     """Snap a world-space coordinate to its voxel index."""
@@ -42,17 +42,13 @@ def _to_world(voxel: Voxel, voxel_size: float) -> Coord3D:
 
 def _heuristic(a: Voxel, b: Voxel) -> float:
     """3-D Euclidean distance heuristic (admissible for diagonal moves)."""
-    return math.sqrt(
-        (a[0] - b[0]) ** 2 +
-        (a[1] - b[1]) ** 2 +
-        (a[2] - b[2]) ** 2
-    )
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
 
 
 def _neighbors(voxel: Voxel) -> list[tuple[Voxel, float]]:
-    """
-    Return all 26-connected neighbours (face, edge, and corner) together
-    with the exact Euclidean step cost.
+    """Return all 26-connected neighbours with the exact Euclidean step cost.
+
+    Neighbours include face-, edge-, and corner-adjacent voxels (26-connectivity).
     """
     x, y, z = voxel
     result: list[tuple[Voxel, float]] = []
@@ -66,11 +62,9 @@ def _neighbors(voxel: Voxel) -> list[tuple[Voxel, float]]:
     return result
 
 
-def _expand_obstacles(
-    blocked: set[Voxel],
-    clearance_voxels: float,
-) -> set[Voxel]:
-    """
+def _expand_obstacles(blocked: set[Voxel], clearance_voxels: float) -> set[Voxel]:
+    """Dilate each obstacle voxel by *clearance_voxels*, returning all impassable voxels.
+
     Dilate each obstacle voxel by *clearance_voxels* in all directions,
     returning the full set of voxels that are considered impassable.
 
@@ -91,8 +85,8 @@ def _expand_obstacles(
     ]
 
     expanded: set[Voxel] = set()
-    for (ox, oy, oz) in blocked:
-        for (dx, dy, dz) in offsets:
+    for ox, oy, oz in blocked:
+        for dx, dy, dz in offsets:
             expanded.add((ox + dx, oy + dy, oz + dz))
 
     return expanded
@@ -102,15 +96,17 @@ def _expand_obstacles(
 # Core algorithm
 # ---------------------------------------------------------------------------
 
+
 def astar_3d(
-    start:               Coord3D,
-    goal:                Coord3D,
-    obstacles:           list[Coord3D],
-    voxel_size:          float,
-    obstacle_clearance:  float = 0.0,
-    gate_normal:        Optional[tuple[Coord3D, Coord3D]] = None,
+    start: Coord3D,
+    goal: Coord3D,
+    obstacles: list[Coord3D],
+    voxel_size: float,
+    obstacle_clearance: float = 0.0,
+    gate_normal: Optional[tuple[Coord3D, Coord3D]] = None,
 ) -> Optional[list[Coord3D]]:
-    """
+    """Find a collision-free path from *start* to *goal*, keeping clear of *obstacles*.
+
     Find a path from *start* to *goal* in 3-D space, avoiding *obstacles*
     and keeping a minimum distance from them.
 
@@ -129,7 +125,7 @@ def astar_3d(
                           units internally, so it should be expressed in the
                           same units as *voxel_size* and the coordinates.
 
-    Returns
+    Returns:
     -------
     A list of (x, y, z) world-space waypoints from start to goal
     (voxel centres), or ``None`` if no path exists.
@@ -147,22 +143,24 @@ def astar_3d(
     blocked = _expand_obstacles(raw_blocked, clearance_voxels)
 
     start_v = _to_voxel(start, voxel_size)
-    goal_v  = _to_voxel(goal,  voxel_size)
+    goal_v = _to_voxel(goal, voxel_size)
 
     # Trivial cases
     if start_v == goal_v:
         return [_to_world(start_v, voxel_size)]
 
     if start_v in blocked or goal_v in blocked:
-        
         if start_v in blocked:
-            start = np.array(start) - 0.2 * gate_normal[0] if gate_normal[0] is not None else np.array(start) - 0.2 * np.array([1, 0, 0])
+            start = (
+                np.array(start) - 0.2 * gate_normal[0]
+                if gate_normal[0] is not None
+                else np.array(start) - 0.2 * np.array([1, 0, 0])
+            )
             start_v = _to_voxel(start, voxel_size)
         if goal_v in blocked:
             goal = np.array(goal) + 0.2 * gate_normal[1]
-            goal_v = _to_voxel(goal, voxel_size)    
+            goal_v = _to_voxel(goal, voxel_size)
         # print("A*: Start or goal is inside an obstacle (or clearance zone).")
-        
 
     # Priority queue entries: (f_score, g_score, voxel)
     # g_score is included as a tiebreaker so equal f values are broken
@@ -171,8 +169,8 @@ def astar_3d(
     heapq.heappush(open_heap, (0.0, 0.0, start_v))
 
     came_from: dict[Voxel, Voxel] = {}
-    g_score:   dict[Voxel, float] = {start_v: 0.0}
-    in_open:   set[Voxel]         = {start_v}
+    g_score: dict[Voxel, float] = {start_v: 0.0}
+    in_open: set[Voxel] = {start_v}
 
     while open_heap:
         _, g_current, current = heapq.heappop(open_heap)
@@ -194,7 +192,7 @@ def astar_3d(
 
             if tentative_g < g_score.get(neighbor, math.inf):
                 came_from[neighbor] = current
-                g_score[neighbor]   = tentative_g
+                g_score[neighbor] = tentative_g
                 f = tentative_g + _heuristic(neighbor, goal_v)
                 heapq.heappush(open_heap, (f, tentative_g, neighbor))
                 in_open.add(neighbor)
@@ -204,9 +202,7 @@ def astar_3d(
 
 
 def _reconstruct_path(
-    came_from:  dict[Voxel, Voxel],
-    current:    Voxel,
-    voxel_size: float,
+    came_from: dict[Voxel, Voxel], current: Voxel, voxel_size: float
 ) -> list[Coord3D]:
     """Walk back through *came_from* and return world-space waypoints."""
     path: list[Voxel] = [current]
