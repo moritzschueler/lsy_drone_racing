@@ -1,14 +1,14 @@
 """A* based drone racing controller."""
 
 from typing import Any
-
+ 
 import numpy as np
+from crazyflow.sim.visualize import draw_line, draw_points
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
-
-from crazyflow.sim.visualize import draw_line, draw_points
-
+ 
 from lsy_drone_racing.control import Controller
+
 from lsy_drone_racing.control.astar import astar_3d
 
 
@@ -152,7 +152,7 @@ class AstarController(Controller):
         return virtual_obs
 
     def _build_spline(self, obs: dict) -> None:
-        """Build the A*-guided cubic spline trajectory from the current position through all gates."""
+        """Build the A*-guided cubic spline trajectory from current position through all gates."""
         start_pos  = obs["pos"]
         gates_pos  = obs["gates_pos"]
         gates_quat = obs["gates_quat"]
@@ -246,7 +246,7 @@ class AstarController(Controller):
         self._visual_trajectory = self.spline(np.linspace(0, self._t_total, 800))
 
     def _state_changed(self, obs: dict) -> bool:
-        """Return True if the relevant environment state has changed enough to warrant replanning."""
+        """Return True if the relevant environment state has changed enough to warrant a replan."""
         if self._last_gates_pos is None:
             return True
 

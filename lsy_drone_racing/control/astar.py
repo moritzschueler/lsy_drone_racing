@@ -50,10 +50,9 @@ def _heuristic(a: Voxel, b: Voxel) -> float:
 
 
 def _neighbors(voxel: Voxel) -> list[tuple[Voxel, float]]:
-    """Return all 26-connected neighbours (face, edge, and corner) together with the exact Euclidean step cost.
+    """Return all 26-connected neighbours with the exact Euclidean step cost.
 
-    Return all 26-connected neighbours (face, edge, and corner) together
-    with the exact Euclidean step cost.
+    Neighbours include face-, edge-, and corner-adjacent voxels (26-connectivity).
     """
     x, y, z = voxel
     result: list[tuple[Voxel, float]] = []
@@ -71,7 +70,7 @@ def _expand_obstacles(
     blocked: set[Voxel],
     clearance_voxels: float,
 ) -> set[Voxel]:
-    """Dilate each obstacle voxel by *clearance_voxels* in all directions, returning the full set of voxels that are considered impassable.
+    """Dilate each obstacle voxel by *clearance_voxels*, returning all impassable voxels.
 
     Dilate each obstacle voxel by *clearance_voxels* in all directions,
     returning the full set of voxels that are considered impassable.
@@ -112,7 +111,7 @@ def astar_3d(
     obstacle_clearance:  float = 0.0,
     gate_normal:        Optional[tuple[Coord3D, Coord3D]] = None,
 ) -> Optional[list[Coord3D]]:
-    """Find a path from *start* to *goal* in 3-D space, avoiding *obstacles* and keeping a minimum distance from them.
+    """Find a collision-free path from *start* to *goal*, keeping clear of *obstacles*.
 
     Find a path from *start* to *goal* in 3-D space, avoiding *obstacles*
     and keeping a minimum distance from them.
