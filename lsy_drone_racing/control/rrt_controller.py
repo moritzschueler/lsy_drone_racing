@@ -1,4 +1,4 @@
-"""A* based drone racing controller."""
+"""RRT* based drone racing controller."""
 
 from typing import Any
 
@@ -8,7 +8,7 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.astar import astar_3d
+from lsy_drone_racing.planning.rrt_star_planner import plan_rrt_star_path
 
 
 class PIDTracker:
@@ -47,11 +47,11 @@ class PIDTracker:
         return np.clip(output, -self.max_output, self.max_output)
 
 
-class AstarController(Controller):
-    """Drone racing controller using A* path planning and a cubic spline trajectory."""
+class RrtController(Controller):
+    """Drone racing controller using RRT* path planning and a cubic spline trajectory."""
 
     def __init__(self, obs: dict, info: dict, config: Any):
-        """Initialize the A* controller, build the initial spline trajectory."""
+        """Initialize the RRT* controller, build the initial spline trajectory."""
         super().__init__(obs, info, config)
 
         self._freq = config.env.freq
@@ -71,12 +71,14 @@ class AstarController(Controller):
         self.gate_offset = 0.35
         self.gate_half_opening = 0.22
         self.max_obstacle_dist = 2
+        self.rrt_max_time = 5.0
 
         self._gate_corners = []
         self._pre_gate_waypoints = []
         self._gate_center_waypoints = []
         self._post_gate_waypoints = []
 
+        # PID controllers - copied from A* controller
         self.pid_pos = PIDTracker(0.5, 0.01, 0.40, max_integral=1.0, max_output=3.0)
         self.pid_vel = PIDTracker(0.25, 0.01, 0.1, max_integral=0.5, max_output=2.0)
         self.pid_acc = PIDTracker(0.01, 0.00, 0.0, max_integral=0.2, max_output=1.0)
@@ -85,8 +87,6 @@ class AstarController(Controller):
         self._last_gates_quat = None
         self._last_obstacles_pos = None
         self._last_target_gate = -2
-
-        self.voxel_size = 0.1
 
         self._build_spline(obs)
 
@@ -105,134 +105,53 @@ class AstarController(Controller):
         s = float(np.clip(s, 0.0, self._arc_length))
         return float(np.clip(float(self._s_to_t(s)), 0.0, self._t_total))
 
-    def _gate_frame_obstacles(self, gates_pos: np.ndarray, gates_quat: np.ndarray) -> list:
-        """Generate virtual obstacle points around gate frames to guide A* around them."""
-        virtual_obs = []
-        self._gate_corners = []
-        GATE_INNER_HALF = 0.20
-        GATE_OUTER_HALF = 0.4
-
-        for i in range(len(gates_pos)):
-            r = R.from_quat(gates_quat[i])
-            lateral = r.apply([0, 1, 0])
-            lateral = np.array([lateral[0], lateral[1], 0.0])
-            lateral /= max(np.linalg.norm(lateral), 1e-6)
-
-            for half in (GATE_INNER_HALF, GATE_OUTER_HALF):
-                corners = []
-                for lat_sign in (+1, -1):
-                    for z_sign in (+1, -1):
-                        corner = (
-                            gates_pos[i]
-                            + lat_sign * half * lateral
-                            + np.array([0, 0, z_sign * half])
-                        )
-                        if half == GATE_OUTER_HALF:
-                            corners.append(corner)
-                        virtual_obs.append(corner)
-                        self._gate_corners.append(corner)
-
-                if half == GATE_OUTER_HALF:
-                    edges = [
-                        (corners[0], corners[2]),  # top:    +z edge
-                        (corners[1], corners[3]),  # bottom: -z edge
-                        (corners[0], corners[1]),  # right:  +lat edge
-                        (corners[2], corners[3]),  # left:   -lat edge
-                    ]
-
-                    for a, b in edges:
-                        for t in (0.2, 0.4, 0.6, 0.8):
-                            pt = a + t * (b - a)
-                            virtual_obs.append(pt)
-                            self._gate_corners.append(pt)
-
-        return virtual_obs
-
     def _build_spline(self, obs: dict) -> None:
-        """Build the A*-guided cubic spline trajectory from current position through all gates."""
-        start_pos = obs["pos"]
-        gates_pos = obs["gates_pos"]
-        gates_quat = obs["gates_quat"]
-        obstacles = obs["obstacles_pos"]
+        """Build the RRT*-guided cubic spline trajectory from current position through all gates."""
+        start_pos = np.array(obs["pos"])
+        gates_pos = np.array(obs["gates_pos"])
+        gates_quat = np.array(obs["gates_quat"])
+        obstacles = np.array(obs["obstacles_pos"])
 
         target_gate = int(obs["target_gate"])
 
         remaining_pos = gates_pos[target_gate:]
         remaining_quat = gates_quat[target_gate:]
 
-        gate_points = self._gate_frame_obstacles(gates_pos, gates_quat)
-
-        sampled_rods = []
-        ROD_MAX_HEIGHT = 2.0
-        ROD_STEP = 0.20
-
-        for rod_pos in obstacles:
-            zs = np.arange(0.0, ROD_MAX_HEIGHT + ROD_STEP, ROD_STEP)
-            for z in zs:
-                sampled_rods.append(np.array([rod_pos[0], rod_pos[1], z]))
-
-        all_obstacles = gate_points + sampled_rods
-
+        # Compute milestones for visualization
         raw_pre_gate_waypoints = []
         raw_waypoints = []
         raw_post_gate_waypoints = []
-        gate_normals = []
-
+        
         for i in range(len(remaining_pos)):
             r = R.from_quat(remaining_quat[i])
             gate_normal = r.apply([1, 0, 0])
-
+            
             pre_wp = remaining_pos[i] - gate_normal * self.gate_offset
             post_wp = remaining_pos[i] + gate_normal * self.gate_offset
-
+            
             raw_pre_gate_waypoints.append(pre_wp)
             raw_waypoints.append(remaining_pos[i].copy())
             raw_post_gate_waypoints.append(post_wp)
-            gate_normals.append(gate_normal)
 
-        final_waypoints = []
-
-        for j, point in enumerate(
-            astar_3d(
-                start=start_pos,
-                goal=raw_pre_gate_waypoints[0],
-                obstacles=all_obstacles,
-                voxel_size=self.voxel_size,
-                obstacle_clearance=self.detour_margin,
-                gate_normal=(None, gate_normals[0]),
-            )
-        ):
-            if j % 3 == 0:
-                final_waypoints.append(point)
-        final_waypoints.append(raw_waypoints[0])
-
-        for i in range(1, len(remaining_pos)):
-            start = raw_post_gate_waypoints[i - 1]
-            end_pos = raw_pre_gate_waypoints[i]
-            for k, point in enumerate(
-                astar_3d(
-                    start=start,
-                    goal=end_pos,
-                    obstacles=all_obstacles,
-                    voxel_size=self.voxel_size,
-                    obstacle_clearance=self.detour_margin,
-                    gate_normal=(
-                        (gate_normals[i - 1], None)
-                        if i == len(remaining_pos)
-                        else (gate_normals[i - 1], gate_normals[i])
-                    ),
-                )
-            ):
-                if k % 3 == 0:
-                    final_waypoints.append(point)
-            final_waypoints.append(raw_waypoints[i])
-        final_waypoints.append(raw_waypoints[-1])
-        final_waypoints.append(raw_post_gate_waypoints[-1])
+        if len(remaining_pos) == 0:
+            # No more gates
+            final_waypoints = [start_pos]
+        else:
+            # Use RRT* planner for path planning
+            try:
+                final_waypoints = plan_rrt_star_path(
+                    start_pos, remaining_pos, remaining_quat, obstacles, self
+                ).tolist()
+            except Exception as e:  # noqa: BLE001
+                # Fallback: simple linear path through gates
+                final_waypoints = [start_pos]
+                for gate_pos in remaining_pos:
+                    final_waypoints.append(gate_pos)
 
         # Store milestones for visualization
-        self._pre_gate_waypoints = np.array(raw_pre_gate_waypoints)
-        self._gate_center_waypoints = np.array(raw_waypoints)
-        self._post_gate_waypoints = np.array(raw_post_gate_waypoints)
+        self._pre_gate_waypoints = np.array(raw_pre_gate_waypoints) if raw_pre_gate_waypoints else np.array([])
+        self._gate_center_waypoints = np.array(raw_waypoints) if raw_waypoints else np.array([])
+        self._post_gate_waypoints = np.array(raw_post_gate_waypoints) if raw_post_gate_waypoints else np.array([])
 
         waypoints = np.vstack(final_waypoints)
         self._t_total = len(waypoints) - 1
@@ -377,15 +296,11 @@ class AstarController(Controller):
 
     def render_callback(self, sim: Any) -> None:
         """Draw the planned trajectory and current setpoint in the visualizer."""
-        draw_line(sim, self._visual_trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
+        draw_line(sim, self._visual_trajectory, rgba=(0.0, 0.5, 1.0, 1.0))
 
         t_now = self._s_to_spline(min(self.current_s + self.look_ahead_dist, self._arc_length))
         setpoint = self.spline(t_now).reshape(1, -1)
-        draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.02)
-
-        if self._gate_corners:
-            corners = np.array(self._gate_corners)
-            draw_points(sim, corners, rgba=(1.0, 0.5, 0.0, 1.0), size=0.03)
+        draw_points(sim, setpoint, rgba=(0.5, 0.5, 1.0, 1.0), size=0.02)
 
         # Visualize waypoint milestones
         if len(self._pre_gate_waypoints) > 0:
