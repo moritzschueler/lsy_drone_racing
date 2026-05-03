@@ -129,97 +129,79 @@ def _plan_rrt_star_segment(
     Returns:
         List of waypoints (excluding start and goal)
     """
-    print(f"DEBUG: _plan_rrt_star_segment start={start}, goal={goal}")
-    # Create state space
     space = ob.RealVectorStateSpace(3)
-    print("DEBUG: Created state space")
-    
-    # Set bounds - use generous bounds based on start/goal
+
     bounds = ob.RealVectorBounds(3)
-    all_points = [start, goal] + obstacles
-    all_points_arr = np.array(all_points)
-    
-    min_coords = np.min(all_points_arr, axis=0) - 5.0
-    max_coords = np.max(all_points_arr, axis=0) + 5.0
-    
+    all_points_arr = np.array([start, goal] + obstacles) if obstacles else np.vstack([start, goal])
+    min_coords = all_points_arr.min(axis=0) - 5.0
+    max_coords = all_points_arr.max(axis=0) + 5.0
     for i in range(3):
         bounds.setLow(i, float(min_coords[i]))
         bounds.setHigh(i, float(max_coords[i]))
-    
     space.setBounds(bounds)
-    
-    # Create space information
+
     si = ob.SpaceInformation(space)
-    
-    # Set state validity checker (collision checking)
+
+    # Pre-build obstacle array and squared threshold once; isValid is called ~hundreds of thousands
+    # of times per planning call, so avoiding a Python loop here matters a lot.
+    obs_arr = np.array(obstacles, dtype=np.float64) if obstacles else np.empty((0, 3))
+    min_dist_sq = float((obstacle_radius + 0.05) ** 2)
+
     class CollisionChecker(ob.StateValidityChecker):
         def isValid(self, state):
-            pos = np.array([state[i] for i in range(3)])
-            # Check distance to all obstacles
-            for obs in obstacles:
-                dist = np.linalg.norm(pos - np.array(obs))
-                if dist < obstacle_radius + 0.05:  # 5cm safety margin
-                    return False
-            return True
+            pos = np.array([state[0], state[1], state[2]])
+            if not obs_arr.size:
+                return True
+            d = obs_arr - pos
+            return not bool(np.any((d * d).sum(axis=1) < min_dist_sq))
     
-    si.setStateValidityChecker(CollisionChecker(si))
+    # Keep a Python reference to the checker so it isn't GC'd while OMPL holds a C++ pointer to it.
+    checker = CollisionChecker(si)
+    si.setStateValidityChecker(checker)
     si.setup()
-    
-    # Set start and goal
+
+    # allocState() returns an owning Python object; do NOT call si.freeState() explicitly —
+    # the binding's destructor will free the C++ memory automatically.
     start_state = si.allocState()
     for i in range(3):
         start_state[i] = start[i]
-    
+
     goal_state = si.allocState()
     for i in range(3):
         goal_state[i] = goal[i]
-    
+
     # Check if start and goal states are valid
     if not si.isValid(start_state):
-        # Start state is invalid - return straight line
-        si.freeState(start_state)
-        si.freeState(goal_state)
         return [start + (goal - start) * t for t in np.linspace(0.1, 0.9, 5)]
-    
+
     if not si.isValid(goal_state):
-        # Goal state is invalid - return straight line
-        si.freeState(start_state)
-        si.freeState(goal_state)
         return [start + (goal - start) * t for t in np.linspace(0.1, 0.9, 5)]
-    
-    try:
-        pdef = ob.ProblemDefinition(si)
-        pdef.setStartAndGoalStates(start_state, goal_state)
-        
-        # Create RRT* planner
-        planner = og.RRTstar(si)
-        planner.setProblemDefinition(pdef)
-        planner.setup()
-        
-        # Solve
-        solved = planner.solve(planning_time)
-        
-        if not solved:
-            # Fall back to straight line if planning fails
-            return [start + (goal - start) * t for t in np.linspace(0.1, 0.9, 5)]
-        
-        # Extract solution path - use a simple approach
-        solution_path = pdef.getSolutionPath()
-        num_states = solution_path.getStateCount()
-        
-        waypoints = []
-        # Extract intermediate waypoints, excluding first and last
-        for i in range(1, num_states - 1):
-            state = solution_path.getState(i)
-            pos = np.array([float(state[j]) for j in range(3)])
-            waypoints.append(pos)
-        
-        # Return waypoints or interpolated line
-        return waypoints if waypoints else [start + (goal - start) * t for t in np.linspace(0.1, 0.9, 5)]
-    finally:
-        # Clean up OMPL states
-        si.freeState(start_state)
-        si.freeState(goal_state)
+
+    pdef = ob.ProblemDefinition(si)
+    pdef.setStartAndGoalStates(start_state, goal_state)
+
+    # Create RRT* planner
+    planner = og.RRTstar(si)
+    planner.setProblemDefinition(pdef)
+    planner.setup()
+
+    # Solve
+    solved = planner.solve(planning_time)
+
+    if not solved:
+        return [start + (goal - start) * t for t in np.linspace(0.1, 0.9, 5)]
+
+    # Extract solution path
+    solution_path = pdef.getSolutionPath()
+    num_states = solution_path.getStateCount()
+
+    waypoints = []
+    for i in range(1, num_states - 1):
+        state = solution_path.getState(i)
+        pos = np.array([float(state[j]) for j in range(3)])
+        waypoints.append(pos)
+
+    return waypoints if waypoints else [start + (goal - start) * t for t in np.linspace(0.1, 0.9, 5)]
 
 
 def _gate_frame_obstacles(

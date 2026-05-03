@@ -1,5 +1,6 @@
 """RRT* based drone racing controller."""
 
+import threading
 from typing import Any
 
 import numpy as np
@@ -71,12 +72,12 @@ class RrtController(Controller):
         self.gate_offset = 0.35
         self.gate_half_opening = 0.22
         self.max_obstacle_dist = 2
-        self.rrt_max_time = 5.0
+        self.rrt_max_time = 1.0  # per segment; runs in background so keeps sim real-time
 
         self._gate_corners = []
-        self._pre_gate_waypoints = []
-        self._gate_center_waypoints = []
-        self._post_gate_waypoints = []
+        self._pre_gate_waypoints = np.array([])
+        self._gate_center_waypoints = np.array([])
+        self._post_gate_waypoints = np.array([])
 
         # PID controllers - copied from A* controller
         self.pid_pos = PIDTracker(0.5, 0.01, 0.40, max_integral=1.0, max_output=3.0)
@@ -88,7 +89,18 @@ class RrtController(Controller):
         self._last_obstacles_pos = None
         self._last_target_gate = -2
 
-        self._build_spline(obs)
+        # Background planning state.  _next_plan is written by the bg thread and read by the main
+        # thread; CPython's GIL makes a single attribute assignment atomic, so no explicit lock is
+        # needed.  _plan_gen lets us discard results from superseded planning runs.
+        self._next_plan: np.ndarray | None = None
+        self._plan_gen: int = 0
+        self._bg_thread: threading.Thread | None = None
+
+        # Build an immediate straight-line fallback so the drone can start flying right away,
+        # then kick off RRT* in the background.
+        self._build_fallback_spline(obs)
+        self._cache_state(obs)
+        self._start_bg_plan(obs)
 
     def _build_arc_length_table(self, n_samples: int = 500) -> None:
         """Build a lookup table mapping arc length to spline parameter t."""
@@ -105,70 +117,84 @@ class RrtController(Controller):
         s = float(np.clip(s, 0.0, self._arc_length))
         return float(np.clip(float(self._s_to_t(s)), 0.0, self._t_total))
 
-    def _build_spline(self, obs: dict) -> None:
-        """Build the RRT*-guided cubic spline trajectory from current position through all gates."""
+    def _update_milestones(self, remaining_pos: np.ndarray, remaining_quat: np.ndarray) -> None:
+        """Recompute the pre/center/post gate visualization waypoints."""
+        pre, center, post = [], [], []
+        for i in range(len(remaining_pos)):
+            normal = R.from_quat(remaining_quat[i]).apply([1, 0, 0])
+            pre.append(remaining_pos[i] - normal * self.gate_offset)
+            center.append(remaining_pos[i].copy())
+            post.append(remaining_pos[i] + normal * self.gate_offset)
+        self._pre_gate_waypoints = np.array(pre) if pre else np.array([])
+        self._gate_center_waypoints = np.array(center) if center else np.array([])
+        self._post_gate_waypoints = np.array(post) if post else np.array([])
+
+    def _apply_waypoints(self, waypoints: np.ndarray, obs: dict) -> None:
+        """Fit a cubic spline to waypoints and rebuild the arc-length table."""
+        if len(waypoints) < 2:
+            waypoints = np.vstack([waypoints, waypoints + [0, 0, 0.01]])
+        t_steps = np.arange(len(waypoints))
+        self._t_total = float(len(waypoints) - 1)
+        vel = np.array(obs.get("vel", [0.0, 0.0, 0.0]))
+        speed = np.linalg.norm(vel)
+        if speed > 0.1:
+            tangent = (vel / speed) * np.linalg.norm(waypoints[1] - waypoints[0])
+            self.spline = CubicSpline(t_steps, waypoints, bc_type=((1, tangent), "natural"))
+        else:
+            self.spline = CubicSpline(t_steps, waypoints, bc_type="natural")
+        self._build_arc_length_table()
+        self._visual_trajectory = self.spline(np.linspace(0, self._t_total, 800))
+
+    def _reanchor(self, pos: np.ndarray) -> None:
+        """Set current_s to the closest point on the current spline to pos."""
+        limit = min(self._arc_length, self.cruise_speed * 3.0)
+        s_search = np.linspace(0.0, limit, 200)
+        pts = self.spline(np.array([self._s_to_spline(s) for s in s_search]))
+        self.current_s = float(s_search[np.linalg.norm(pts - pos, axis=1).argmin()])
+
+    def _build_fallback_spline(self, obs: dict) -> None:
+        """Build an immediate straight-line spline through remaining gates (no planning)."""
         start_pos = np.array(obs["pos"])
         gates_pos = np.array(obs["gates_pos"])
         gates_quat = np.array(obs["gates_quat"])
-        obstacles = np.array(obs["obstacles_pos"])
-
         target_gate = int(obs["target_gate"])
-
         remaining_pos = gates_pos[target_gate:]
         remaining_quat = gates_quat[target_gate:]
-
-        # Compute milestones for visualization
-        raw_pre_gate_waypoints = []
-        raw_waypoints = []
-        raw_post_gate_waypoints = []
-        
-        for i in range(len(remaining_pos)):
-            r = R.from_quat(remaining_quat[i])
-            gate_normal = r.apply([1, 0, 0])
-            
-            pre_wp = remaining_pos[i] - gate_normal * self.gate_offset
-            post_wp = remaining_pos[i] + gate_normal * self.gate_offset
-            
-            raw_pre_gate_waypoints.append(pre_wp)
-            raw_waypoints.append(remaining_pos[i].copy())
-            raw_post_gate_waypoints.append(post_wp)
-
+        self._update_milestones(remaining_pos, remaining_quat)
         if len(remaining_pos) == 0:
-            # No more gates
-            final_waypoints = [start_pos]
+            waypoints = start_pos.reshape(1, 3)
         else:
-            # Use RRT* planner for path planning
+            waypoints = np.vstack([start_pos, remaining_pos])
+        self._apply_waypoints(waypoints, obs)
+
+    def _start_bg_plan(self, obs: dict) -> None:
+        """Snapshot current state and launch RRT* in a daemon thread."""
+        self._plan_gen += 1
+        gen = self._plan_gen
+        obs_snap = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in obs.items()}
+
+        def _run() -> None:
             try:
-                final_waypoints = plan_rrt_star_path(
+                start_pos = np.array(obs_snap["pos"])
+                gates_pos = np.array(obs_snap["gates_pos"])
+                gates_quat = np.array(obs_snap["gates_quat"])
+                obstacles = np.array(obs_snap["obstacles_pos"])
+                target_gate = int(obs_snap["target_gate"])
+                remaining_pos = gates_pos[target_gate:]
+                remaining_quat = gates_quat[target_gate:]
+                if len(remaining_pos) == 0:
+                    return
+                waypoints = plan_rrt_star_path(
                     start_pos, remaining_pos, remaining_quat, obstacles, self
-                ).tolist()
-            except Exception as e:  # noqa: BLE001
-                # Fallback: simple linear path through gates
-                final_waypoints = [start_pos]
-                for gate_pos in remaining_pos:
-                    final_waypoints.append(gate_pos)
+                )
+                # Only stage if this is still the latest planning request (GIL makes this atomic).
+                if gen == self._plan_gen:
+                    self._next_plan = waypoints
+            except Exception:  # noqa: BLE001
+                pass
 
-        # Store milestones for visualization
-        self._pre_gate_waypoints = np.array(raw_pre_gate_waypoints) if raw_pre_gate_waypoints else np.array([])
-        self._gate_center_waypoints = np.array(raw_waypoints) if raw_waypoints else np.array([])
-        self._post_gate_waypoints = np.array(raw_post_gate_waypoints) if raw_post_gate_waypoints else np.array([])
-
-        waypoints = np.vstack(final_waypoints)
-        self._t_total = len(waypoints) - 1
-        t_steps = np.arange(len(waypoints))
-
-        current_vel = np.array(obs.get("vel", [0.0, 0.0, 0.0]))
-        speed = np.linalg.norm(current_vel)
-
-        if speed > 0.1:
-            dist_to_next = np.linalg.norm(waypoints[1] - waypoints[0])
-            start_tangent = (current_vel / speed) * dist_to_next
-            self.spline = CubicSpline(t_steps, waypoints, bc_type=((1, start_tangent), "natural"))
-        else:
-            self.spline = CubicSpline(t_steps, waypoints, bc_type="natural")
-
-        self._build_arc_length_table()
-        self._visual_trajectory = self.spline(np.linspace(0, self._t_total, 800))
+        self._bg_thread = threading.Thread(target=_run, daemon=True)
+        self._bg_thread.start()
 
     def _state_changed(self, obs: dict) -> bool:
         """Return True if the relevant environment state has changed enough to warrant a replan."""
@@ -202,20 +228,20 @@ class RrtController(Controller):
 
     def compute_control(self, obs: dict, info: dict | None = None) -> np.ndarray:
         """Compute the control action for the current timestep."""
+        pos = np.array(obs["pos"])
+
         if self._state_changed(obs):
-            actual_pos_before = np.array(obs["pos"])
-            try:
-                self._build_spline(obs)
-                self._cache_state(obs)
+            self._cache_state(obs)
+            self._build_fallback_spline(obs)
+            self._reanchor(pos)
+            self._start_bg_plan(obs)
 
-                s_search = np.linspace(0.0, min(self._arc_length, self.cruise_speed * 3.0), 200)
-                t_search = np.array([self._s_to_spline(s) for s in s_search])
-                pts = self.spline(t_search)
-                dists = np.linalg.norm(pts - actual_pos_before, axis=1)
-                self.current_s = float(s_search[np.argmin(dists)])
-
-            except Exception:  # noqa: BLE001
-                pass
+        # Swap in the RRT* result as soon as the background thread finishes.
+        pending = self._next_plan
+        if pending is not None:
+            self._next_plan = None
+            self._apply_waypoints(pending, obs)
+            self._reanchor(pos)
 
         target_s = min(self.current_s + self.look_ahead_dist, self._arc_length)
         t = self._s_to_spline(target_s)
@@ -228,10 +254,9 @@ class RrtController(Controller):
         ref_vel = spline_tangent * dt_ds * self.cruise_speed
         ref_acc = self.spline(t, 2) * dt_ds**2 * self.cruise_speed**2
 
-        actual_pos = np.array(obs["pos"])
         actual_vel = np.array(obs["vel"])
 
-        pos_correction = self.pid_pos.update(ref_pos - actual_pos, self.dt)
+        pos_correction = self.pid_pos.update(ref_pos - pos, self.dt)
         vel_correction = self.pid_vel.update(ref_vel - actual_vel, self.dt)
         acc_correction = self.pid_acc.update(ref_acc, self.dt)
 
@@ -293,17 +318,20 @@ class RrtController(Controller):
         self._last_gates_quat = None
         self._last_obstacles_pos = None
         self._last_target_gate = -2
+        self._next_plan = None
+        self._plan_gen += 1  # invalidate any in-flight background plan
 
     def render_callback(self, sim: Any) -> None:
         """Draw the planned trajectory and current setpoint in the visualizer."""
         draw_line(sim, self._visual_trajectory, rgba=(0.0, 0.5, 1.0, 1.0))
 
-        t_now = self._s_to_spline(min(self.current_s + self.look_ahead_dist, self._arc_length))
-        setpoint = self.spline(t_now).reshape(1, -1)
-        draw_points(sim, setpoint, rgba=(0.5, 0.5, 1.0, 1.0), size=0.02)
+        # Disabled: causes apparent collisions with the drone (markers are visual-only but
+        # visually interfere; re-enable for debugging by uncommenting the two lines below).
+        # t_now = self._s_to_spline(min(self.current_s + self.look_ahead_dist, self._arc_length))
+        # draw_points(sim, self.spline(t_now).reshape(1, -1), rgba=(0.5, 0.5, 1.0, 1.0), size=0.02)
 
         # Visualize waypoint milestones
-        if len(self._pre_gate_waypoints) > 0:
-            draw_points(sim, self._pre_gate_waypoints, rgba=(0.0, 0.0, 1.0, 1.0), size=0.04)  # Blue
-            draw_points(sim, self._gate_center_waypoints, rgba=(0.0, 1.0, 1.0, 1.0), size=0.05)  # Cyan
-            draw_points(sim, self._post_gate_waypoints, rgba=(1.0, 1.0, 0.0, 1.0), size=0.04)  # Yellow
+        #if len(self._pre_gate_waypoints) > 0:
+        #    draw_points(sim, self._pre_gate_waypoints, rgba=(0.0, 0.0, 1.0, 1.0), size=0.012)
+        #    draw_points(sim, self._gate_center_waypoints, rgba=(0.0, 1.0, 1.0, 1.0), size=0.015)
+        #    draw_points(sim, self._post_gate_waypoints, rgba=(1.0, 1.0, 0.0, 1.0), size=0.012)
