@@ -1,5 +1,6 @@
 """A naive RL pipeline for drone racing."""
 
+import pickle
 import random
 import time
 from dataclasses import dataclass
@@ -7,13 +8,12 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 import fire
+import flax.linen as nn
 import gymnasium as gym
 import jax
-import jax.numpy as jp
+import jax.numpy as jnp
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import optax
 import wandb
 from crazyflow.envs.drone_env import DroneEnv
 from crazyflow.envs.norm_actions_wrapper import NormalizeActions
@@ -25,16 +25,16 @@ from gymnasium import spaces
 from gymnasium.spaces import flatten_space
 from gymnasium.vector import VectorEnv, VectorObservationWrapper, VectorRewardWrapper
 from gymnasium.vector.utils import batch_space
-from gymnasium.wrappers.vector.jax_to_torch import JaxToTorch
 from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
 from ml_collections import ConfigDict
 from scipy.interpolate import CubicSpline
-from torch import Tensor
-from torch.distributions.normal import Normal
 
 from lsy_drone_racing.envs.race_core import build_dynamics_disturbance_fn, rng_spec2fn
 from lsy_drone_racing.utils import load_config
+
+# Keep jp alias used throughout the environment classes
+jp = jnp
 
 
 # region Arguments
@@ -44,12 +44,8 @@ class Args:
 
     seed: int = 42
     """seed of the experiment"""
-    torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
     jax_device: str = "gpu"
-    """environment device"""
+    """environment and training device"""
     wandb_project_name: str = "ADR-PPO-Racing"
     """the wandb's project name"""
     wandb_entity: str = None
@@ -459,10 +455,6 @@ def set_seeds(seed: int):
     """Seed everything."""
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 # region MakeEnvs
@@ -470,7 +462,6 @@ def make_envs(
     config: str = "level0.toml",
     num_envs: int = None,
     jax_device: str = "cpu",
-    torch_device: torch.device = torch.device("cpu"),
     coefs: dict = {},
 ) -> VectorEnv:
     """Make environments for training RL policy."""
@@ -495,77 +486,81 @@ def make_envs(
         d_act_xy_coef=coefs.get("d_act_xy_coef", 1.0),
     )
     env = FlattenJaxObservation(env)
-    env = JaxToTorch(env, torch_device)
     return env
-
-
-def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Module:
-    """Initialize layer."""
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
 
 
 # region Agent
 class Agent(nn.Module):
-    """RL Agent."""
+    """RL Agent implemented as a Flax linen module.
 
-    def __init__(self, obs_shape: tuple, action_shape: tuple):
-        """Init network structures."""
-        super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(torch.tensor(obs_shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(torch.tensor(obs_shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, torch.tensor(action_shape).prod()), std=0.01),
-            nn.Tanh(),
-        )
-        self.actor_logstd = nn.Parameter(
-            torch.Tensor([[-1, -1, -1, 1]])  # start with smaller std for roll, pitch, yaw
-        )
+    The forward pass returns (action_mean, log_std, value). Separate helper functions
+    handle action sampling and log-probability computation.
+    """
 
-    def get_value(self, x: Tensor) -> Tensor:
-        """Value estimation."""
-        return self.critic(x)
+    action_dim: int
 
-    def get_action_and_value(
-        self, x: Tensor, action: Tensor | None = None, deterministic: bool = False
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Action output."""
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        # During learning the agent explores the environment by sampling actions from a Normal
-        # distribution. The standard deviation is a learnable parameter that should decrease during
-        # training as the agent gets more confident in its actions.
-        probs = Normal(action_mean, action_std)
-        if action is None:
-            action = probs.sample() if not deterministic else action_mean
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+    @nn.compact
+    def __call__(self, x: Array) -> tuple[Array, Array, Array]:
+        """Forward pass.
+
+        Args:
+            x: Observation tensor of shape (batch, obs_dim).
+
+        Returns:
+            Tuple of (action_mean, log_std, value) with shapes
+            (batch, action_dim), (1, action_dim), (batch, 1).
+        """
+        orth = nn.initializers.orthogonal
+        zeros = nn.initializers.zeros
+
+        # Critic
+        v = nn.Dense(64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros)(x)
+        v = nn.tanh(v)
+        v = nn.Dense(64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros)(v)
+        v = nn.tanh(v)
+        value = nn.Dense(1, kernel_init=orth(1.0), bias_init=zeros)(v)
+
+        # Actor
+        m = nn.Dense(64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros)(x)
+        m = nn.tanh(m)
+        m = nn.Dense(64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros)(m)
+        m = nn.tanh(m)
+        mean = nn.tanh(nn.Dense(self.action_dim, kernel_init=orth(0.01), bias_init=zeros)(m))
+
+        # Learnable log std: lower for roll/pitch/yaw, higher for thrust
+        log_std = self.param("log_std", lambda _: jnp.array([[-1.0, -1.0, -1.0, 1.0]]))
+
+        return mean, log_std, value
+
+
+def _log_prob(action: Array, mean: Array, log_std: Array) -> Array:
+    """Compute log probability of actions under a diagonal Gaussian."""
+    std = jnp.exp(log_std)
+    return jnp.sum(
+        -0.5 * ((action - mean) / std) ** 2 - log_std - 0.5 * jnp.log(2.0 * jnp.pi),
+        axis=-1,
+    )
+
+
+def _entropy(log_std: Array, batch_size: int) -> Array:
+    """Compute entropy of a diagonal Gaussian, broadcast to batch."""
+    per_dim = 0.5 * jnp.log(2.0 * jnp.pi * jnp.e) + log_std  # (1, action_dim)
+    return jnp.broadcast_to(jnp.sum(per_dim, axis=-1), (batch_size,))
 
 
 # region Train
 def train_ppo(
-    args: Args, model_path: Path, device: torch.device, jax_device: str, wandb_enabled: bool = False
+    args: Args, model_path: Path, jax_device: str, wandb_enabled: bool = False
 ) -> None:
-    """Train.
+    """Train a PPO agent.
 
     An implementation of PPO from cleanrl, see https://docs.cleanrl.dev/.
     """
-    # train setup
     if wandb_enabled and wandb.run is None:
         wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args))
     train_start_time = time.time()
-    set_seeds(args.seed)  # TRY NOT TO MODIFY: seeding
-    print("Training on device:", device, "| Environment device:", jax_device)
+    set_seeds(args.seed)
+    print("Training on device:", jax_device)
 
     # env setup
     r_coefs = {
@@ -575,192 +570,261 @@ def train_ppo(
         "d_act_th_coef": args.d_act_th_coef,
         "act_coef": args.act_coef,
     }
-    envs = make_envs(
-        num_envs=args.num_envs, jax_device=jax_device, torch_device=device, coefs=r_coefs
-    )
+    envs = make_envs(num_envs=args.num_envs, jax_device=jax_device, coefs=r_coefs)
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
 
-    agent = Agent(envs.single_observation_space.shape, envs.single_action_space.shape).to(device)
-    optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    obs_shape = envs.single_observation_space.shape
+    act_shape = envs.single_action_space.shape
+    action_dim = int(np.prod(act_shape))
 
-    # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(
-        device
-    )
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(
-        device
-    )
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    # Agent init
+    agent = Agent(action_dim=action_dim)
+    rng = jax.random.PRNGKey(args.seed)
+    rng, init_key = jax.random.split(rng)
+    params = agent.init(init_key, jnp.zeros((1,) + obs_shape))["params"]
 
-    # TRY NOT TO MODIFY: start the game
+    # Optimizer: clip grads then update
+    if args.anneal_lr:
+        schedule = optax.linear_schedule(args.learning_rate, 0.0, args.num_iterations)
+    else:
+        schedule = args.learning_rate
+    tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(schedule, eps=1e-5))
+    opt_state = tx.init(params)
+
+    # ------------------------------------------------------------------ #
+    # JIT-compiled inner functions (capture args, agent, tx via closure)  #
+    # ------------------------------------------------------------------ #
+
+    @jax.jit
+    def policy_step(params: dict, obs: Array, rng_key: Array) -> tuple[Array, Array, Array]:
+        mean, log_std, value = agent.apply({"params": params}, obs)
+        std = jnp.exp(log_std)
+        action = mean + std * jax.random.normal(rng_key, mean.shape)
+        logprob = _log_prob(action, mean, log_std)
+        return action, logprob, value.squeeze(-1)
+
+    @jax.jit
+    def get_value(params: dict, obs: Array) -> Array:
+        _, _, value = agent.apply({"params": params}, obs)
+        return value.squeeze(-1)
+
+    @jax.jit
+    def compute_gae(
+        rewards: Array, values: Array, dones: Array, next_value: Array, next_done: Array
+    ) -> tuple[Array, Array]:
+        """GAE via lax.scan over reversed time steps."""
+
+        def scan_fn(lastgaelam: Array, inputs: tuple) -> tuple[Array, Array]:
+            reward, value, next_val, next_d = inputs
+            nextnonterminal = 1.0 - next_d
+            delta = reward + args.gamma * next_val * nextnonterminal - value
+            advantage = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            return advantage, advantage
+
+        # next_val and next_done for each step t: values[t+1] / dones[t+1], last step uses bootstrap
+        next_values = jnp.concatenate([values[1:], next_value[None]], axis=0)
+        next_dones = jnp.concatenate([dones[1:], next_done[None]], axis=0)
+
+        _, advantages_rev = jax.lax.scan(
+            scan_fn,
+            jnp.zeros(rewards.shape[1:]),
+            (rewards[::-1], values[::-1], next_values[::-1], next_dones[::-1]),
+        )
+        advantages = advantages_rev[::-1]
+        return advantages, advantages + values
+
+    def ppo_loss_fn(
+        params: dict,
+        obs: Array,
+        actions: Array,
+        log_probs: Array,
+        advantages: Array,
+        returns: Array,
+        b_values: Array,
+    ) -> tuple[Array, tuple]:
+        mean, log_std, new_values = agent.apply({"params": params}, obs)
+        new_log_probs = _log_prob(actions, mean, log_std)
+        entropy = _entropy(log_std, obs.shape[0])
+
+        log_ratio = new_log_probs - log_probs
+        ratio = jnp.exp(log_ratio)
+        approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
+
+        mb_advantages = advantages
+        if args.norm_adv:
+            mb_advantages = (mb_advantages - jnp.mean(mb_advantages)) / (
+                jnp.std(mb_advantages) + 1e-8
+            )
+
+        # Policy loss
+        pg_loss1 = -mb_advantages * ratio
+        pg_loss2 = -mb_advantages * jnp.clip(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+        pg_loss = jnp.mean(jnp.maximum(pg_loss1, pg_loss2))
+
+        # Value loss
+        new_values_flat = new_values.reshape(-1)
+        if args.clip_vloss:
+            v_clipped = b_values + jnp.clip(
+                new_values_flat - b_values, -args.clip_coef, args.clip_coef
+            )
+            v_loss = 0.5 * jnp.mean(
+                jnp.maximum(
+                    (new_values_flat - returns) ** 2,
+                    (v_clipped - returns) ** 2,
+                )
+            )
+        else:
+            v_loss = 0.5 * jnp.mean((new_values_flat - returns) ** 2)
+
+        entropy_loss = jnp.mean(entropy)
+        total_loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+        return total_loss, (pg_loss, v_loss, entropy_loss, approx_kl, ratio)
+
+    @jax.jit
+    def update_epoch(
+        params: dict,
+        opt_state: optax.OptState,
+        flat_data: tuple,
+        rng_key: Array,
+    ) -> tuple[dict, optax.OptState, tuple]:
+        """One full epoch of minibatch PPO updates compiled as a single XLA program."""
+        shuffled = jax.random.permutation(rng_key, args.batch_size)
+        mb_inds = shuffled.reshape(args.num_minibatches, args.minibatch_size)
+
+        def minibatch_step(
+            carry: tuple, inds: Array
+        ) -> tuple[tuple, tuple]:
+            p, os = carry
+            mb = tuple(x[inds] for x in flat_data)
+            (loss, aux), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(p, *mb)
+            updates, new_os = tx.update(grads, os, p)
+            new_p = optax.apply_updates(p, updates)
+            return (new_p, new_os), (loss, aux)
+
+        (params, opt_state), metrics = jax.lax.scan(
+            minibatch_step, (params, opt_state), mb_inds
+        )
+        return params, opt_state, metrics
+
+    # ------------------------------------------------------------------ #
+    # Training loop                                                        #
+    # ------------------------------------------------------------------ #
     global_step = 0
-    start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
-    sum_rewards = torch.zeros((args.num_envs)).to(device)
-    sum_rewards_hist = []
+    next_obs = jnp.asarray(next_obs)
+    next_done = jnp.zeros(args.num_envs)
+    sum_rewards = jnp.zeros(args.num_envs)
+    sum_rewards_hist: list[float] = []
 
     for iteration in range(1, args.num_iterations + 1):
         start_time = time.time()
 
-        # Annealing the rate if instructed to do so.
-        if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+        # -- Rollout --
+        obs_list, act_list, logp_list, val_list, rew_list, done_list = [], [], [], [], [], []
 
-        for step in range(0, args.num_steps):
+        for _ in range(args.num_steps):
             global_step += args.num_envs
-            obs[step] = next_obs
-            dones[step] = next_done
+            obs_list.append(next_obs)
+            done_list.append(next_done)
 
-            # ALGO LOGIC: action logic
-            with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
-            actions[step] = action
-            logprobs[step] = logprob
+            rng, action_key = jax.random.split(rng)
+            action, logprob, value = policy_step(params, next_obs, action_key)
+            act_list.append(action)
+            logp_list.append(logprob)
+            val_list.append(value)
 
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action)
-            # envs.render()
-            rewards[step] = reward
-            sum_rewards += reward
-            sum_rewards[next_done.bool()] = 0
-            next_done = terminations | truncations
+            next_obs, reward, terminations, truncations, _ = envs.step(action)
+            next_obs = jnp.asarray(next_obs)
+            reward = jnp.asarray(reward)
+            rew_list.append(reward)
 
-            if wandb_enabled and next_done.any():
-                for r in sum_rewards[next_done.bool()]:
-                    wandb.log({"train/reward": r.item()}, step=global_step)
-                    sum_rewards_hist.append(r.item())
+            # Track episode returns; reset done envs before accumulating
+            sum_rewards = jnp.where(next_done.astype(bool), 0.0, sum_rewards)
+            next_done = jnp.asarray(terminations | truncations).astype(jnp.float32)
+            sum_rewards = sum_rewards + reward
 
-        # bootstrap value if not done
-        with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done.float()
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = (
-                    delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                )
-            returns = advantages + values
+            if wandb_enabled and bool(jnp.any(next_done)):
+                done_indices = np.where(np.array(next_done, dtype=bool))[0]
+                for idx in done_indices:
+                    r = float(sum_rewards[idx])
+                    wandb.log({"train/reward": r}, step=global_step)
+                    sum_rewards_hist.append(r)
 
-        # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        obs_buf = jnp.stack(obs_list)       # (T, E, obs_dim)
+        act_buf = jnp.stack(act_list)       # (T, E, act_dim)
+        logp_buf = jnp.stack(logp_list)     # (T, E)
+        val_buf = jnp.stack(val_list)       # (T, E)
+        rew_buf = jnp.stack(rew_list)       # (T, E)
+        done_buf = jnp.stack(done_list)     # (T, E)
 
-        # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
-        clipfracs = []
-        for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+        # -- GAE --
+        next_value = get_value(params, next_obs)
+        advantages, returns = compute_gae(rew_buf, val_buf, done_buf, next_value, next_done)
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
-                )
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
+        # -- Flatten batch --
+        flat_data = (
+            obs_buf.reshape((-1,) + obs_shape),
+            act_buf.reshape((-1,) + act_shape),
+            logp_buf.reshape(-1),
+            advantages.reshape(-1),
+            returns.reshape(-1),
+            val_buf.reshape(-1),
+        )
 
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+        # -- PPO update epochs --
+        last_metrics = None
+        for _ in range(args.update_epochs):
+            rng, epoch_key = jax.random.split(rng)
+            params, opt_state, metrics = update_epoch(params, opt_state, flat_data, epoch_key)
+            last_metrics = metrics
+            if args.target_kl is not None:
+                approx_kl = float(jnp.mean(metrics[1][3]))
+                if approx_kl > args.target_kl:
+                    break
 
-                mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-                        mb_advantages.std() + 1e-8
-                    )
-
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(
-                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
-                )
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds], -args.clip_coef, args.clip_coef
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-                entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
-
-            if args.target_kl is not None and approx_kl > args.target_kl:
-                break
-
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        # -- Logging --
+        y_pred = np.array(val_buf.reshape(-1))
+        y_true = np.array(returns.reshape(-1))
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if wandb_enabled:
+        end_time = time.time()
+        if wandb_enabled and last_metrics is not None:
+            _, (pg_arr, v_arr, ent_arr, kl_arr, ratio_arr) = last_metrics
             wandb.log(
                 {
-                    "charts/learning_rate": optimizer.param_groups[0]["lr"],
-                    "losses/value_loss": v_loss.item(),
-                    "losses/policy_loss": pg_loss.item(),
-                    "losses/entropy": entropy_loss.item(),
-                    "losses/old_approx_kl": old_approx_kl.item(),
-                    "losses/approx_kl": approx_kl.item(),
-                    "losses/clipfrac": np.mean(clipfracs),
+                    "losses/value_loss": float(jnp.mean(v_arr)),
+                    "losses/policy_loss": float(jnp.mean(pg_arr)),
+                    "losses/entropy": float(jnp.mean(ent_arr)),
+                    "losses/approx_kl": float(jnp.mean(kl_arr)),
+                    "losses/clipfrac": float(
+                        jnp.mean(jnp.abs(ratio_arr - 1.0) > args.clip_coef)
+                    ),
                     "losses/explained_variance": explained_var,
-                    "charts/SPS": int(global_step / (time.time() - start_time)),
+                    "charts/SPS": int(global_step / (end_time - start_time)),
                 },
                 step=global_step,
             )
-        end_time = time.time()
         print(f"Iter {iteration}/{args.num_iterations} took {end_time - start_time:.2f} seconds")
-    train_end_time = time.time()
-    print(f"Training for {global_step} steps took {train_end_time - train_start_time:.2f} seconds.")
-    if model_path is not None:
-        torch.save(agent.state_dict(), model_path)
-        print(f"model saved to {model_path}")
-    envs.close()
 
+    train_end_time = time.time()
+    print(
+        f"Training for {global_step} steps took {train_end_time - train_start_time:.2f} seconds."
+    )
+    if model_path is not None:
+        with open(model_path, "wb") as f:
+            pickle.dump(params, f)
+        print(f"Model saved to {model_path}")
+    envs.close()
     return sum_rewards_hist
 
 
 # region Evaluate
-def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[float, float]:
-    """Evaluate."""
+def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[list, list]:
+    """Evaluate a trained PPO agent."""
     set_seeds(args.seed)
-    device = torch.device("cpu")
     r_coefs = {
         "n_obs": args.n_obs,
         "rpy_coef": args.rpy_coef,
@@ -769,37 +833,44 @@ def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[float, floa
         "act_coef": args.act_coef,
     }
     eval_env = make_envs(num_envs=1, coefs=r_coefs)
-    agent = Agent(eval_env.single_observation_space.shape, eval_env.single_action_space.shape).to(
-        device
+    action_dim = int(np.prod(eval_env.single_action_space.shape))
+
+    agent = Agent(action_dim=action_dim)
+    with open(model_path, "rb") as f:
+        params = pickle.load(f)
+
+    @jax.jit
+    def deterministic_action(params: dict, obs: Array) -> Array:
+        mean, _, _ = agent.apply({"params": params}, obs)
+        return mean
+
+    episode_rewards: list[float] = []
+    episode_lengths: list[int] = []
+    ep_seed = args.seed
+
+    for episode in range(n_eval):
+        obs, _ = eval_env.reset(seed=(ep_seed := ep_seed + 1))
+        done = False
+        episode_reward = 0.0
+        steps = 0
+        while not done:
+            obs_jax = jnp.asarray(obs)
+            act = deterministic_action(params, obs_jax)
+            obs, reward, terminated, truncated, _ = eval_env.step(act)
+            eval_env.render()
+            done = bool(jnp.any(jnp.asarray(terminated) | jnp.asarray(truncated)))
+            episode_reward += float(jnp.asarray(reward)[0])
+            steps += 1
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(steps)
+        print(f"Episode {episode + 1}: Reward = {episode_reward:.2f}, Length = {steps}")
+
+    print(
+        f"Average Reward = {np.mean(episode_rewards):.2f},"
+        f" Length = {np.mean(episode_lengths)}"
     )
-    agent.load_state_dict(torch.load(model_path))
-    with torch.no_grad():
-        episode_rewards = []
-        episode_lengths = []
-        ep_seed = args.seed
-        # Evaluate the policy
-        for episode in range(n_eval):
-            obs, _ = eval_env.reset(seed=(ep_seed := ep_seed + 1))
-            done = torch.zeros(10, dtype=bool, device=device)
-            episode_reward = 0
-            steps = 0
-            while not done.any():
-                act, _, _, _ = agent.get_action_and_value(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = eval_env.step(act)
-                eval_env.render()
-                done = terminated | truncated
-                episode_reward += reward[0].item()
-                steps += 1
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(steps)
-            print(f"Episode {episode + 1}: Reward = {episode_reward:.2f}, Length = {steps}")
-
-        print(
-            f"Average Reward = {np.mean(episode_rewards):.2f}, Length = {np.mean(episode_lengths)}"
-        )
-        eval_env.close()
-
-        return episode_rewards, episode_lengths
+    eval_env.close()
+    return episode_rewards, episode_lengths
 
 
 # region Main
@@ -807,13 +878,12 @@ def main(wandb_enabled: bool = True, train: bool = True, eval: int = 1):
     """Main."""
     args = Args.create()
     model_path = Path(__file__).parent / "ppo_drone_racing.ckpt"
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     jax_device = args.jax_device
 
-    if train:  # use "--train False" to skip training
-        train_ppo(args, model_path, device, jax_device, wandb_enabled)
+    if train:
+        train_ppo(args, model_path, jax_device, wandb_enabled)
 
-    if eval > 0:  # use "--eval <N>" to perform N evaluation episodes
+    if eval > 0:
         episode_rewards, episode_lengths = evaluate_ppo(args, eval, model_path)
         if wandb_enabled and train:
             wandb.log(

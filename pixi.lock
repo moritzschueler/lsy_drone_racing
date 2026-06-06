@@ -6380,11 +6380,12 @@ packages:
 - pypi: ./
   name: lsy-drone-racing
   version: 0.0.1
-  sha256: 5605be84a7648c6db45c133ea8ac434ba2ac2328b01d7078b043777f5d20a97a
+  sha256: 075f04e64183ae6e1f35a27a1487a973778ab0439991978ecdaa841b91cd75da
   requires_dist:
   - fire>=0.6.0
   - numpy
   - toml>=0.10.2
+  - numpy
   - gymnasium[array-api]>=1.2.0 ; extra == 'sim'
   - ml-collections>=1.0 ; extra == 'sim'
   - packaging>=24.0 ; extra == 'sim'

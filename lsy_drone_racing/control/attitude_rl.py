@@ -10,11 +10,13 @@ Note that the trajectory uses pre-defined waypoints instead of dynamically gener
 
 from __future__ import annotations  # Python 3.10 type hints
 
+import pickle
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
 from drone_models.core import load_params
 from scipy.interpolate import CubicSpline
 
@@ -78,15 +80,29 @@ class AttitudeRL(Controller):
         self.trajectory = spline(ts)  # (n_steps, 3)
 
         # Load RL policy
-        self.agent = Agent((13 + 3 * self.n_samples + self.n_obs * 13 + 4,), (4,)).to("cpu")
+        action_dim = 4
+        obs_dim = 13 + 3 * self.n_samples + self.n_obs * 13 + action_dim
+        self._agent = Agent(action_dim=action_dim)
         model_path = Path(__file__).parent / "ppo_drone_racing.ckpt"
-        self.agent.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
+        with open(model_path, "rb") as f:
+            self._params = pickle.load(f)
+
+        # JIT-compile inference once at init to avoid latency on first control call
+        sample_obs = jnp.zeros((1, obs_dim))
+        self._infer = jax.jit(self._deterministic_action)
+        self._infer(self._params, sample_obs)  # trigger compilation
+
         self.last_action = np.array([0.0, 0.0, 0.0, self.drone_mass * 9.81], dtype=np.float32)
         self.basic_obs_key = ["pos", "quat", "vel", "ang_vel"]
         basic_obs = np.concatenate([obs[k] for k in self.basic_obs_key], axis=-1)
         self.prev_obs = np.tile(basic_obs[None, :], (self.n_obs, 1))
 
         self._finished = False
+
+    def _deterministic_action(self, params: dict, obs: jnp.ndarray) -> jnp.ndarray:
+        """Return the mean action (deterministic policy)."""
+        mean, _, _ = self._agent.apply({"params": params}, obs)
+        return mean
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -106,15 +122,14 @@ class AttitudeRL(Controller):
             self._finished = True
 
         obs_rl = self._obs_rl(obs)
-        obs_rl = torch.tensor(obs_rl, dtype=torch.float32).unsqueeze(0).to("cpu")
-        with torch.no_grad():
-            act, _, _, _ = self.agent.get_action_and_value(obs_rl, deterministic=True)
-            self.last_action = np.asarray(torch.asarray(act.squeeze(0))).copy()
-            act[..., 2] = 0.0
+        obs_jax = jnp.asarray(obs_rl[None])  # (1, obs_dim)
+        action = self._infer(self._params, obs_jax)[0]  # (action_dim,)
 
-        act = self._scale_actions(act.squeeze(0).numpy()).astype(np.float32)
+        # Store raw action (before yaw zeroing and scaling) for next step's action penalty obs
+        self.last_action = np.array(action)
+        action = action.at[2].set(0.0)  # zero yaw
 
-        return act
+        return self._scale_actions(np.array(action)).astype(np.float32)
 
     def _obs_rl(self, obs: dict[str, NDArray[np.floating]]) -> NDArray[np.floating]:
         """Extract the relevant parts of the observation for the RL policy."""
