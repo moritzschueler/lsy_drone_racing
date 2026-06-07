@@ -1,5 +1,6 @@
 """A naive RL pipeline for drone racing."""
 
+import os
 import pickle
 import random
 import time
@@ -7,8 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+import warnings
+
 import fire
 import flax.linen as nn
+import glfw
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -861,6 +865,25 @@ def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[list, list]
             done = bool(jnp.any(jnp.asarray(terminated) | jnp.asarray(truncated)))
             episode_reward += float(jnp.asarray(reward)[0])
             steps += 1
+        sim = eval_env.unwrapped.sim
+        while (
+            sim.viewer is not None
+            and sim.viewer.viewer is not None
+            and sim.viewer.viewer.window is not None
+        ):
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", category=glfw.GLFWError)
+                try:
+                    eval_env.render()
+                except glfw.GLFWError:
+                    # ESC called glfw.terminate() without setting window=None; null it out so
+                    # WindowViewer.__del__ -> free() skips GLFW calls on garbage collection.
+                    if sim.viewer is not None and sim.viewer.viewer is not None:
+                        sim.viewer.viewer.window = None
+                    sim.viewer = None
+                    break
+            time.sleep(1 / 60)
+
         episode_rewards.append(episode_reward)
         episode_lengths.append(steps)
         print(f"Episode {episode + 1}: Reward = {episode_reward:.2f}, Length = {steps}")
@@ -874,9 +897,10 @@ def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[list, list]
 
 
 # region Main
-def main(wandb_enabled: bool = True, train: bool = True, eval: int = 1):
+def main(wandb_enabled: bool = True, train: bool = True, eval: int = 1, **kwargs):
     """Main."""
-    args = Args.create()
+    os.environ.pop("WAYLAND_DISPLAY", None)
+    args = Args.create(**kwargs)
     model_path = Path(__file__).parent / "ppo_drone_racing.ckpt"
     jax_device = args.jax_device
 
