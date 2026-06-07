@@ -591,7 +591,9 @@ def train_ppo(
 
     # Optimizer: clip grads then update
     if args.anneal_lr:
-        schedule = optax.linear_schedule(args.learning_rate, 0.0, args.num_iterations)
+        schedule = optax.linear_schedule(
+            args.learning_rate, 0.0, args.num_iterations * args.update_epochs * args.num_minibatches
+        )
     else:
         schedule = args.learning_rate
     tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(schedule, eps=1e-5))
