@@ -50,9 +50,9 @@ class Args:
     """seed of the experiment"""
     jax_device: str = "gpu"
     """environment and training device"""
-    wandb_project_name: str = "ADR-PPO-Racing"
+    wandb_project_name: str = "maadr"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str = "maad-flies "
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments
