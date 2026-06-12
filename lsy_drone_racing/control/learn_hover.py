@@ -56,35 +56,35 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments
-    total_timesteps: int = 1_000_000
+    total_timesteps: int = 3_000_000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-3
     """the learning rate of the optimizer"""
-    num_envs: int = 1024
+    num_envs: int = 2048
     """the number of parallel game environments"""
-    num_steps: int = 8
+    num_steps: int = 16
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.94
+    gamma: float = 0.98
     """the discount factor gamma"""
-    gae_lambda: float = 0.97
+    gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 8
+    num_minibatches: int = 16
     """the number of mini-batches"""
     update_epochs: int = 10
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.26
+    clip_coef: float = 0.3
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.007
+    ent_coef: float = 0.005
     """coefficient of the entropy"""
-    vf_coef: float = 0.7
+    vf_coef: float = 0.5
     """coefficient of the value function"""
-    max_grad_norm: float = 1.5
+    max_grad_norm: float = 1.0
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
@@ -102,7 +102,7 @@ class Args:
     rpy_coef: float = 0.06
     d_act_th_coef: float = 0.4
     d_act_xy_coef: float = 1.0
-    act_coef: float = 0.02
+    act_coef: float = 0.077
     """reward coefficients for training"""
 
     @staticmethod
