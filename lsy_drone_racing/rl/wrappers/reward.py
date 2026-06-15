@@ -3,7 +3,12 @@
 import jax.numpy as jnp
 import numpy as np
 from gymnasium import spaces
-from gymnasium.vector import VectorEnv, VectorObservationWrapper, VectorRewardWrapper
+from gymnasium.vector import (
+    VectorActionWrapper,
+    VectorEnv,
+    VectorObservationWrapper,
+    VectorRewardWrapper,
+)
 from gymnasium.vector.utils import batch_space
 from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
@@ -20,8 +25,7 @@ class AngleReward(VectorRewardWrapper):
         self.rpy_coef = rpy_coef
 
     def step(self, actions: Array) -> tuple[Array, Array, Array, Array, dict]:
-        """Set yaw command to zero."""
-        actions = actions.at[..., 2].set(0.0)  # block yaw output because we don't need it
+        """Step and add the orientation penalty to the reward."""
         observations, rewards, terminations, truncations, infos = self.env.step(actions)
         return observations, self.rewards(rewards, observations), terminations, truncations, infos
 
@@ -72,3 +76,18 @@ class ActionPenalty(VectorObservationWrapper):
         """Override observation."""
         observations["last_action"] = self._last_action
         return observations
+
+
+class ZeroYaw(VectorActionWrapper):
+    """Force the yaw command to zero before it reaches the environment.
+
+    A quadrotor reaches every gate regardless of heading, and the drone/physics used here are
+    yaw-symmetric, so yaw is a redundant degree of freedom for this task. Zeroing it at the
+    outermost action boundary (i.e. outside ``ActionPenalty``) keeps it out of the
+    action-smoothness penalty and out of the observed ``last_action``, which would otherwise
+    report and penalize a yaw command that is never actually applied.
+    """
+
+    def actions(self, actions: Array) -> Array:
+        """Zero the yaw channel of the (normalized) action."""
+        return actions.at[..., 2].set(0.0)

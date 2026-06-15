@@ -20,6 +20,12 @@ from lsy_drone_racing.rl.tasks import get_task
 CHECKPOINT_DIR = Path(__file__).parents[1] / "checkpoints"
 
 
+def _latest_checkpoint(task: str) -> Path | None:
+    """Return the most recently modified checkpoint for a task, or None if none exist."""
+    candidates = list((CHECKPOINT_DIR / task).glob("*.ckpt"))
+    return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+
+
 def main(
     task: str = "single_agent_racing",
     wandb_enabled: bool = True,
@@ -40,16 +46,21 @@ def main(
     task_spec = get_task(task)
     args = Args.create(**{**task_spec.defaults, **kwargs})
 
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = CHECKPOINT_DIR / f"{task}.ckpt"
+    # Each task gets its own checkpoint subfolder; runs are saved with a timestamp + reward.
+    task_dir = CHECKPOINT_DIR / task
+    task_dir.mkdir(parents=True, exist_ok=True)
     jax_device = args.jax_device
 
+    model_path = None
     if train:
-        train_ppo(args, task_spec.make_env, model_path, jax_device, wandb_enabled)
+        model_path = train_ppo(args, task_spec.make_env, task_dir, task, jax_device, wandb_enabled)
 
     if num_eval_iterations > 0:
+        eval_path = model_path or _latest_checkpoint(task)
+        if eval_path is None:
+            raise FileNotFoundError(f"Can't evaluate because there is no checkpoint for task {task} in {task_dir} and training is disabled.")
         episode_rewards, episode_lengths = evaluate_ppo(
-            args, task_spec.make_env, num_eval_iterations, model_path
+            args, task_spec.make_env, num_eval_iterations, eval_path
         )
         if wandb_enabled and train:
             wandb.log(
