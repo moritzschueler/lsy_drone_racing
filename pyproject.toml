@@ -73,6 +73,7 @@ compilers = ">=1.9.0, <1.11.0"
 cmake = "==3.26.0"  # Pinned for motion_capture_tracking
 make = "==4.4.1"  # Pinned for motion_capture_tracking
 openblas = ">=0.3.30,<0.4"
+wandb = ">=0.27.2,<0.28"
 
 [tool.pixi.pypi-dependencies]
 lsy_drone_racing = { path = ".", editable = true }
@@ -177,3 +178,6 @@ skip-magic-trailing-comma = true
 line-ending = "auto"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
+
+[dependency-groups]
+gpu = ["torch>=2.8.0,<3"]

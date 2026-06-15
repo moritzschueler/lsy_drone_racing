@@ -56,7 +56,7 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments
-    total_timesteps: int = 1_500_000
+    total_timesteps: int = 4_500_000
     """total timesteps of the experiments"""
     learning_rate: float = 1.5e-3
     """the learning rate of the optimizer"""
@@ -127,11 +127,11 @@ class RandTrajEnv(DroneEnv):
     def __init__(
         self,
         n_samples: int = 10,
-        trajectory_time: float = 15.0,
+        trajectory_time: float = 5.0,
         samples_dt: float = 0.1,
         *,
         num_envs: int = 1,
-        max_episode_time: float = 15.0,
+        max_episode_time: float = 5.0,
         physics: Literal["so_rpy_rotor_drag", "first_principles"]
         | Physics = Physics.first_principles,
         drone_model: str = "cf21B_500",
@@ -806,7 +806,7 @@ def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[float, floa
 def main(wandb_enabled: bool = True, train: bool = True, eval: int = 1):
     """Main."""
     args = Args.create()
-    model_path = Path(__file__).parent / "ppo_drone_racing.ckpt"
+    model_path = Path(__file__).parent / "trajectory_follow_5s.ckpt"
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     jax_device = args.jax_device
 
