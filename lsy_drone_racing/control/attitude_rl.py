@@ -14,14 +14,14 @@ import pickle
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from drone_models.core import load_params
+from flax import nnx
 from scipy.interpolate import CubicSpline
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.train_rl import Agent
+from lsy_drone_racing.rl.agents.ppo_agent import Agent
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -80,18 +80,18 @@ class AttitudeRL(Controller):
         spline = CubicSpline(np.linspace(0, self.trajectory_time, waypoints.shape[0]), waypoints)
         self.trajectory = spline(ts)  # (n_steps, 3)
 
-        # Load RL policy
+        # Load RL policy (nnx: the model owns its weights; load the saved params into it).
         action_dim = 4
         obs_dim = 13 + 3 * self.n_samples + self.n_obs * 13 + action_dim
-        self._agent = Agent(action_dim=action_dim)
-        model_path = Path(__file__).parent / "ppo_drone_racing.ckpt"
+        self._agent = Agent(obs_dim, action_dim, rngs=nnx.Rngs(0))
+        model_path = Path(__file__).parents[1] / "rl" / "checkpoints" / "trajectory.ckpt"
         with open(model_path, "rb") as f:
-            self._params = pickle.load(f)
+            nnx.update(self._agent, pickle.load(f))
 
         # JIT-compile inference once at init to avoid latency on first control call
         sample_obs = jnp.zeros((1, obs_dim))
-        self._infer = jax.jit(self._deterministic_action)
-        self._infer(self._params, sample_obs)  # trigger compilation
+        self._infer = nnx.jit(self._deterministic_action)
+        self._infer(self._agent, sample_obs)  # trigger compilation
 
         self.last_action = np.array([0.0, 0.0, 0.0, self.drone_mass * 9.81], dtype=np.float32)
         self.basic_obs_key = ["pos", "quat", "vel", "ang_vel"]
@@ -100,9 +100,10 @@ class AttitudeRL(Controller):
 
         self._finished = False
 
-    def _deterministic_action(self, params: dict, obs: jnp.ndarray) -> jnp.ndarray:
+    @staticmethod
+    def _deterministic_action(agent: Agent, obs: jnp.ndarray) -> jnp.ndarray:
         """Return the mean action (deterministic policy)."""
-        mean, _, _ = self._agent.apply({"params": params}, obs)
+        mean, _, _ = agent(obs)
         return mean
 
     def compute_control(
@@ -124,7 +125,7 @@ class AttitudeRL(Controller):
 
         obs_rl = self._obs_rl(obs)
         obs_jax = jnp.asarray(obs_rl[None])  # (1, obs_dim)
-        action = self._infer(self._params, obs_jax)[0]  # (action_dim,)
+        action = self._infer(self._agent, obs_jax)[0]  # (action_dim,)
 
         # Store raw action (before yaw zeroing and scaling) for next step's action penalty obs
         self.last_action = np.array(action)
