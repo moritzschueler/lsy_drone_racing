@@ -38,16 +38,29 @@ def set_seeds(seed: int):
 def train_ppo(
     args: Args,
     make_env: MakeEnv,
-    model_path: Path,
+    checkpoint_dir: Path | None,
+    run_name: str,
     jax_device: str,
     wandb_enabled: bool = False,
-) -> list[float]:
-    """Train a PPO agent on the environment produced by ``make_env``."""
+) -> Path | None:
+    """Train a PPO agent on the environment produced by ``make_env``.
+
+    The checkpoint is saved into ``checkpoint_dir`` under
+    ``{run_name}_{timestamp}_r{reward}.ckpt`` so multiple runs are distinguishable, and the
+    saved path is returned (None if ``checkpoint_dir`` is None). ``reward`` is the mean of the
+    most recent episode returns, or ``NA`` if no episodes finished/were tracked (wandb off).
+    """
     if wandb_enabled and wandb.run is None:
         wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args))
     train_start_time = time.time()
     set_seeds(args.seed)
     print("Training on device:", jax_device)
+    # Log the full configuration so the exact values used are recoverable from the run logs
+    # (wandb.init also records these under the run's config).
+    print("--- Hyperparameters ---")
+    for k, v in vars(args).items():
+        print(f"  {k}: {v}")
+    print("-----------------------")
 
     # env setup
     envs = make_env(args, args.num_envs, jax_device)
@@ -61,6 +74,14 @@ def train_ppo(
 
     print(f"Shape of observation shape: {obs_shape}")
     print(f"Shape of action space: {act_shape}")
+
+    # Number of gates, for the racing completion metric (None for tasks without gates).
+    base_space = envs.unwrapped.single_observation_space
+    n_gates = (
+        base_space["gates_pos"].shape[0]
+        if hasattr(base_space, "spaces") and "gates_pos" in base_space.spaces
+        else None
+    )
 
     # Agent init. NNX owns the weights statefully (PyTorch-style); the model instance is
     # passed directly into the jitted functions below.
@@ -231,7 +252,7 @@ def train_ppo(
             logp_list.append(logprob)
             val_list.append(value)
 
-            next_obs, reward, terminations, truncations, _ = envs.step(action)
+            next_obs, reward, terminations, truncations, info = envs.step(action)
             next_obs = jnp.asarray(next_obs)
             reward = jnp.asarray(reward)
             rew_list.append(reward)
@@ -243,10 +264,18 @@ def train_ppo(
 
             if wandb_enabled and bool(jnp.any(next_done)):
                 done_indices = np.where(np.array(next_done, dtype=bool))[0]
+                # target_gate at the terminal step = next gate to pass, or -1 if the whole track
+                # was completed. Present only for the racing task.
+                target_gate = np.array(info["target_gate"]) if "target_gate" in info else None
                 for idx in done_indices:
                     r = float(sum_rewards[idx])
-                    wandb.log({"train/reward": r}, step=global_step)
                     sum_rewards_hist.append(r)
+                    log = {"train/reward": r}
+                    if target_gate is not None and n_gates is not None:
+                        g = int(target_gate[idx])
+                        log["train/gates_passed"] = float(n_gates if g == -1 else g)
+                        log["train/completed"] = float(g == -1)
+                    wandb.log(log, step=global_step)
 
         obs_buf = jnp.stack(obs_list)       # (T, E, obs_dim)
         act_buf = jnp.stack(act_list)       # (T, E, act_dim)
@@ -309,12 +338,17 @@ def train_ppo(
     print(
         f"Training for {global_step} steps took {train_end_time - train_start_time:.2f} seconds."
     )
-    if model_path is not None:
+    model_path = None
+    if checkpoint_dir is not None:
+        recent = sum_rewards_hist[-100:]
+        reward_tag = f"r{np.mean(recent):.2f}" if recent else "rNA"
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        model_path = checkpoint_dir / f"{run_name}_{timestamp}_{reward_tag}.ckpt"
         with open(model_path, "wb") as f:
             pickle.dump(nnx.state(agent, nnx.Param), f)
         print(f"Model saved to {model_path}")
     envs.close()
-    return sum_rewards_hist
+    return model_path
 
 
 def evaluate_ppo(

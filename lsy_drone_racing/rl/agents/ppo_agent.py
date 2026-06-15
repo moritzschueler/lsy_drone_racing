@@ -4,6 +4,12 @@ import jax.numpy as jnp
 from flax import nnx
 from jax import Array
 
+# Lower bound on the policy log-std, applied in the forward pass. Floors exploration during
+# training so the policy cannot collapse to a (near-)deterministic policy, while still being low
+# enough to let the policy sharpen and exploit. Deployment uses the mean, so this does not reduce
+# final precision. -3.5 corresponds to std >= ~0.03.
+MIN_LOG_STD = -3.5
+
 
 class Agent(nnx.Module):
     """RL Agent implemented as a stateful Flax NNX module.
@@ -62,7 +68,9 @@ class Agent(nnx.Module):
         m = jnp.tanh(self.actor2(m))
         mean = jnp.tanh(self.actor_mean(m))
 
-        return mean, self.log_std[...], value
+        # Floor the std so the policy keeps exploring (prevents entropy/policy collapse).
+        log_std = jnp.clip(self.log_std[...], min=MIN_LOG_STD)
+        return mean, log_std, value
 
 
 def _log_prob(action: Array, mean: Array, log_std: Array) -> Array:

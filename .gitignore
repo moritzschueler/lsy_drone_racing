@@ -24,4 +24,4 @@ acados/
 
 
 # RL training checkpoints (artifacts, not source)
-lsy_drone_racing/rl/checkpoints/*.ckpt
+lsy_drone_racing/rl/checkpoints/**/*.ckpt

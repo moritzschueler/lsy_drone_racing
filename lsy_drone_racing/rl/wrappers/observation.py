@@ -7,8 +7,12 @@ from gymnasium import spaces
 from gymnasium.vector import VectorEnv, VectorObservationWrapper
 from gymnasium.vector.utils import batch_space
 from jax import Array
+from jax.scipy.spatial.transform import Rotation as R
 
 jp = jnp
+
+# Number of upcoming gates (current target + the following one) exposed to the policy.
+N_NEXT_GATES = 2
 
 
 class StackObs(VectorObservationWrapper):
@@ -85,3 +89,77 @@ class FlattenJaxObservation(VectorObservationWrapper):
             ],
             axis=-1,
         )
+
+
+@jax.jit
+def _relative_racing_obs(obs: dict) -> dict:
+    """Recast a raw racing observation into the relative, next-2-gates representation."""
+    pos = obs["pos"]  # (E, 3)
+    n_envs = pos.shape[0]
+    n_gates = obs["gates_pos"].shape[1]
+    # Drone attitude as a flattened rotation matrix (body -> world).
+    drone_rot = R.from_quat(obs["quat"]).as_matrix().reshape(n_envs, 9)
+    # Indices of the next N_NEXT_GATES gates, clamped to the last gate (and to 0 once finished).
+    base_idx = jp.maximum(obs["target_gate"], 0)  # target_gate is -1 when the track is done
+    idx = jp.minimum(base_idx[:, None] + jp.arange(N_NEXT_GATES)[None, :], n_gates - 1)  # (E, k)
+    env_idx = jp.arange(n_envs)[:, None]
+    gates_pos = obs["gates_pos"][env_idx, idx]  # (E, k, 3)
+    gates_quat = obs["gates_quat"][env_idx, idx]  # (E, k, 4)
+    gates_visited = obs["gates_visited"][env_idx, idx]  # (E, k)
+    gates_rel_pos = gates_pos - pos[:, None, :]
+    gates_rot = R.from_quat(gates_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, N_NEXT_GATES, 9)
+    return {
+        "ang_vel": obs["ang_vel"],
+        "drone_rot": drone_rot,
+        "gates_rel_pos": gates_rel_pos,
+        "gates_rot": gates_rot,
+        "gates_visited": gates_visited,
+        "last_action": obs["last_action"],
+        "obstacles_rel_pos": obs["obstacles_pos"] - pos[:, None, :],
+        "obstacles_visited": obs["obstacles_visited"],
+        "vel": obs["vel"],
+    }
+
+
+class RelativeRacingObs(VectorObservationWrapper):
+    """Recast the observation into a relative, track-length-invariant racing representation.
+
+    Compared to the raw observation this wrapper:
+
+    * expresses gate and obstacle positions relative to the drone (``obj_pos - drone_pos``,
+      in world axes) and drops the drone's absolute position,
+    * keeps only the next ``N_NEXT_GATES`` gates (current target + the following one), so the
+      observation size is independent of the track length,
+    * represents the drone and gate orientations as flattened 3x3 rotation matrices instead of
+      quaternions (no double-cover discontinuity, and the gate's +x traversal axis is the first
+      column),
+    * drops the ``target_gate`` index (implicit once only the upcoming gates are shown).
+
+    Velocity and angular velocity are kept in world axes; the drone rotation matrix is provided
+    so the policy can rotate into the body frame itself if useful.
+
+    Requires ``last_action`` to already be present (i.e. wrap *after* ``ActionPenalty``).
+    """
+
+    def __init__(self, env: VectorEnv):
+        """Init."""
+        super().__init__(env)
+        base = self.single_observation_space
+        n_obstacles = base["obstacles_pos"].shape[0]
+        spec = {
+            "ang_vel": base["ang_vel"],
+            "drone_rot": spaces.Box(-1.0, 1.0, shape=(9,)),
+            "gates_rel_pos": spaces.Box(-np.inf, np.inf, shape=(N_NEXT_GATES, 3)),
+            "gates_rot": spaces.Box(-1.0, 1.0, shape=(N_NEXT_GATES, 9)),
+            "gates_visited": spaces.Box(0, 1, shape=(N_NEXT_GATES,), dtype=bool),
+            "last_action": base["last_action"],
+            "obstacles_rel_pos": spaces.Box(-np.inf, np.inf, shape=(n_obstacles, 3)),
+            "obstacles_visited": base["obstacles_visited"],
+            "vel": base["vel"],
+        }
+        self.single_observation_space = spaces.Dict(spec)
+        self.observation_space = batch_space(self.single_observation_space, self.num_envs)
+
+    def observations(self, observations: dict) -> dict:
+        """Transform the raw observation dict into the relative racing representation."""
+        return _relative_racing_obs(observations)
