@@ -23,7 +23,7 @@ class Task:
 
 
 TASKS: dict[str, Task] = {
-    "single_agent_racing": Task(racing.make_env, racing.DEFAULTS),
+    "single_agent_racing": Task(racing.make_env, racing.RACING_CONFIG),
     "hover": Task(hover.make_env, hover.DEFAULTS),
     "random_trajectory_following": Task(trajectory.make_env, trajectory.DEFAULTS),
 }
