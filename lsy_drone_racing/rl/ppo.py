@@ -7,6 +7,7 @@ An implementation of PPO from cleanrl, see https://docs.cleanrl.dev/.
 
 import pickle
 import random
+import signal
 import time
 import warnings
 from pathlib import Path
@@ -67,6 +68,21 @@ def train_ppo(
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
+
+    # Curriculum hook: any wrapper in the chain exposing ``set_progress`` is fed training progress
+    # (global_step / total_timesteps) each iteration. Check the class (not the instance) so the
+    # gymnasium attribute proxy doesn't report inner wrappers' methods on outer ones.
+    progress_sinks = []
+    _e = envs
+    while _e is not None:
+        if getattr(type(_e), "set_progress", None) is not None:
+            progress_sinks.append(_e)
+        _e = getattr(_e, "env", None)
+
+    def set_progress(step: int) -> None:
+        frac = min(step / args.total_timesteps, 1.0)
+        for sink in progress_sinks:
+            sink.set_progress(frac)
 
     obs_shape = envs.single_observation_space.shape
     act_shape = envs.single_action_space.shape
@@ -151,6 +167,7 @@ def train_ppo(
         advantages: Array,
         returns: Array,
         b_values: Array,
+        ent_coef: Array,
     ) -> tuple[Array, tuple]:
         mean, log_std, new_values = agent(obs)
         new_log_probs = _log_prob(actions, mean, log_std)
@@ -187,7 +204,7 @@ def train_ppo(
             v_loss = 0.5 * jnp.mean((new_values_flat - returns) ** 2)
 
         entropy_loss = jnp.mean(entropy)
-        total_loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+        total_loss = pg_loss - ent_coef * entropy_loss + args.vf_coef * v_loss
         return total_loss, (pg_loss, v_loss, entropy_loss, approx_kl, ratio)
 
     @nnx.jit
@@ -196,6 +213,7 @@ def train_ppo(
         optimizer: nnx.Optimizer,
         flat_data: tuple,
         rng_key: Array,
+        ent_coef: Array,
     ) -> tuple:
         """One full epoch of minibatch PPO updates compiled as a single XLA program.
 
@@ -209,7 +227,7 @@ def train_ppo(
         losses, pgs, vs, ents, kls, ratios = [], [], [], [], [], []
         for i in range(args.num_minibatches):
             mb = tuple(x[mb_inds[i]] for x in flat_data)
-            (loss, aux), grads = nnx.value_and_grad(ppo_loss_fn, has_aux=True)(agent, *mb)
+            (loss, aux), grads = nnx.value_and_grad(ppo_loss_fn, has_aux=True)(agent, *mb, ent_coef)
             optimizer.update(agent, grads)
             pg, v_loss, ent, kl, ratio = aux
             losses.append(loss)
@@ -229,17 +247,58 @@ def train_ppo(
     # Training loop                                                      #
     # ------------------------------------------------------------------ #
     global_step = 0
+    set_progress(global_step)  # activate the curriculum before the initial reset
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = jnp.asarray(next_obs)
     next_done = jnp.zeros(args.num_envs)
     sum_rewards = jnp.zeros(args.num_envs)
+    ep_lengths = jnp.zeros(args.num_envs)  # per-env step counter; reset on done (survival time)
     sum_rewards_hist: list[float] = []
+    # Returns of true-start (deployment-like) episodes; with the curriculum, mid-track cone spawns
+    # are excluded so "best" reflects full-track performance. Falls back to all episodes when the
+    # episode_true_start flag is absent (other tasks / no curriculum).
+    true_start_hist: list[float] = []
+    # Best checkpoint tracking: snapshot the params whenever the recent mean true-start return
+    # improves, then write that snapshot (not the final state) at the end.
+    best_reward = -float("inf")
+    best_state_bytes: bytes | None = None
+    best_window, best_min_episodes = 100, 20
+
+    # -- Graceful early stop --
+    # Ctrl-C requests a stop: the current iteration finishes, then we break to the best-checkpoint
+    # save (evaluation/render then runs on it). A second Ctrl-C forces an immediate abort.
+    stop_requested = {"flag": False}
+
+    def _handle_sigint(signum, frame):
+        if stop_requested["flag"]:
+            raise KeyboardInterrupt  # second press -> hard abort
+        stop_requested["flag"] = True
+        print(
+            "\nStop requested (Ctrl-C): finishing current iteration, then saving the best "
+            "checkpoint. Press Ctrl-C again to force quit."
+        )
+
+    prev_sigint = signal.signal(signal.SIGINT, _handle_sigint)
+    iters_since_improve = 0  # plateau kill-switch counter (best mean true-start return)
+    kl_stall = 0  # stalled-policy kill-switch counter (approx_kl below kl_floor)
 
     for iteration in range(1, args.num_iterations + 1):
         start_time = time.time()
+        set_progress(global_step)  # advance the curriculum schedules (kappa, p_start_position)
 
         # -- Rollout --
         obs_list, act_list, logp_list, val_list, rew_list, done_list = [], [], [], [], [], []
+        # Cone-spawn gate-pass tally for this iteration: of curriculum (non-true-start) episodes that
+        # finish, how many advanced past the gate they were spawned in front of.
+        cone_passed, cone_total = 0, 0
+        # Start-mix tally for this iteration: how many finished episodes started from the true race
+        # start vs a cone spawn. The realized true-start fraction should track p_start_schedule(tau).
+        true_start_count = 0
+        # Per-step metric accumulators: each wrapper stashes a per-env value under a "rew/<name>"
+        # (reward component) or "diag/<name>" (diagnostic, e.g. commanded thrust / velocity) info
+        # key; we sum them over the rollout (lazily, on-device) and log mean-per-step values so the
+        # reward composition and the policy's behavior over training are visible.
+        step_metric_sums: dict[str, Array] = {}
 
         for _ in range(args.num_steps):
             global_step += args.num_envs
@@ -257,25 +316,62 @@ def train_ppo(
             reward = jnp.asarray(reward)
             rew_list.append(reward)
 
-            # Track episode returns; reset done envs before accumulating
-            sum_rewards = jnp.where(next_done.astype(bool), 0.0, sum_rewards)
+            # Accumulate per-step metrics (reward components + diagnostics; kept on-device,
+            # summed across steps & envs, divided by step*env count at log time -> mean per step).
+            for key, val in info.items():
+                if isinstance(key, str) and (key.startswith("rew/") or key.startswith("diag/")):
+                    step_metric_sums[key] = step_metric_sums.get(key, jnp.zeros(())) + jnp.sum(
+                        jnp.asarray(val)
+                    )
+
+            # Track episode returns and lengths; reset done envs before accumulating
+            done_mask = next_done.astype(bool)
+            sum_rewards = jnp.where(done_mask, 0.0, sum_rewards)
+            ep_lengths = jnp.where(done_mask, 0.0, ep_lengths)
             next_done = jnp.asarray(terminations | truncations).astype(jnp.float32)
             sum_rewards = sum_rewards + reward
+            ep_lengths = ep_lengths + 1.0
 
-            if wandb_enabled and bool(jnp.any(next_done)):
+            if bool(jnp.any(next_done)):
                 done_indices = np.where(np.array(next_done, dtype=bool))[0]
                 # target_gate at the terminal step = next gate to pass, or -1 if the whole track
                 # was completed. Present only for the racing task.
                 target_gate = np.array(info["target_gate"]) if "target_gate" in info else None
+                # Curriculum spawns mid-track episodes that trivially "complete"; gate-progress
+                # metrics and the best-checkpoint criterion are only meaningful for episodes that
+                # started from the true race start. Absent (other tasks / no curriculum) -> treat
+                # every episode as a true start.
+                true_start = (
+                    np.array(info["episode_true_start"], dtype=bool)
+                    if "episode_true_start" in info
+                    else None
+                )
+                # Start gate of each finishing episode (cone spawns); paired with the terminal
+                # target_gate to detect whether the gate the drone was spawned in front of was passed.
+                start_gate = (
+                    np.array(info["episode_start_gate"]) if "episode_start_gate" in info else None
+                )
                 for idx in done_indices:
                     r = float(sum_rewards[idx])
                     sum_rewards_hist.append(r)
-                    log = {"train/reward": r}
-                    if target_gate is not None and n_gates is not None:
-                        g = int(target_gate[idx])
-                        log["train/gates_passed"] = float(n_gates if g == -1 else g)
-                        log["train/completed"] = float(g == -1)
-                    wandb.log(log, step=global_step)
+                    full_track = true_start is None or bool(true_start[idx])
+                    if full_track:
+                        true_start_hist.append(r)
+                        # Count true-start episodes only when the curriculum is active (true_start
+                        # present), so the start-mix fraction is meaningful for the racing task.
+                        true_start_count += int(true_start is not None)
+                    elif target_gate is not None and start_gate is not None:
+                        # Cone-spawned episode: it passed its gate iff the target advanced past the
+                        # one it started on (forward-only; terminal -1 = finished also counts).
+                        cone_total += 1
+                        cone_passed += int(int(target_gate[idx]) != int(start_gate[idx]))
+                    if wandb_enabled:
+                        log = {"train/reward": r, "train/episode_length": float(ep_lengths[idx])}
+                        if target_gate is not None and n_gates is not None and full_track:
+                            g = int(target_gate[idx])
+                            log["train/gates_passed"] = float(n_gates if g == -1 else g)
+                            log["train/completed"] = float(g == -1)
+                        wandb.log(log, step=global_step)
 
         obs_buf = jnp.stack(obs_list)       # (T, E, obs_dim)
         act_buf = jnp.stack(act_list)       # (T, E, act_dim)
@@ -298,11 +394,22 @@ def train_ppo(
             val_buf.reshape(-1),
         )
 
+        # Anneal the entropy bonus linearly to 0 over training (mirrors anneal_lr) so the policy
+        # explores early and sharpens late; a constant bonus was inflating the action spread as
+        # advantages flattened on the hard cones, eroding precision. Passed as a traced scalar so
+        # update_epoch isn't recompiled each iteration.
+        ent_coef_now = (
+            args.ent_coef * (1.0 - (iteration - 1) / args.num_iterations)
+            if args.anneal_ent_coef
+            else args.ent_coef
+        )
+        ent_coef_arr = jnp.asarray(ent_coef_now, dtype=jnp.float32)
+
         # -- PPO update epochs --
         last_metrics = None
         for _ in range(args.update_epochs):
             rng, epoch_key = jax.random.split(rng)
-            metrics = update_epoch(agent, optimizer, flat_data, epoch_key)
+            metrics = update_epoch(agent, optimizer, flat_data, epoch_key, ent_coef_arr)
             last_metrics = metrics
             if args.target_kl is not None:
                 approx_kl = float(jnp.mean(metrics[1][3]))
@@ -318,35 +425,105 @@ def train_ppo(
         end_time = time.time()
         if wandb_enabled and last_metrics is not None:
             _, (pg_arr, v_arr, ent_arr, kl_arr, ratio_arr) = last_metrics
-            wandb.log(
-                {
-                    "losses/value_loss": float(jnp.mean(v_arr)),
-                    "losses/policy_loss": float(jnp.mean(pg_arr)),
-                    "losses/entropy": float(jnp.mean(ent_arr)),
-                    "losses/approx_kl": float(jnp.mean(kl_arr)),
-                    "losses/clipfrac": float(
-                        jnp.mean(jnp.abs(ratio_arr - 1.0) > args.clip_coef)
-                    ),
-                    "losses/explained_variance": explained_var,
-                    "charts/SPS": int(global_step / (end_time - start_time)),
-                },
-                step=global_step,
-            )
+            log_metrics = {
+                "losses/value_loss": float(jnp.mean(v_arr)),
+                "losses/policy_loss": float(jnp.mean(pg_arr)),
+                "losses/entropy": float(jnp.mean(ent_arr)),
+                "losses/approx_kl": float(jnp.mean(kl_arr)),
+                "losses/clipfrac": float(jnp.mean(jnp.abs(ratio_arr - 1.0) > args.clip_coef)),
+                "losses/explained_variance": explained_var,
+                "charts/SPS": int(global_step / (end_time - start_time)),
+                "charts/ent_coef": float(ent_coef_now),
+            }
+            # Fraction (0-1) of cone-spawned episodes this iteration that passed their spawn gate.
+            # Isolates curriculum progress from full-track skill; only logged when any cone episode
+            # finished (i.e. the curriculum is active and producing cone spawns).
+            if cone_total > 0:
+                log_metrics["train/cone_gate_pass_rate"] = cone_passed / cone_total
+            # Realized true-start fraction among finished episodes this iteration (cone fraction is
+            # 1 - this); should track p_start_schedule(tau). n_starts > 0 only when the curriculum is
+            # active (both counters increment solely when episode_true_start is present).
+            n_starts = true_start_count + cone_total
+            if n_starts > 0:
+                log_metrics["train/true_start_frac"] = true_start_count / n_starts
+            # Mean per-step value of each accumulated metric this iteration: reward components go
+            # under reward/<name>, behavioral diagnostics keep their diag/<name> prefix.
+            denom = args.num_steps * args.num_envs
+            for key, total in step_metric_sums.items():
+                name = f"reward/{key[len('rew/'):]}" if key.startswith("rew/") else key
+                log_metrics[name] = float(total) / denom
+            wandb.log(log_metrics, step=global_step)
+
+        # -- Best-checkpoint snapshot --
+        # Snapshot params when the recent mean true-start return improves. pickle.dumps takes an
+        # immutable snapshot now (the optimizer mutates `agent` in place each update, so a live
+        # reference would not preserve this iteration's weights).
+        improved = False
+        best_active = checkpoint_dir is not None and len(true_start_hist) >= best_min_episodes
+        if best_active:
+            mean_reward = float(np.mean(true_start_hist[-best_window:]))
+            if mean_reward > best_reward:
+                best_reward = mean_reward
+                best_state_bytes = pickle.dumps(nnx.state(agent, nnx.Param))
+                improved = True
+                if wandb_enabled:
+                    wandb.log({"charts/best_reward": best_reward}, step=global_step)
+
         print(f"Iter {iteration}/{args.num_iterations} took {end_time - start_time:.2f} seconds")
 
+        # -- Graceful early-stop checks (after the best snapshot, so the saved checkpoint is current) --
+        if stop_requested["flag"]:
+            print("Stopping early on user request; saving best checkpoint.")
+            break
+        # Both kill-switches stay inert (and their counters frozen) until training progress reaches
+        # early_stop_arm_frac, so the run can't be cut off while the curriculum is still ramping and
+        # the policy is *expected* to struggle. After arming, the patience windows measure only the
+        # post-curriculum plateau. arm_frac == 0 -> armed from the start (no gating).
+        armed = (global_step / args.total_timesteps) >= args.early_stop_arm_frac
+        # Plateau kill-switch: best mean true-start return has not improved for a while. Only counts
+        # once armed and best tracking is active (enough true-start episodes seen) so it can't trip
+        # at startup or mid-curriculum.
+        if armed and best_active:
+            iters_since_improve = 0 if improved else iters_since_improve + 1
+            if args.early_stop_patience and iters_since_improve >= args.early_stop_patience:
+                print(
+                    f"No improvement in best return for {iters_since_improve} iterations "
+                    f"(patience {args.early_stop_patience}) -> stopping early."
+                )
+                break
+        # Stalled-policy kill-switch: approx_kl collapsed toward zero (policy no longer updating).
+        if armed and args.kl_floor and last_metrics is not None:
+            iter_kl = float(jnp.mean(last_metrics[1][3]))
+            kl_stall = kl_stall + 1 if iter_kl < args.kl_floor else 0
+            if kl_stall >= args.kl_floor_patience:
+                print(
+                    f"approx_kl < {args.kl_floor} for {kl_stall} iterations -> policy stalled, "
+                    "stopping early."
+                )
+                break
+
+    signal.signal(signal.SIGINT, prev_sigint)  # restore so evaluation/render handles Ctrl-C itself
     train_end_time = time.time()
     print(
         f"Training for {global_step} steps took {train_end_time - train_start_time:.2f} seconds."
     )
     model_path = None
     if checkpoint_dir is not None:
-        recent = sum_rewards_hist[-100:]
-        reward_tag = f"r{np.mean(recent):.2f}" if recent else "rNA"
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        model_path = checkpoint_dir / f"{run_name}_{timestamp}_{reward_tag}.ckpt"
-        with open(model_path, "wb") as f:
-            pickle.dump(nnx.state(agent, nnx.Param), f)
-        print(f"Model saved to {model_path}")
+        if best_state_bytes is not None:
+            # Save the best snapshot (highest recent mean true-start return), not the final state.
+            model_path = checkpoint_dir / f"{run_name}_{timestamp}_r{best_reward:.2f}_best.ckpt"
+            with open(model_path, "wb") as f:
+                f.write(best_state_bytes)
+            print(f"Best model (mean true-start return {best_reward:.2f}) saved to {model_path}")
+        else:
+            # No best was recorded (too few completed episodes) -> fall back to the final state.
+            recent = sum_rewards_hist[-100:]
+            reward_tag = f"r{np.mean(recent):.2f}" if recent else "rNA"
+            model_path = checkpoint_dir / f"{run_name}_{timestamp}_{reward_tag}.ckpt"
+            with open(model_path, "wb") as f:
+                pickle.dump(nnx.state(agent, nnx.Param), f)
+            print(f"Final model saved to {model_path} (no best snapshot recorded)")
     envs.close()
     return model_path
 

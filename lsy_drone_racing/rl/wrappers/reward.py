@@ -27,7 +27,11 @@ class AngleReward(VectorRewardWrapper):
     def step(self, actions: Array) -> tuple[Array, Array, Array, Array, dict]:
         """Step and add the orientation penalty to the reward."""
         observations, rewards, terminations, truncations, infos = self.env.step(actions)
-        return observations, self.rewards(rewards, observations), terminations, truncations, infos
+        rpy_norm = jp.linalg.norm(R.from_quat(observations["quat"]).as_euler("xyz"), axis=-1)
+        rpy_term = -self.rpy_coef * rpy_norm
+        # Surface the term for per-component reward logging (summed per iteration in PPO).
+        infos = {**infos, "rew/rpy": rpy_term}
+        return observations, rewards + rpy_term, terminations, truncations, infos
 
     def rewards(self, rewards: Array, observations: dict[str, Array]) -> Array:
         """Additional angular rewards."""
@@ -62,14 +66,19 @@ class ActionPenalty(VectorObservationWrapper):
     def step(self, action: Array) -> tuple[Array, Array, Array, Array, dict]:
         """Override step."""
         obs, reward, terminated, truncated, info = super().step(action)
-        # penalty on actions
         action_diff = action - self._last_action
-        # energy
-        reward -= self.act_coef * action[..., -1] ** 2
-        # smoothness
-        reward -= self.d_act_th_coef * action_diff[..., -1] ** 2
-        reward -= self.d_act_xy_coef * jp.sum(action_diff[..., :3] ** 2, axis=-1)
+        act_term = -self.act_coef * action[..., -1] ** 2  # energy
+        d_act_th_term = -self.d_act_th_coef * action_diff[..., -1] ** 2  # thrust smoothness
+        d_act_xy_term = -self.d_act_xy_coef * jp.sum(action_diff[..., :3] ** 2, axis=-1)  # rp smoothness
+        reward = reward + act_term + d_act_th_term + d_act_xy_term
         self._last_action = action
+        # Surface the terms for per-component reward logging (summed per iteration in PPO).
+        info = {**info, "rew/act": act_term, "rew/d_act_th": d_act_th_term, "rew/d_act_xy": d_act_xy_term}
+        # Diagnostics (normalized action: thrust 0 == hover, +1 == max): mean commanded thrust and
+        # lean magnitude. Distinguishes "climbs because it over-thrusts and never tilts" (act_thrust>0,
+        # act_tilt~0) from a thrust deficit. Logged as diag/* (mean-per-step) by PPO.
+        act_tilt = jp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
+        info = {**info, "diag/act_thrust": action[..., -1], "diag/act_tilt": act_tilt}
         return self.observations(obs), reward, terminated, truncated, info
 
     def observations(self, observations: dict) -> dict:

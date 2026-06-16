@@ -93,12 +93,20 @@ class FlattenJaxObservation(VectorObservationWrapper):
 
 @jax.jit
 def _relative_racing_obs(obs: dict) -> dict:
-    """Recast a raw racing observation into the relative, next-2-gates representation."""
+    """Recast a raw racing observation into the fully body-frame, next-2-gates representation."""
     pos = obs["pos"]  # (E, 3)
     n_envs = pos.shape[0]
     n_gates = obs["gates_pos"].shape[1]
-    # Drone attitude as a flattened rotation matrix (body -> world).
-    drone_rot = R.from_quat(obs["quat"]).as_matrix().reshape(n_envs, 9)
+    # Drone attitude, body -> world. Its transpose (world -> body) rotates world quantities into
+    # the drone frame.
+    rot_bw = R.from_quat(obs["quat"]).as_matrix()  # (E, 3, 3)
+
+    def to_body_vec(v_world: Array) -> Array:  # (E, ..., 3) world vectors -> drone frame
+        return jp.einsum("eji,e...j->e...i", rot_bw, v_world)
+
+    # Gravity direction in the body frame: the only world reference a relative observation needs
+    # (tells the policy which way is "down" for thrust/attitude). Equals -rot_bw[:, 2, :].
+    grav_body = to_body_vec(jp.array([0.0, 0.0, -1.0]) + jp.zeros_like(pos))
     # Indices of the next N_NEXT_GATES gates, clamped to the last gate (and to 0 once finished).
     base_idx = jp.maximum(obs["target_gate"], 0)  # target_gate is -1 when the track is done
     idx = jp.minimum(base_idx[:, None] + jp.arange(N_NEXT_GATES)[None, :], n_gates - 1)  # (E, k)
@@ -106,37 +114,40 @@ def _relative_racing_obs(obs: dict) -> dict:
     gates_pos = obs["gates_pos"][env_idx, idx]  # (E, k, 3)
     gates_quat = obs["gates_quat"][env_idx, idx]  # (E, k, 4)
     gates_visited = obs["gates_visited"][env_idx, idx]  # (E, k)
-    gates_rel_pos = gates_pos - pos[:, None, :]
-    gates_rot = R.from_quat(gates_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, N_NEXT_GATES, 9)
+    # Gate position in the drone frame, and gate orientation relative to the drone (rot_bw^T @ R_g).
+    gates_rel_pos = to_body_vec(gates_pos - pos[:, None, :])
+    gates_rot_bw = R.from_quat(gates_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, N_NEXT_GATES, 3, 3)
+    gates_rot = jp.einsum("eji,ekjl->ekil", rot_bw, gates_rot_bw).reshape(n_envs, N_NEXT_GATES, 9)
     return {
-        "ang_vel": obs["ang_vel"],
-        "drone_rot": drone_rot,
+        "ang_vel": to_body_vec(obs["ang_vel"]),
+        "grav_body": grav_body,
         "gates_rel_pos": gates_rel_pos,
         "gates_rot": gates_rot,
         "gates_visited": gates_visited,
         "last_action": obs["last_action"],
-        "obstacles_rel_pos": obs["obstacles_pos"] - pos[:, None, :],
+        "obstacles_rel_pos": to_body_vec(obs["obstacles_pos"] - pos[:, None, :]),
         "obstacles_visited": obs["obstacles_visited"],
-        "vel": obs["vel"],
+        "vel": to_body_vec(obs["vel"]),
     }
 
 
 class RelativeRacingObs(VectorObservationWrapper):
     """Recast the observation into a relative, track-length-invariant racing representation.
 
-    Compared to the raw observation this wrapper:
+    The observation is fully expressed in the drone's body frame. Compared to the raw observation
+    this wrapper:
 
-    * expresses gate and obstacle positions relative to the drone (``obj_pos - drone_pos``,
-      in world axes) and drops the drone's absolute position,
+    * expresses gate/obstacle positions, gate orientations, velocity and angular velocity in the
+      drone body frame, and drops the drone's absolute position,
     * keeps only the next ``N_NEXT_GATES`` gates (current target + the following one), so the
       observation size is independent of the track length,
-    * represents the drone and gate orientations as flattened 3x3 rotation matrices instead of
-      quaternions (no double-cover discontinuity, and the gate's +x traversal axis is the first
-      column),
-    * drops the ``target_gate`` index (implicit once only the upcoming gates are shown).
-
-    Velocity and angular velocity are kept in world axes; the drone rotation matrix is provided
-    so the policy can rotate into the body frame itself if useful.
+    * represents gate orientations (relative to the drone) as flattened 3x3 rotation matrices
+      instead of quaternions (no double-cover discontinuity; the gate's +x traversal axis is the
+      first column),
+    * drops the ``target_gate`` index (implicit once only the upcoming gates are shown),
+    * replaces the full world-frame drone attitude with ``grav_body``, the gravity direction in
+      the body frame -- the only world reference a body-frame observation still needs (which way
+      is "down" for thrust/attitude). Yaw-about-vertical is intentionally not observable.
 
     Requires ``last_action`` to already be present (i.e. wrap *after* ``ActionPenalty``).
     """
@@ -148,7 +159,7 @@ class RelativeRacingObs(VectorObservationWrapper):
         n_obstacles = base["obstacles_pos"].shape[0]
         spec = {
             "ang_vel": base["ang_vel"],
-            "drone_rot": spaces.Box(-1.0, 1.0, shape=(9,)),
+            "grav_body": spaces.Box(-1.0, 1.0, shape=(3,)),
             "gates_rel_pos": spaces.Box(-np.inf, np.inf, shape=(N_NEXT_GATES, 3)),
             "gates_rot": spaces.Box(-1.0, 1.0, shape=(N_NEXT_GATES, 9)),
             "gates_visited": spaces.Box(0, 1, shape=(N_NEXT_GATES,), dtype=bool),
