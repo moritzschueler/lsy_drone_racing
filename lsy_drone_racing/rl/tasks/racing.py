@@ -41,9 +41,9 @@ RACING_CONFIG: dict[str, Any] = {
     "progress_coef": 3,
     "progress_reach": 2.0,  # far-field pull length scale (m); >= largest gate-to-gate gap (~2.8 m randomized)
     "progress_sharpness": 0.3,  # directional funnel length scale (m)
-    "speed_coef": 0.05,  # exponential speed-barrier weight; tune vs progress
+    "speed_coef": 0.01,  # exponential speed-barrier weight; tune vs progress
     "max_speed": 3.0,  # speed ceiling (m/s); barrier diverges toward this, drone can't exceed it
-    "speed_penalty_slope": 0.3,  # how early/steep the exponential wall rises
+    "speed_penalty_slope": 0.15,  # how early/steep the exponential wall rises
     "rpy_coef": 0.001,
     "d_act_xy_coef": 0.001,
     "d_act_th_coef": 0.001,
