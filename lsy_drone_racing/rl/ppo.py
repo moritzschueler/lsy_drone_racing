@@ -303,8 +303,11 @@ def train_ppo(
         # Per-step metric accumulators: each wrapper stashes a per-env value under a "rew/<name>"
         # (reward component) or "diagnostics/<name>" (diagnostic, e.g. commanded thrust / velocity)
         # info key; we sum them over the rollout (lazily, on-device) and log mean-per-step values so
-        # the reward composition and the policy's behavior over training are visible.
+        # the reward composition and the policy's behavior over training are visible. A "max/<name>"
+        # key is instead reduced with a running max over the rollout and logged as the iteration peak
+        # under diagnostics/<name>_max (e.g. peak speed).
         step_metric_sums: dict[str, Array] = {}
+        step_metric_max: dict[str, Array] = {}
 
         for _ in range(args.num_steps):
             global_step += args.num_envs
@@ -328,6 +331,10 @@ def train_ppo(
                 if isinstance(key, str) and (key.startswith("rew/") or key.startswith("diagnostics/")):
                     step_metric_sums[key] = step_metric_sums.get(key, jnp.zeros(())) + jnp.sum(
                         jnp.asarray(val)
+                    )
+                elif isinstance(key, str) and key.startswith("max/"):
+                    step_metric_max[key] = jnp.maximum(
+                        step_metric_max.get(key, -jnp.inf), jnp.max(jnp.asarray(val))
                     )
 
             # Track episode returns and lengths; reset done envs before accumulating
@@ -465,6 +472,9 @@ def train_ppo(
             for key, total in step_metric_sums.items():
                 name = f"reward/{key[len('rew/'):]}" if key.startswith("rew/") else key
                 log_metrics[name] = float(total) / denom
+            # Max-reduced metrics: log the rollout peak under diagnostics/<name>_max.
+            for key, peak in step_metric_max.items():
+                log_metrics[f"diagnostics/{key[len('max/'):]}_max"] = float(peak)
             wandb.log(log_metrics, step=global_step)
 
         # -- Best-checkpoint snapshot --

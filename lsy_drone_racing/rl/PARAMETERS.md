@@ -151,23 +151,26 @@ The potential is built on the distance to this *cuboid opening* (not a single po
 distance = sqrt(along² + max(|y| - h, 0)² + max(|z| - h, 0)²)   # h = GATE_HALF_EXTENT
 ```
 
-(gate frame: `along` = traversal-axis gap to the gate plane, `y`/`z` span the opening). The potential
-then blends a long-range distance pull with a **directional** entry-vs-exit term:
+(gate frame: `along` = traversal-axis gap to the gate plane, `y`/`z` span the opening). The
+entry/exit asymmetry is folded into the *distance* — the `along` coordinate is inflated by
+`exit_scale` on the exit side — and the potential is a non-negative blend of two length scales:
 
 ```
-angle_progress = 2·angle/π − 1     # angle between gate normal and (opening → drone); entry +1, exit −1
-reach_term     = exp(−distance / progress_reach)       # long-range "get closer" field
-w              = exp(−distance / progress_sharpness)   # directional weight, concentrated at the gate
-Φ              = w · angle_progress + (1 − w) · reach_term
+along_eff = along            if along ≤ 0   (entry side)
+along_eff = exit_scale·along if along > 0   (exit side — counts as farther away)
+distance  = sqrt(along_eff² + max(|y| − h, 0)² + max(|z| − h, 0)²)   # h = GATE_HALF_EXTENT
+Φ         = 0.5·exp(−distance / progress_reach) + 0.5·exp(−distance / progress_sharpness)
 ```
 
-- **Directional funnel.** The env requires gates be crossed −x → +x (`gate_passed`), so `Φ` is high on
-  the entry side and low on the exit side. Approaching from the correct side climbs `Φ`; skirting past
-  the frame or sitting on the wrong side (e.g. arriving at an anti-parallel adjacent gate) reads as low
-  and the drone is pulled around to the entry side. This is the fix for "no field pulling the drone
-  into the correct approach" with close, oppositely-oriented gates.
+- **Peak at the gate plane.** `Φ ∈ (0, 1]` and is maximal *at* the opening (`distance = 0`) — which is
+  exactly where the target gate advances. So a forward traversal climbs monotonically to the peak and
+  banks **net-positive** progress over the whole segment, instead of the old directional ±1 potential
+  whose peak sat on the entry side and trough on the exit side, making every successful crossing
+  net-*negative* (the bug this replaced). See the design history in `parameter_visualizations.ipynb`.
+- **Through-gate funnel.** The exit side decays `exit_scale`× faster, so skirting past the frame or
+  sitting on the wrong side reads as low potential and the drone is pulled around to the entry side.
 - **Two length scales** (`progress_reach`, `progress_sharpness`) decouple the far-field reach from the
-  near-gate directional sharpness — a single exponential could not do both.
+  tight near-gate funnel — a single exponential could not do both.
 - Being a deterministic function of state, `Φ` is a **potential**: progress cannot be farmed by
   looping. `gate_bonus` confirms the actual crossing (and shadows the crossing-step drop; see
   `progress_coef`).

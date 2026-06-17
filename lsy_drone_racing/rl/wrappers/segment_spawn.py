@@ -21,8 +21,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from crazyflow.sim.visualize import draw_points
 from gymnasium.vector import VectorEnv, VectorWrapper
 from jax import Array
 
@@ -129,18 +127,3 @@ class SegmentSpawn(VectorWrapper):
             "episode_start_gate": self._start_gate,
         }
         return obs, reward, terminated, truncated, info
-
-
-class DrawSpawnPoints(VectorWrapper):
-    """Debug viz: mark each env's realized spawn point (``takeoff_pos``) on render.
-
-    Mirrors ``DrawProgressTarget`` -- draws points only when rendering, so the cone-spawn
-    distribution can be eyeballed (run a render session with the curriculum active to see it).
-    """
-
-    def render(self):
-        """Draw the per-env spawn points then delegate to the underlying render."""
-        base = self.env.unwrapped
-        points = np.asarray(base.data.takeoff_pos).reshape(-1, 3)
-        draw_points(base.sim, points, rgba=np.array([0.0, 1.0, 1.0, 1.0]), size=0.04)
-        return self.env.render()
