@@ -33,14 +33,20 @@ sum to the per-step total reward.
 > (e.g. `crash`: −0.017 ÷ (1 / 290 steps) ≈ −5 = `crash_penalty`).
 
 ### `progress_coef` (current **3.0**, champion paper λ₁ = 1.0)
-Weight on the dense progress term: `progress_coef · (dist_prevₜ₋₁ − dist_currₜ)` toward the current
-gate's target point. This is meant to be the **workhorse** positive reward — the champion racing
+Weight on the dense progress term: `progress_coef · (Φₜ − Φₜ₋₁)`, the per-step increase of the
+**directional gate potential** `Φ` (see `gate_progress_potential`, and `progress_reach` /
+`progress_sharpness`). This is meant to be the **workhorse** positive reward — the champion racing
 policy leans almost entirely on it (no gate bonus at all).
 - **↑** Stronger, more continuous pull toward gates; the dominant driver. Too high can make the drone
   reckless (dive at gates, clip frames) and can drown out the value signal.
 - **↓** Weaker forward pull; the policy has less reason to move and tends to loiter/hover.
-- **Watch:** if `reward/progress` is **negative**, the drone is on average drifting *away* from its
-  target — the workhorse is broken. Fix that before adding sparse incentives.
+- **Coupling:** `Φ ∈ (−1, 1]`, so the one-step drop as the drone crosses the gate plane (entry side
+  high → exit side low) is up to `2 · progress_coef`. `gate_bonus` must stay `≥ 2 · progress_coef`
+  (asserted in `build_racing_reward`) or crossing a gate is net-penalized. **Re-check this whenever
+  you retune `progress_coef`.**
+- **Watch:** `reward/progress` no longer telescopes to net displacement; the crossing drop is real and
+  shadowed by `gate_bonus`. A persistently **negative** `reward/progress` outside crossings still means
+  the drone is drifting away from its target — fix that before adding sparse incentives.
 
 ### `gate_bonus` (current **15.0**)
 One-off bonus each time `target_gate` advances (an actual pass). Provides the discrete "go *through*,
@@ -50,8 +56,11 @@ not just *near*" incentive that the telescoping progress term can't.
   threshold ⇒ the policy attempts crossings even when it's only moderately likely to make it.
 - **↓** Crossing has to "pay for itself" via progress alone; with imprecise control the policy backs
   off and the cone-pass rate collapses as exploration anneals.
+- **Floor:** `gate_bonus` must be `≥ 2 · progress_coef` (asserted in `build_racing_reward`) so it
+  shadows the one-step potential drop at a crossing; at the current `progress_coef = 3` that floor is
+  6, well below 15.
 - **Trap:** a large `gate_bonus` is only dangerous *in combination with* an asymmetric
-  `timeout_penalty` (see that). With the aperture-based progress term (a non-gameable potential,
+  `timeout_penalty` (see that). With the directional progress potential (a non-gameable potential,
   see `GATE_HALF_EXTENT`) and symmetric failure penalties, raising it is safe.
 
 ### `finish_bonus` (current **30.0**)
@@ -106,28 +115,75 @@ magnitude below progress.
   bounded, applied action instead of the raw output. Also changes what `last_action` means in the
   obs, so validate carefully.
 
+### `speed_coef` (current **0.05**) / `max_speed` (current **3.0 m/s**) / `speed_penalty_slope` (current **0.3**)
+Exponential **speed barrier**, env-side dense term (logged as `reward/speed`). With normalized speed
+`u = ‖vel‖ / max_speed`:
+
+```
+reward_speed = −speed_coef · ( exp( speed_penalty_slope · u/(1−u) ) − 1 )
+```
+
+Introduced because the bounded progress potential lets the policy race **too fast to learn the track**.
+An earlier `(u)**power` ramp barely bit below the limit; this **diverges toward `max_speed`** so it is
+an effective ceiling the drone cannot exceed (no discontinuous clip).
+- **`max_speed`** is the asymptote: the penalty is 0 at rest, grows exponentially, and blows up at
+  `‖vel‖ = max_speed`. (At `slope = 0.3`: ~0.018·`speed_coef`-scale at 0.5×, ~0.05 at 0.7×, ~0.7 at
+  0.9×, then a wall.) The exponent is **clamped** (`_SPEED_ARG_CAP` in `racing.py`) so the penalty
+  saturates at a large-but-finite value (~`20` at `speed_coef = 0.05`) instead of `inf` — required for
+  float32 / advantage stability; `speed >= max_speed` is clipped onto the wall.
+- **`speed_penalty_slope`** sets where the wall rises: **↑** → earlier/steeper (firmer, lower effective
+  ceiling); **↓** → the drone can get closer to `max_speed` before the penalty bites.
+- **`speed_coef`** trades against `progress_coef`. It's **dense** (every step), so even a small value
+  competes with per-step progress (≈ `progress_coef · ΔΦ`, ~0.01–0.05/step at cruise on this 50 Hz
+  track). Watch `reward/speed` vs `reward/progress` and the `diagnostics/vel_along` chart: if the drone
+  creeps, lower `speed_coef` / `speed_penalty_slope` or raise `max_speed`; if it still dives through
+  gates, raise them or lower `max_speed`. Set `speed_coef = 0` to disable entirely.
+- Visualised in [`parameter_visualizations.ipynb`](parameter_visualizations.ipynb) §6 (drag the slope).
+
 ---
 
 ## 2. `GATE_HALF_EXTENT` (current **0.225 m**)
 
-Half-extent of the square gate opening used by the progress term (`gate_aperture_distance`). The
-progress reward is the per-step decrease in distance to this *cuboid opening*, not to a single
-point:
+Half-extent of the square gate opening used by the progress potential (`gate_progress_potential`).
+The potential is built on the distance to this *cuboid opening* (not a single point):
 
 ```
-dist = sqrt(along² + max(|y| - h, 0)² + max(|z| - h, 0)²)   # h = GATE_HALF_EXTENT
+distance = sqrt(along² + max(|y| - h, 0)² + max(|z| - h, 0)²)   # h = GATE_HALF_EXTENT
 ```
 
-(gate frame: `along` = traversal-axis gap to the gate plane, `y`/`z` span the opening.)
-- **Inside the opening corridor** (`|y|, |z| < h`) the lateral terms vanish, so the reward is pure
-  forward progress toward the plane — **every crossing point in the hole is equally good** (no
-  center bias).
-- **Off to the side** the lateral terms pull the drone toward the nearest opening edge; "fly forward
-  beside the frame" earns strictly less than crossing, and flying *past* beside the frame increases
-  the distance again (a penalty). It is a potential function, so progress telescopes to net
-  displacement and **cannot be farmed** by looping. `gate_bonus` still confirms the actual crossing.
+(gate frame: `along` = traversal-axis gap to the gate plane, `y`/`z` span the opening). The potential
+then blends a long-range distance pull with a **directional** entry-vs-exit term:
+
+```
+angle_progress = 2·angle/π − 1     # angle between gate normal and (opening → drone); entry +1, exit −1
+reach_term     = exp(−distance / progress_reach)       # long-range "get closer" field
+w              = exp(−distance / progress_sharpness)   # directional weight, concentrated at the gate
+Φ              = w · angle_progress + (1 − w) · reach_term
+```
+
+- **Directional funnel.** The env requires gates be crossed −x → +x (`gate_passed`), so `Φ` is high on
+  the entry side and low on the exit side. Approaching from the correct side climbs `Φ`; skirting past
+  the frame or sitting on the wrong side (e.g. arriving at an anti-parallel adjacent gate) reads as low
+  and the drone is pulled around to the entry side. This is the fix for "no field pulling the drone
+  into the correct approach" with close, oppositely-oriented gates.
+- **Two length scales** (`progress_reach`, `progress_sharpness`) decouple the far-field reach from the
+  near-gate directional sharpness — a single exponential could not do both.
+- Being a deterministic function of state, `Φ` is a **potential**: progress cannot be farmed by
+  looping. `gate_bonus` confirms the actual crossing (and shadows the crossing-step drop; see
+  `progress_coef`).
 - **Keep in sync** with the `gate_size` used by `gate_passed` in `race_core._update_target_gates`
   (currently `(0.45, 0.45)` → `h = 0.225`) so "inside the opening" matches the env's pass detection.
+
+### `progress_reach` (current **2.0 m**) / `progress_sharpness` (current **0.3 m**)
+- **`progress_reach`** sets how far the far-field still pulls. Size it to the **largest gate-to-gate
+  gap** so there is no flat dead zone between gates. On the current track the worst nominal gap is
+  G2→G3 ≈ 2.34 m, ~2.8 m with position randomization — `2.0 m` keeps `Φ ≈ 0.25` (clear gradient) even
+  at 2.8 m. Too small → the drone has to "find" the next gate by chance; too large → over-flat, weak
+  per-step signal.
+- **`progress_sharpness`** sets how close to the gate the directional term takes over. Smaller →
+  the entry-vs-exit funnel is tighter to the opening (less directional bias far out); larger → the
+  drone is steered onto the correct approach line from further away, at the cost of penalizing
+  off-axis positions sooner.
   Shrinking `h` tightens the corridor (demands more accurate lineup); enlarging it loosens it.
 
 ---
@@ -186,13 +242,11 @@ practiced from varied, recoverable poses. Two cosine schedules anneal it over tr
 | `num_envs` | 1024 | Parallel envs. | ↑ throughput + batch size, more memory. |
 | `num_steps` | 128 | Rollout length per env per update ⇒ `batch_size = num_envs·num_steps`. | ↑ longer horizon per update, more on-policy, more memory. |
 
-## 6. Early-stop / kill-switches
+## 6. Stopping
 
-| Param | Current | Meaning | Effect |
-| --- | --- | --- | --- |
-| `early_stop_patience` | 20 | Iterations with no improvement in best mean true-start return before stopping (0 = off). | ↓ stops sooner on plateaus / ↑ more patient. |
-| `kl_floor` | 5e-4 | approx-KL below this signals a stalled policy (healthy ≈ 2e-3). | Trips the stall kill-switch; set 0 to disable. |
-| `kl_floor_patience` | 20 | Consecutive sub-floor iterations to trip the kill-switch. | ↓ trips sooner / ↑ more patient. |
+There is no rule-based early stopping — the run trains for the full `total_timesteps`. The best
+checkpoint (highest recent mean true-start **gates-passed**) is snapshotted throughout, and **Ctrl-C**
+stops gracefully at the end of the current iteration, writing out that best checkpoint.
 
 ---
 

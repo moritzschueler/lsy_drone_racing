@@ -39,6 +39,11 @@ RACING_CONFIG: dict[str, Any] = {
     "ent_coef": 0.01,
     "anneal_ent_coef": True,  # decay entropy bonus to 0 so the policy sharpens late (was growing more stochastic)
     "progress_coef": 3,
+    "progress_reach": 2.0,  # far-field pull length scale (m); >= largest gate-to-gate gap (~2.8 m randomized)
+    "progress_sharpness": 0.3,  # directional funnel length scale (m)
+    "speed_coef": 0.05,  # exponential speed-barrier weight; tune vs progress
+    "max_speed": 3.0,  # speed ceiling (m/s); barrier diverges toward this, drone can't exceed it
+    "speed_penalty_slope": 0.3,  # how early/steep the exponential wall rises
     "rpy_coef": 0.001,
     "d_act_xy_coef": 0.001,
     "d_act_th_coef": 0.001,
@@ -48,16 +53,6 @@ RACING_CONFIG: dict[str, Any] = {
     "crash_penalty": 2.0,
     "timeout_penalty": 5.0, # Penalize timeout instead of finishing
     "num_steps": 128,
-    # Early stopping params. Patience floors (absolute iters) below; the *_frac scale them to the
-    # horizon (fraction of num_iterations, whichever is larger) so behavior is consistent whether the
-    # run is 10M or 50M. arm_frac keeps both kill-switches inert until the cone curriculum (kappa)
-    # has finished ramping at tau=0.5, so the run can't be cut off mid-curriculum.
-    "early_stop_patience": 20,           # floor; ~38 iters at 50M via the frac below
-    "early_stop_patience_frac": 0.10,
-    "kl_floor": 5e-4,                    # approx_kl below this (healthy ~2e-3) signals a stalled policy ...
-    "kl_floor_patience": 20,             # ... floor; scaled by the frac below
-    "kl_floor_patience_frac": 0.10,
-    "early_stop_arm_frac": 0.5,          # don't arm kill-switches until the kappa ramp completes
 }
 
 
@@ -91,33 +86,62 @@ def _target_gate_frame(
     return gate_pos, rot, local
 
 
-def gate_aperture_distance(
-    drone_pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array, half_extent: float
+def gate_progress_potential(
+    drone_pos: Array,
+    gates_pos: Array,
+    gates_quat: Array,
+    target_gate: Array,
+    half_extent: float,
+    reach: float,
+    sharpness: float,
 ) -> Array:
-    """Distance from each drone to the nearest point of its target gate's opening.
+    """Directional progress potential toward each drone's target gate (higher == better).
 
-    The opening is the square in the gate's y-z plane (the +x column of the gate rotation is the
-    traversal normal). We keep the full along-axis (x) gap and clamp the lateral (y, z) offsets to
-    the opening, independently per axis -- so the corridor of equally-good crossing points is a
-    *cuboid* prism whose square cross-section matches the gate hole. Concretely::
+    The per-step progress reward is the *increase* of this potential. Unlike a plain distance, it is
+    asymmetric across the gate plane so it builds a through-gate funnel: the env requires gates be
+    crossed from -x to +x (see ``gate_passed``), so the entry side (gate-local x < 0) is high and
+    the exit side (x > 0) is low, and the potential climbs as the drone lines up and approaches the
+    opening from the correct side.
 
-        dist = sqrt(along**2 + max(|y| - h, 0)**2 + max(|z| - h, 0)**2)
+    Geometry (all in the gate frame; the +x column of the gate rotation is the traversal normal):
 
-    * Laterally inside the opening (``|y|, |z| < h``) this is the pure forward distance to the gate
-      plane, so every point inside the hole is an equally good crossing target.
-    * Off to the side, the lateral terms pull the drone toward the nearest opening edge and make
-      "fly forward beside the frame" earn strictly less than crossing -- and flying *past* beside
-      the frame increases the distance again (a penalty), so the term cannot be farmed by skirting
-      the gate. It is a potential function, so the per-step progress (its decrease) telescopes to
-      net displacement and cannot be looped for free reward.
+    * ``distance``: distance to the nearest point of the square opening -- ``along`` (gate-local x)
+      kept in full, lateral (y, z) offsets clamped to the opening half-extent per axis, i.e.
+      ``sqrt(along**2 + max(|y|-h,0)**2 + max(|z|-h,0)**2)`` (a cuboid prism of equally-good
+      crossing points, matching ``gate_passed``'s box test).
+    * ``angle_progress = 2*angle/pi - 1`` in [-1, 1], where ``angle`` is between the gate normal and
+      the (nearest-opening-point -> drone) vector. In the gate frame the normal is +x, so
+      ``cos(angle) = along/distance``: entry side (along < 0) -> +1, dead in the opening -> 0, exit
+      side (along > 0) -> -1. This is the directional term.
+    * Two **decoupled** length scales blend them::
 
-    Returns distance, shape (n_envs, n_drones).
+          reach_term = exp(-distance / reach)      # long-range pull, sized to gate spacing
+          w          = exp(-distance / sharpness)  # directional weight, concentrated near the gate
+          Phi        = w * angle_progress + (1 - w) * reach_term
+
+      Far out (``w -> 0``) ``Phi -> reach_term``: a smooth, monotone "get closer" field that reaches
+      across the largest gate-to-gate gap. Near the gate (``w -> 1``) ``Phi -> angle_progress``: the
+      directional funnel dominates, so skirting past the frame or sitting on the exit side reads as
+      low potential and the drone is pulled around to the entry side.
+
+    Being a deterministic function of state it is a potential: the per-step progress telescopes and
+    cannot be farmed by looping. Note ``Phi`` in (-1, 1], so the worst one-step drop at a crossing
+    (entry +1 -> exit -1) is ``2 * progress_coef``; ``gate_bonus`` is held above that (asserted in
+    :func:`build_racing_reward`) so passing a gate is never net-penalized on that step.
+
+    Returns potential, shape (n_envs, n_drones).
     """
     _, _, local = _target_gate_frame(drone_pos, gates_pos, gates_quat, target_gate)
     along = local[..., 0]
-    dy = jp.maximum(jp.abs(local[..., 1]) - half_extent, 0.0)
-    dz = jp.maximum(jp.abs(local[..., 2]) - half_extent, 0.0)
-    return jp.sqrt(along**2 + dy**2 + dz**2)
+    oy = jp.maximum(jp.abs(local[..., 1]) - half_extent, 0.0)
+    oz = jp.maximum(jp.abs(local[..., 2]) - half_extent, 0.0)
+    distance = jp.sqrt(along**2 + oy**2 + oz**2)
+    cos_angle = along / (distance + 1e-6)
+    angle = jp.arccos(jp.clip(cos_angle, -1.0, 1.0))
+    angle_progress = 2.0 * angle / jp.pi - 1.0
+    reach_term = jp.exp(-distance / reach)
+    w = jp.exp(-distance / sharpness)
+    return w * angle_progress + (1.0 - w) * reach_term
 
 
 def gate_aperture_target_point(
@@ -125,8 +149,8 @@ def gate_aperture_target_point(
 ) -> Array:
     """World-frame nearest point on the target gate opening to each drone (the reward's pull target).
 
-    Mirrors :func:`gate_aperture_distance` for visualization: projects the drone onto the gate plane
-    (along-axis x -> 0) and clamps the in-plane (y, z) coordinates to the square opening.
+    Mirrors :func:`gate_progress_potential` for visualization: projects the drone onto the gate
+    plane (along-axis x -> 0) and clamps the in-plane (y, z) coordinates to the square opening.
 
     Returns points, shape (n_envs, n_drones, 3).
     """
@@ -135,6 +159,30 @@ def gate_aperture_target_point(
     z = jp.clip(local[..., 2], -half_extent, half_extent)
     nearest_local = jp.stack([jp.zeros_like(y), y, z], axis=-1)
     return gate_pos + jp.einsum("edij,edj->edi", rot, nearest_local)
+
+
+# Cap the barrier's exponent so the (unweighted) penalty stays finite and float32-safe. Without it
+# exp() overflows to inf right at the wall and poisons the advantage. exp(_SPEED_ARG_CAP) - 1 is the
+# max unweighted penalty (~402); with speed_coef ~ 0.05 that is a firm but bounded wall (~20/step).
+_SPEED_ARG_CAP = 6.0
+
+
+def soft_speed_penalty(speed: Array, max_speed: float, slope: float) -> Array:
+    """Unweighted exponential speed barrier (>= 0, 0 at rest, diverging toward ``max_speed``).
+
+    With normalized speed ``u = speed / max_speed`` the penalty is ``expm1(slope * u / (1 - u))``:
+    zero at rest and growing without bound as ``u -> 1``, so ``max_speed`` acts as a soft wall the
+    drone effectively cannot exceed (rather than the old power-law ramp, which barely bit below the
+    limit). ``slope`` sets how early/steep the wall rises.
+
+    The exponent is clamped to ``_SPEED_ARG_CAP`` so the penalty saturates at a large-but-finite
+    value for ``u`` near/above 1 (``speed >= max_speed`` is clipped to the wall) -- this keeps the
+    reward float32-safe and bounded for stable training. The caller scales it by ``speed_coef`` and
+    negates it into a penalty.
+    """
+    u = jp.clip(speed / max_speed, 0.0, 1.0)
+    arg = slope * u / jp.maximum(1.0 - u, 1e-6)  # u/(1-u): 0 at rest, -> large at the wall
+    return jp.expm1(jp.minimum(arg, _SPEED_ARG_CAP))
 
 
 def racing_reward_components(
@@ -147,6 +195,11 @@ def racing_reward_components(
     crash_penalty: float,
     timeout_penalty: float,
     gate_half_extent: float,
+    progress_reach: float,
+    progress_sharpness: float,
+    speed_coef: float,
+    max_speed: float,
+    speed_penalty_slope: float,
 ) -> dict[str, Array]:
     """Per-step racing reward broken into its named, already-weighted+signed terms.
 
@@ -155,15 +208,20 @@ def racing_reward_components(
     both the real reward (``build_racing_reward`` sums these) and the per-component wandb logging
     (``LogRewardComponents`` recomputes them), so the chart can never drift from what's optimized.
     """
-    # Progress = decrease in distance to the cuboid opening of the gate that was the target at the
-    # start of the step (forward inside the hole, lateral pull toward the opening otherwise).
-    dist_prev = gate_aperture_distance(
-        prev_data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate, gate_half_extent
+    # Progress = increase of the directional gate potential (see gate_progress_potential), measured
+    # against the gate that was the target at the start of the step. It is NOT masked on the crossing
+    # step: there the potential drops (entry high -> exit low) by up to 2*progress_coef, but the
+    # gate_bonus (kept >= 2*progress_coef in build_racing_reward) shadows it so the step stays net +.
+    # Leaving the term unmasked keeps it a pure potential difference (no bias, no flat step).
+    pot_prev = gate_progress_potential(
+        prev_data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate,
+        gate_half_extent, progress_reach, progress_sharpness,
     )
-    dist_curr = gate_aperture_distance(
-        data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate, gate_half_extent
+    pot_curr = gate_progress_potential(
+        data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate,
+        gate_half_extent, progress_reach, progress_sharpness,
     )
-    progress = dist_prev - dist_curr
+    progress = pot_curr - pot_prev
 
     active = prev_data.target_gate != -1  # episode was not already finished
     passed_gate = (data.target_gate != prev_data.target_gate) & active
@@ -175,6 +233,12 @@ def racing_reward_components(
     # (a drone that already finished and idles to timeout has target_gate == -1 -> exempt).
     timed_out = (data.steps >= data.max_episode_steps)[:, None] & not_finished & active
 
+    # Speed barrier: an exponential penalty that diverges toward max_speed (see soft_speed_penalty),
+    # an effective ceiling so the policy races at a controllable pace instead of diving through gates
+    # too fast. Disabled when speed_coef == 0.
+    speed = jp.linalg.norm(data.sim_data.states.vel, axis=-1)
+    speed_term = -speed_coef * soft_speed_penalty(speed, max_speed, speed_penalty_slope)
+
     # Zero every term on auto-reset transition steps (prev/post straddle an episode boundary).
     keep = (~prev_data.marked_for_reset[:, None]).astype(jp.float32)
     return {
@@ -183,6 +247,7 @@ def racing_reward_components(
         "finish": finish_bonus * finished * keep,
         "crash": -crash_penalty * crashed * keep,
         "timeout": -timeout_penalty * timed_out * keep,
+        "speed": speed_term * keep,
     }
 
 
@@ -193,18 +258,24 @@ def build_racing_reward(
     crash_penalty: float = 5.0,
     timeout_penalty: float = 5.0,
     gate_half_extent: float = GATE_HALF_EXTENT,
+    progress_reach: float = 2.0,
+    progress_sharpness: float = 0.3,
+    speed_coef: float = 0.0,
+    max_speed: float = 3.0,
+    speed_penalty_slope: float = 0.3,
 ) -> Callable[[Any, Any], Array]:
     """Build a dense racing reward to be compiled into the env step.
 
     The reward is computed inside the env (via ``reward_fn``) so it can use the *true* gate
     positions, which the observation only reveals once a gate is sensed. It combines:
 
-    * progress: reduction in distance to the current target gate's cuboid *opening* (see
-      :func:`gate_aperture_distance`), measured against the gate that was the target at the *start*
-      of the step. Inside the opening corridor this is pure forward progress toward the plane (any
-      crossing point equally good); off to the side it pulls the drone toward the opening and
-      penalizes skirting past the frame. Being a potential function it cannot be farmed; the
-      gate_bonus confirms the actual crossing,
+    * progress: increase of the directional gate potential (see :func:`gate_progress_potential`),
+      measured against the gate that was the target at the *start* of the step. The potential is
+      high on the gate's entry side and low on its exit side, so approaching the correct side climbs
+      it (a through-gate funnel) while skirting past the frame or sitting on the wrong side reads as
+      low. Being a potential function it cannot be farmed. The term is left unmasked on the crossing
+      step, where the potential drops by up to ``2 * progress_coef``; ``gate_bonus`` is asserted
+      ``>= 2 * progress_coef`` so that drop is shadowed and passing is never net-penalized,
     * gate_bonus: a one-off bonus each time the target gate advances,
     * finish_bonus: a large one-off bonus when the final gate is passed (target_gate -> -1),
     * crash_penalty: a penalty when the drone is disabled without finishing (out of bounds
@@ -217,6 +288,10 @@ def build_racing_reward(
       failure modes costing the same, the only way to avoid the end-penalty is to finish, and since
       parking banks less progress than flying on (and each gate_bonus already exceeds the penalty),
       forward flight strictly wins.
+    * speed: an exponential barrier that diverges toward ``max_speed`` (see
+      :func:`soft_speed_penalty`), an effective ceiling the drone cannot exceed; ``speed_penalty_slope``
+      sets how early/steep the wall rises. It pushes the policy toward a controllable racing pace.
+      Disabled when ``speed_coef == 0``.
 
     Reward is zeroed on auto-reset transition steps, where prev/post state straddle an
     episode boundary.
@@ -229,7 +304,22 @@ def build_racing_reward(
         timeout_penalty: Penalty subtracted on truncation (max_episode_steps) without finishing.
         gate_half_extent: Half-extent (m) of the square gate opening used by the progress term as
             the cuboid corridor of equally-good crossing points.
+        progress_reach: Length scale (m) of the progress potential's far field; size to the largest
+            gate-to-gate gap so there is no flat dead zone between gates.
+        progress_sharpness: Length scale (m) over which the directional (entry-vs-exit) term acts.
+        speed_coef: Overall weight of the exponential speed-barrier penalty; 0 = off.
+        max_speed: Speed ceiling (m/s) the barrier diverges toward (an effective hard limit).
+        speed_penalty_slope: Slope of the barrier; larger = the wall rises earlier/steeper.
     """
+    # The directional potential drops by at most its full range (Phi in (-1, 1], so <= 2) across a
+    # gate plane, scaled by progress_coef. gate_bonus must cover that one-step drop or crossing a
+    # gate is locally punished (the progress term is intentionally left unmasked there; see
+    # racing_reward_components). Catch a mis-tuned pair at build time rather than as silent stalling.
+    if gate_bonus < 2.0 * progress_coef:
+        raise ValueError(
+            f"gate_bonus ({gate_bonus}) must be >= 2 * progress_coef ({2.0 * progress_coef}) so the "
+            f"one-step potential drop at a gate crossing is shadowed and a pass is not net-penalized."
+        )
 
     def reward(data: Any, prev_data: Any) -> Array:
         terms = racing_reward_components(
@@ -241,6 +331,11 @@ def build_racing_reward(
             crash_penalty=crash_penalty,
             timeout_penalty=timeout_penalty,
             gate_half_extent=gate_half_extent,
+            progress_reach=progress_reach,
+            progress_sharpness=progress_sharpness,
+            speed_coef=speed_coef,
+            max_speed=max_speed,
+            speed_penalty_slope=speed_penalty_slope,
         )
         # Terms are already zeroed on auto-reset transition steps, so the sum is the env reward.
         return sum(terms.values())
@@ -269,6 +364,11 @@ class LogRewardComponents(VectorWrapper):
         crash_penalty: float,
         timeout_penalty: float,
         gate_half_extent: float = GATE_HALF_EXTENT,
+        progress_reach: float = 2.0,
+        progress_sharpness: float = 0.3,
+        speed_coef: float = 0.0,
+        max_speed: float = 3.0,
+        speed_penalty_slope: float = 0.3,
     ):
         """Init; jit a closure over the (static) reward coefficients."""
         super().__init__(env)
@@ -284,6 +384,11 @@ class LogRewardComponents(VectorWrapper):
                 crash_penalty=crash_penalty,
                 timeout_penalty=timeout_penalty,
                 gate_half_extent=gate_half_extent,
+                progress_reach=progress_reach,
+                progress_sharpness=progress_sharpness,
+                speed_coef=speed_coef,
+                max_speed=max_speed,
+                speed_penalty_slope=speed_penalty_slope,
             )
 
         self._components = components
@@ -309,9 +414,9 @@ class LogRewardComponents(VectorWrapper):
         terms = self._components(data, prev_data)
         info = {**info, **{f"rew/{name}": v[:, 0] for name, v in terms.items()}}
         # Velocity diagnostics: forward speed toward the target gate vs. vertical speed. "Climbs
-        # instead of advancing" shows up as vel_up >> vel_along. Logged as diag/* by PPO.
+        # instead of advancing" shows up as vel_up >> vel_along. Logged as diagnostics/* by PPO.
         vel_along, vel_up = self._vel_diag(data)
-        info = {**info, "diag/vel_along": vel_along[:, 0], "diag/vel_up": vel_up[:, 0]}
+        info = {**info, "diagnostics/vel_along": vel_along[:, 0], "diagnostics/vel_up": vel_up[:, 0]}
         return obs, reward, terminated, truncated, info
 
 
@@ -352,6 +457,11 @@ def make_env(args: Args, num_envs: int, jax_device: str = "cpu", config: str = "
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
         timeout_penalty=args.timeout_penalty,
+        progress_reach=args.progress_reach,
+        progress_sharpness=args.progress_sharpness,
+        speed_coef=args.speed_coef,
+        max_speed=args.max_speed,
+        speed_penalty_slope=args.speed_penalty_slope,
     )
     env = VecDroneRaceEnv(
         num_envs=num_envs,
@@ -376,6 +486,11 @@ def make_env(args: Args, num_envs: int, jax_device: str = "cpu", config: str = "
         crash_penalty=args.crash_penalty,
         timeout_penalty=args.timeout_penalty,
         gate_half_extent=GATE_HALF_EXTENT,
+        progress_reach=args.progress_reach,
+        progress_sharpness=args.progress_sharpness,
+        speed_coef=args.speed_coef,
+        max_speed=args.max_speed,
+        speed_penalty_slope=args.speed_penalty_slope,
     )
     # Curriculum: respawn drones in per-gate approach cones on (auto)reset. Manages the base data and
     # returns base-format obs (the monitor below it is transparent); inactive until training pushes

@@ -53,26 +53,7 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    # Graceful early stop of the whole run (saves the best checkpoint, then evaluation/render
-    # runs on it). Disabled by default; enabled per-task via the task config.
-    early_stop_patience: int = 0
-    """iterations with no improvement in the best mean true-start return before stopping the run (0 = disabled). Acts as the floor when early_stop_patience_frac > 0."""
-    kl_floor: float = 0.0
-    """stalled-policy kill-switch: approx_kl below this for kl_floor_patience consecutive iterations stops the run (0 = disabled)"""
-    kl_floor_patience: int = 20
-    """consecutive iterations of approx_kl < kl_floor required to trip the stalled-policy kill-switch. Acts as the floor when kl_floor_patience_frac > 0."""
-    # Horizon-relative early-stop windows: the absolute patiences above are fixed iteration counts,
-    # so a shorter total_timesteps makes them a larger fraction of the run (more trigger-happy). When
-    # a *_frac is set, Args.create scales the patience up to that fraction of num_iterations (keeping
-    # the absolute value as a floor), so the stop behavior is consistent across training horizons.
-    early_stop_patience_frac: float = 0.0
-    """no-improvement patience as a fraction of num_iterations (0 = use the absolute early_stop_patience)"""
-    kl_floor_patience_frac: float = 0.0
-    """stalled-KL patience as a fraction of num_iterations (0 = use the absolute kl_floor_patience)"""
-    early_stop_arm_frac: float = 0.0
-    """training progress (global_step / total_timesteps) below which both early-stop kill-switches are inert, so the run cannot be cut off while the curriculum is still ramping (0 = armed from the start)"""
-
-    # to be filled in runtime
+    # Filled during runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
     minibatch_size: int = 0
@@ -96,6 +77,20 @@ class Args:
     crash_penalty: float = 5.0
     timeout_penalty: float = 5.0
     """dense racing reward coefficients (computed inside the env step)"""
+    progress_reach: float = 2.0
+    """length scale (m) of the progress potential's far field: how far from the gate the term still
+    pulls. Sized to the largest gate-to-gate gap so there is no flat dead zone between gates."""
+    progress_sharpness: float = 0.3
+    """length scale (m) over which the progress potential's directional (entry-vs-exit) term acts;
+    smaller = the through-gate funnel is concentrated closer to the opening."""
+    speed_coef: float = 0.0
+    """overall weight of the exponential speed-barrier penalty; 0 disables it."""
+    max_speed: float = 3.0
+    """speed ceiling (m/s). Soft barrier: the penalty grows exponentially toward this and diverges at
+    it (saturated to a finite cap), so the drone effectively cannot exceed max_speed."""
+    speed_penalty_slope: float = 0.3
+    """slope of the exponential speed barrier: larger = the wall rises earlier/steeper (firmer, lower
+    effective ceiling), smaller = the drone can get closer to max_speed before the penalty bites."""
 
     @staticmethod
     def create(**kwargs: Any) -> "Args":
@@ -104,15 +99,4 @@ class Args:
         args.batch_size = int(args.num_envs * args.num_steps)
         args.minibatch_size = int(args.batch_size // args.num_minibatches)
         args.num_iterations = args.total_timesteps // args.batch_size
-        # Scale the early-stop windows to the horizon: a *_frac sets the patience to that fraction of
-        # num_iterations, keeping the absolute value as a floor (so short runs aren't cut off below it
-        # and long runs get proportionally more patience).
-        if args.early_stop_patience_frac > 0:
-            args.early_stop_patience = max(
-                args.early_stop_patience, round(args.early_stop_patience_frac * args.num_iterations)
-            )
-        if args.kl_floor_patience_frac > 0:
-            args.kl_floor_patience = max(
-                args.kl_floor_patience, round(args.kl_floor_patience_frac * args.num_iterations)
-            )
         return args
