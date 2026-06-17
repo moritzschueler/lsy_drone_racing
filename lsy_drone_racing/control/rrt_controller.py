@@ -4,7 +4,7 @@ import threading
 from typing import Any
 
 import numpy as np
-from crazyflow.sim.visualize import draw_line, draw_points
+from crazyflow.sim.visualize import draw_line
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 

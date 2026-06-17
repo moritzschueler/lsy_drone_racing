@@ -81,8 +81,12 @@ class Args:
     """length scale (m) of the progress potential's far field: how far from the gate the term still
     pulls. Sized to the largest gate-to-gate gap so there is no flat dead zone between gates."""
     progress_sharpness: float = 0.3
-    """length scale (m) over which the progress potential's directional (entry-vs-exit) term acts;
-    smaller = the through-gate funnel is concentrated closer to the opening."""
+    """length scale (m) over which the progress potential's near-gate funnel acts; smaller = the
+    through-gate funnel is concentrated closer to the opening."""
+    exit_scale: float = 3.0
+    """entry/exit asymmetry of the progress potential (>= 1). The gate-local along coordinate is
+    inflated by this factor on the exit (already-passed) side, so the field decays faster behind the
+    gate -- a through-gate funnel that pulls the drone in from the entry side. 1 = symmetric."""
     speed_coef: float = 0.0
     """overall weight of the exponential speed-barrier penalty; 0 disables it."""
     max_speed: float = 3.0
