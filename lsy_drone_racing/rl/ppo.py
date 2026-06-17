@@ -258,9 +258,17 @@ def train_ppo(
     # are excluded so "best" reflects full-track performance. Falls back to all episodes when the
     # episode_true_start flag is absent (other tasks / no curriculum).
     true_start_hist: list[float] = []
-    # Best checkpoint tracking: snapshot the params whenever the recent mean true-start return
-    # improves, then write that snapshot (not the final state) at the end.
-    best_reward = -float("inf")
+    # Per true-start episode racing *progress* = gates passed (n_gates if the track was completed).
+    # Skill measure on the fixed deployment distribution, unaffected by reward shaping (crash/timeout/
+    # smoothness penalties), so unlike return it rises with competence and peaks late rather than
+    # early. Drives best-checkpoint + early-stop; empty for non-racing tasks (then we fall back to
+    # return). See best_score selection below.
+    true_start_progress_hist: list[float] = []
+    # Best checkpoint tracking: snapshot the params whenever the recent mean true-start *score*
+    # (gates-passed for racing, else return) improves, then write that snapshot (not the final
+    # state) at the end.
+    best_score = -float("inf")
+    best_is_progress = False  # True once gates-passed history exists (racing); else return-based
     best_state_bytes: bytes | None = None
     best_window, best_min_episodes = 100, 20
 
@@ -279,8 +287,6 @@ def train_ppo(
         )
 
     prev_sigint = signal.signal(signal.SIGINT, _handle_sigint)
-    iters_since_improve = 0  # plateau kill-switch counter (best mean true-start return)
-    kl_stall = 0  # stalled-policy kill-switch counter (approx_kl below kl_floor)
 
     for iteration in range(1, args.num_iterations + 1):
         start_time = time.time()
@@ -295,9 +301,9 @@ def train_ppo(
         # start vs a cone spawn. The realized true-start fraction should track p_start_schedule(tau).
         true_start_count = 0
         # Per-step metric accumulators: each wrapper stashes a per-env value under a "rew/<name>"
-        # (reward component) or "diag/<name>" (diagnostic, e.g. commanded thrust / velocity) info
-        # key; we sum them over the rollout (lazily, on-device) and log mean-per-step values so the
-        # reward composition and the policy's behavior over training are visible.
+        # (reward component) or "diagnostics/<name>" (diagnostic, e.g. commanded thrust / velocity)
+        # info key; we sum them over the rollout (lazily, on-device) and log mean-per-step values so
+        # the reward composition and the policy's behavior over training are visible.
         step_metric_sums: dict[str, Array] = {}
 
         for _ in range(args.num_steps):
@@ -319,7 +325,7 @@ def train_ppo(
             # Accumulate per-step metrics (reward components + diagnostics; kept on-device,
             # summed across steps & envs, divided by step*env count at log time -> mean per step).
             for key, val in info.items():
-                if isinstance(key, str) and (key.startswith("rew/") or key.startswith("diag/")):
+                if isinstance(key, str) and (key.startswith("rew/") or key.startswith("diagnostics/")):
                     step_metric_sums[key] = step_metric_sums.get(key, jnp.zeros(())) + jnp.sum(
                         jnp.asarray(val)
                     )
@@ -355,8 +361,16 @@ def train_ppo(
                     r = float(sum_rewards[idx])
                     sum_rewards_hist.append(r)
                     full_track = true_start is None or bool(true_start[idx])
+                    # Gates passed this episode (n_gates if completed, g==-1); None when the task
+                    # exposes no gate index (non-racing).
+                    gates_passed = None
+                    if target_gate is not None and n_gates is not None:
+                        g = int(target_gate[idx])
+                        gates_passed = float(n_gates if g == -1 else g)
                     if full_track:
                         true_start_hist.append(r)
+                        if gates_passed is not None:
+                            true_start_progress_hist.append(gates_passed)
                         # Count true-start episodes only when the curriculum is active (true_start
                         # present), so the start-mix fraction is meaningful for the racing task.
                         true_start_count += int(true_start is not None)
@@ -367,10 +381,9 @@ def train_ppo(
                         cone_passed += int(int(target_gate[idx]) != int(start_gate[idx]))
                     if wandb_enabled:
                         log = {"train/reward": r, "train/episode_length": float(ep_lengths[idx])}
-                        if target_gate is not None and n_gates is not None and full_track:
-                            g = int(target_gate[idx])
-                            log["train/gates_passed"] = float(n_gates if g == -1 else g)
-                            log["train/completed"] = float(g == -1)
+                        if full_track and gates_passed is not None:
+                            log["train/gates_passed"] = gates_passed
+                            log["train/completed"] = float(gates_passed == n_gates)
                         wandb.log(log, step=global_step)
 
         obs_buf = jnp.stack(obs_list)       # (T, E, obs_dim)
@@ -447,7 +460,7 @@ def train_ppo(
             if n_starts > 0:
                 log_metrics["train/true_start_frac"] = true_start_count / n_starts
             # Mean per-step value of each accumulated metric this iteration: reward components go
-            # under reward/<name>, behavioral diagnostics keep their diag/<name> prefix.
+            # under reward/<name>, behavioral diagnostics keep their diagnostics/<name> prefix.
             denom = args.num_steps * args.num_envs
             for key, total in step_metric_sums.items():
                 name = f"reward/{key[len('rew/'):]}" if key.startswith("rew/") else key
@@ -455,52 +468,30 @@ def train_ppo(
             wandb.log(log_metrics, step=global_step)
 
         # -- Best-checkpoint snapshot --
-        # Snapshot params when the recent mean true-start return improves. pickle.dumps takes an
-        # immutable snapshot now (the optimizer mutates `agent` in place each update, so a live
-        # reference would not preserve this iteration's weights).
-        improved = False
-        best_active = checkpoint_dir is not None and len(true_start_hist) >= best_min_episodes
-        if best_active:
-            mean_reward = float(np.mean(true_start_hist[-best_window:]))
-            if mean_reward > best_reward:
-                best_reward = mean_reward
+        # Snapshot params when the recent mean true-start *score* improves. The score is gates-passed
+        # (skill on the fixed deployment distribution, unshaped) for racing, falling back to return
+        # when no gate progress is available (other tasks). pickle.dumps takes an immutable snapshot
+        # now (the optimizer mutates `agent` in place each update, so a live reference would not
+        # preserve this iteration's weights).
+        best_hist = true_start_progress_hist if true_start_progress_hist else true_start_hist
+        best_is_progress = bool(true_start_progress_hist)
+        if checkpoint_dir is not None and len(best_hist) >= best_min_episodes:
+            mean_score = float(np.mean(best_hist[-best_window:]))
+            if mean_score > best_score:
+                best_score = mean_score
                 best_state_bytes = pickle.dumps(nnx.state(agent, nnx.Param))
-                improved = True
                 if wandb_enabled:
-                    wandb.log({"charts/best_reward": best_reward}, step=global_step)
+                    key = "charts/best_true_start_gates" if best_is_progress else "charts/best_reward"
+                    wandb.log({key: best_score}, step=global_step)
 
         print(f"Iter {iteration}/{args.num_iterations} took {end_time - start_time:.2f} seconds")
 
-        # -- Graceful early-stop checks (after the best snapshot, so the saved checkpoint is current) --
+        # Graceful manual stop: Ctrl-C finishes the current iteration (best snapshot already taken
+        # above, so the saved checkpoint is current), then breaks to write it out. There is no
+        # rule-based early stopping; the run otherwise trains for the full horizon.
         if stop_requested["flag"]:
-            print("Stopping early on user request; saving best checkpoint.")
+            print("Stopping on user request (Ctrl-C); saving best checkpoint.")
             break
-        # Both kill-switches stay inert (and their counters frozen) until training progress reaches
-        # early_stop_arm_frac, so the run can't be cut off while the curriculum is still ramping and
-        # the policy is *expected* to struggle. After arming, the patience windows measure only the
-        # post-curriculum plateau. arm_frac == 0 -> armed from the start (no gating).
-        armed = (global_step / args.total_timesteps) >= args.early_stop_arm_frac
-        # Plateau kill-switch: best mean true-start return has not improved for a while. Only counts
-        # once armed and best tracking is active (enough true-start episodes seen) so it can't trip
-        # at startup or mid-curriculum.
-        if armed and best_active:
-            iters_since_improve = 0 if improved else iters_since_improve + 1
-            if args.early_stop_patience and iters_since_improve >= args.early_stop_patience:
-                print(
-                    f"No improvement in best return for {iters_since_improve} iterations "
-                    f"(patience {args.early_stop_patience}) -> stopping early."
-                )
-                break
-        # Stalled-policy kill-switch: approx_kl collapsed toward zero (policy no longer updating).
-        if armed and args.kl_floor and last_metrics is not None:
-            iter_kl = float(jnp.mean(last_metrics[1][3]))
-            kl_stall = kl_stall + 1 if iter_kl < args.kl_floor else 0
-            if kl_stall >= args.kl_floor_patience:
-                print(
-                    f"approx_kl < {args.kl_floor} for {kl_stall} iterations -> policy stalled, "
-                    "stopping early."
-                )
-                break
 
     signal.signal(signal.SIGINT, prev_sigint)  # restore so evaluation/render handles Ctrl-C itself
     train_end_time = time.time()
@@ -511,11 +502,13 @@ def train_ppo(
     if checkpoint_dir is not None:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         if best_state_bytes is not None:
-            # Save the best snapshot (highest recent mean true-start return), not the final state.
-            model_path = checkpoint_dir / f"{run_name}_{timestamp}_r{best_reward:.2f}_best.ckpt"
+            # Save the best snapshot (highest recent mean true-start score), not the final state.
+            tag = "g" if best_is_progress else "r"  # gates-passed vs return
+            metric = "gates-passed" if best_is_progress else "return"
+            model_path = checkpoint_dir / f"{run_name}_{timestamp}_{tag}{best_score:.2f}_best.ckpt"
             with open(model_path, "wb") as f:
                 f.write(best_state_bytes)
-            print(f"Best model (mean true-start return {best_reward:.2f}) saved to {model_path}")
+            print(f"Best model (mean true-start {metric} {best_score:.2f}) saved to {model_path}")
         else:
             # No best was recorded (too few completed episodes) -> fall back to the final state.
             recent = sum_rewards_hist[-100:]

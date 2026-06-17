@@ -76,9 +76,9 @@ class ActionPenalty(VectorObservationWrapper):
         info = {**info, "rew/act": act_term, "rew/d_act_th": d_act_th_term, "rew/d_act_xy": d_act_xy_term}
         # Diagnostics (normalized action: thrust 0 == hover, +1 == max): mean commanded thrust and
         # lean magnitude. Distinguishes "climbs because it over-thrusts and never tilts" (act_thrust>0,
-        # act_tilt~0) from a thrust deficit. Logged as diag/* (mean-per-step) by PPO.
+        # act_tilt~0) from a thrust deficit. Logged as diagnostics/* (mean-per-step) by PPO.
         act_tilt = jp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
-        info = {**info, "diag/act_thrust": action[..., -1], "diag/act_tilt": act_tilt}
+        info = {**info, "diagnostics/act_thrust": action[..., -1], "diagnostics/act_tilt": act_tilt}
         return self.observations(obs), reward, terminated, truncated, info
 
     def observations(self, observations: dict) -> dict:
