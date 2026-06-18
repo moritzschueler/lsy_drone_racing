@@ -39,13 +39,14 @@ class RacingArgs(Args):
     target_kl: float = 0.03
     update_epochs: int = 4
     clip_coef: float = 0.2
-    ent_coef: float = 0.007
+    ent_coef: float = 0.01
     anneal_ent_coef: bool = False  # decay entropy to 0 if True
-    # Champion-paper progress: weight on the per-step distance-to-gate REDUCTION (now in metres, not a
-    # bounded 0-1 potential). At cruise (~1-2 m/s, 50 Hz) the per-step reduction is ~0.02-0.04 m, so
-    # coef=1 gives ~0.02-0.04/step -- already several x the dense penalties and the clearly-positive
-    # workhorse the bounded potential never was. Raise it to make progress more dominant (champion
-    # leans heavily on it), but high values get reckless. Lambda_1 = 1.0 in the paper.
+    # Champion-paper progress: weight on the per-step distance-to-gate REDUCTION (now in metres,
+    # not a bounded 0-1 potential). At cruise (~1-2 m/s, 50 Hz) the per-step reduction is
+    # ~0.02-0.04 m, so coef=1 gives ~0.02-0.04/step -- already several x the dense penalties and the
+    # clearly-positive workhorse the bounded potential never was. Raise it to make progress more
+    # dominant (champion leans heavily on it), but high values get reckless. Lambda_1 = 1.0 in the
+    # paper.
     progress_coef: float = 5
     speed_coef: float = 0.00  # exponential speed-barrier weight
     max_speed: float = 3.0  # speed ceiling (m/s)
@@ -54,10 +55,10 @@ class RacingArgs(Args):
     # rpy / act / d_act_xy / d_act_th stack. Whisper-level relative to progress; tune up only once
     # gate-passing is solid (a too-large smoothness penalty rewards "fly calm" over "pass gates").
     d_act_coef: float = 0.001
-    gate_bonus: float = 10.0
-    finish_bonus: float = 20.0
-    crash_penalty: float = 3.0
-    timeout_penalty: float = 3.0  # Penalize timeout if drone doesn't finish
+    gate_bonus: float = 20.0
+    finish_bonus: float = 30.0
+    crash_penalty: float = 5.0
+    timeout_penalty: float = 20.0  # Penalize timeout if drone doesn't finish
     num_steps: int = 128
 
 
@@ -100,12 +101,13 @@ def gate_opening_distance(
 ) -> Array:
     """Euclidean distance (m) from each drone to its target gate's *opening* (lower == closer).
 
-    This is the distance used by the champion-paper progress reward (Kaufmann et al., "Champion-level
-    drone racing using deep RL", 2023): the per-step reward is the *reduction* of this distance, so
-    closing on the gate banks reward proportional to the metres covered, with a constant gradient all
-    the way into the opening (unlike a bounded/saturating potential, whose gain vanishes near the gate
-    and is cancelled by the crossing drop). It is unbounded but still a deterministic function of
-    state (a potential ``Phi = -distance``), so progress telescopes and cannot be farmed by looping.
+    This is the distance used by the champion-paper progress reward (Kaufmann et al.,
+    "Champion-level drone racing using deep RL", 2023): the per-step reward is the *reduction* of
+    this distance, so closing on the gate banks reward proportional to the metres covered, with a
+    constant gradient all the way into the opening (unlike a bounded/saturating potential, whose
+    gain vanishes near the gate and is cancelled by the crossing drop). It is unbounded but still a
+    deterministic function of state (a potential ``Phi = -distance``), so progress telescopes and
+    cannot be farmed by looping.
 
     Geometry (in the gate frame; the +x column of the gate rotation is the traversal normal):
     ``along`` is the gate-local x (traversal) coordinate; the lateral (y, z) offsets are clamped to
@@ -172,13 +174,14 @@ def racing_reward_components(
     both the real reward (``build_racing_reward`` sums these) and the per-component wandb logging
     (``LogRewardComponents`` recomputes them), so the chart can never drift from what's optimized.
     """
-    # Progress = champion-paper reward: the per-step REDUCTION in distance to the target gate opening
-    # (see gate_opening_distance), measured against the gate that was the target at the start of the
-    # step (prev_data.target_gate for both terms, so the gate-advance is handled without an artifact).
-    # Positive while approaching, proportional to metres closed; the gate-advance resets the reference
-    # distance to the next gate (a one-step change bounded by the drone's per-step displacement, not
-    # by progress_coef -- so crossing is never meaningfully net-penalized). Left unmasked on the
-    # crossing step to keep it a pure distance difference (no bias, no flat step).
+    # Progress = champion-paper reward: the per-step REDUCTION in distance to the target gate
+    # opening (see gate_opening_distance), measured against the gate that was the target at the
+    # start of the step (prev_data.target_gate for both terms, so the gate-advance is handled
+    # without an artifact). Positive while approaching, proportional to metres closed; the
+    # gate-advance resets the reference distance to the next gate (a one-step change bounded by the
+    # drone's per-step displacement, not by progress_coef -- so crossing is never meaningfully
+    # net-penalized). Left unmasked on the crossing step to keep it a pure distance difference (no
+    # bias, no flat step).
     d_prev = gate_opening_distance(
         prev_data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate,
         gate_half_extent,
@@ -200,8 +203,8 @@ def racing_reward_components(
     timed_out = (data.steps >= data.max_episode_steps)[:, None] & not_finished & active
 
     # Speed barrier: an exponential penalty that diverges toward max_speed (see soft_speed_penalty),
-    # an effective ceiling so the policy races at a controllable pace instead of diving through gates
-    # too fast. Disabled when speed_coef == 0.
+    # an effective ceiling so the policy races at a controllable pace instead of diving through
+    # gates too fast. Disabled when speed_coef == 0.
     speed = jnp.linalg.norm(data.sim_data.states.vel, axis=-1)
     speed_term = -speed_coef * soft_speed_penalty(speed, max_speed, speed_penalty_slope)
 
@@ -253,8 +256,9 @@ def build_racing_reward(
       parking banks less progress than flying on (and each gate_bonus already exceeds the penalty),
       forward flight strictly wins.
     * speed: an exponential barrier that diverges toward ``max_speed`` (see
-      :func:`soft_speed_penalty`), an effective ceiling the drone cannot exceed; ``speed_penalty_slope``
-      sets how early/steep the wall rises. It pushes the policy toward a controllable racing pace.
+      :func:`soft_speed_penalty`), an effective ceiling the drone cannot exceed;
+      ``speed_penalty_slope`` sets how early/steep the wall rises. It pushes the policy toward a
+      controllable racing pace.
       Disabled when ``speed_coef == 0``.
 
     Reward is zeroed on auto-reset transition steps, where prev/post state straddle an
@@ -341,7 +345,7 @@ class LogRewardComponents(VectorWrapper):
 
         @jax.jit
         def vel_diag(data: Any) -> tuple[Array, Array, Array]:
-            """Velocity projected on the target gate normal (forward), world-up, and its magnitude."""
+            """Velocity along the target gate normal (forward), world-up, and its magnitude."""
             _, rot, _ = _target_gate_frame(
                 data.sim_data.states.pos, data.gates_pos, data.gates_quat, data.target_gate
             )
@@ -375,7 +379,9 @@ class LogRewardComponents(VectorWrapper):
         return obs, reward, terminated, truncated, info
 
 
-def make_env(args: Args, num_envs: int, jax_device: str = "cpu", config: str = "level0.toml") -> VectorEnv:
+def make_env(
+    args: Args, num_envs: int, jax_device: str = "cpu", config: str = "level0.toml"
+) -> VectorEnv:
     """Build the vectorized, fully-wrapped racing environment."""
     config = load_config(Path(__file__).parents[3] / "config" / config)
     reward_fn = build_racing_reward(
@@ -415,9 +421,9 @@ def make_env(args: Args, num_envs: int, jax_device: str = "cpu", config: str = "
         max_speed=args.max_speed,
         speed_penalty_slope=args.speed_penalty_slope,
     )
-    # Curriculum: respawn drones in per-gate approach cones on (auto)reset. Manages the base data and
-    # returns base-format obs (the monitor below it is transparent); inactive until training pushes
-    # progress.
+    # Curriculum: respawn drones in per-gate approach cones on (auto)reset. Manages the base data
+    # and returns base-format obs (the monitor below it is transparent); inactive until training
+    # pushes progress.
     env = SegmentSpawn(env, seed=args.seed)
     # Seed warm rotors on every (auto)reset so the drone starts in hover equilibrium instead of
     # falling with cold rotors. Sits *outside* SegmentSpawn: the cone respawn overrides the pose
@@ -432,8 +438,8 @@ def make_env(args: Args, num_envs: int, jax_device: str = "cpu", config: str = "
     # Zero yaw outside ActionSmoothnessPenalty so the redundant yaw DOF is excluded from the action
     # penalty and last_action (yaw is unused for this yaw-symmetric racing task).
     env = ZeroYaw(env)
-    # Relative geometry + next-2-gates + rotation matrices (must come after ActionSmoothnessPenalty so
-    # last_action is present in the dict it transforms).
+    # Relative geometry + next-2-gates + rotation matrices (must come after
+    # ActionSmoothnessPenalty so last_action is present in the dict it transforms).
     env = RelativeRacingObs(env)
     env = FlattenJaxObservation(env)
     return env

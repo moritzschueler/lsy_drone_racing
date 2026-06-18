@@ -19,6 +19,8 @@ iteration). Evaluation never calls it, so eval always starts from the true race 
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from gymnasium.vector import VectorEnv, VectorWrapper
@@ -63,14 +65,14 @@ class SegmentSpawn(VectorWrapper):
         cfg = self.cfg
 
         @jax.jit
-        def _respawn(data, mask: Array, key: Array, tau: Array):
+        def _respawn(data: Any, mask: Array, key: Array, tau: Array) -> tuple[Any, Array]:
             spawn_pos, spawn_vel, target_gate, cone_mask = segment_spawn(
                 key, data.gates_pos, data.gates_quat, data.obstacles_pos, nominal_start, tau, cfg
             )
             return apply_spawn(data, mask & cone_mask, spawn_pos, spawn_vel, target_gate), cone_mask
 
         @jax.jit
-        def _obs(data) -> dict:
+        def _obs(data: Any) -> dict:
             return {k: v[:, 0] for k, v in race_obs(data).items()}
 
         self._respawn = _respawn
