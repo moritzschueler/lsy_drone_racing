@@ -249,7 +249,9 @@ class RandTrajEnv(DroneEnv):
                 return _reset_randomization_so_rpy
 
 
-def make_env(args: Args, num_envs: int, jax_device: str = "cpu", config: str = "level0.toml") -> VectorEnv:
+def make_env(
+    args: Args, num_envs: int, jax_device: str = "cpu", config: str = "level0.toml"
+) -> VectorEnv:
     """Build the vectorized, fully-wrapped random-trajectory-following environment."""
     config = load_config(Path(__file__).parents[3] / "config" / config)
     env = RandTrajEnv(

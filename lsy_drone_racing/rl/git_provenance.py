@@ -8,8 +8,8 @@ reproducible code::
     git diff wandb-runs/rare-energy-49-xxxx wandb-runs/deep-forest-56-yyyy -- lsy_drone_racing/rl/
 
 The run *name* (``deep-forest-56``) is the readable handle from the chart legend; the run *id*
-(``3a7bx9k2``, from the run URL) is appended as an immutable, collision-proof suffix -- redundancy at
-no cost, so a renamed/reused name can never make a branch ambiguous.
+(``3a7bx9k2``, from the run URL) is appended as an immutable, collision-proof suffix -- redundancy
+at no cost, so a renamed/reused name can never make a branch ambiguous.
 
 The snapshot is built in a *temporary* index seeded from HEAD, so the user's real index, working
 tree, and HEAD are never touched, and the branch is created via ``update-ref`` without switching to
@@ -39,7 +39,7 @@ def _git(*args: str, env: dict | None = None) -> str:
 
 
 def _sanitize(component: str) -> str:
-    """Make a string safe as a single git ref path component (cheap insurance; W&B names are tame)."""
+    """Make a string safe as a single git ref path component (W&B names are tame anyway)."""
     return re.sub(r"[^A-Za-z0-9._-]+", "-", component).strip("-") or "run"
 
 
@@ -87,7 +87,14 @@ def pin_run_to_branch(run_name: str | None, run_id: str | None) -> dict:
         dirty = bool(_git("status", "--porcelain"))
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"[git_provenance] skipped (not a git repo / git missing): {e}")
-        return {"git_sha": None, "git_head": None, "git_branch": None, "git_dirty": None, "wandb_branch": None, "wandb_branch_pushed": False}
+        return {
+            "git_sha": None,
+            "git_head": None,
+            "git_branch": None,
+            "git_dirty": None,
+            "wandb_branch": None,
+            "wandb_branch_pushed": False,
+        }
 
     suffix = "-".join(_sanitize(p) for p in (run_name, run_id) if p) or "run"
     branch = f"{_BRANCH_PREFIX}/{suffix}"
@@ -97,7 +104,14 @@ def pin_run_to_branch(run_name: str | None, run_id: str | None) -> dict:
         _git("update-ref", f"refs/heads/{branch}", sha)
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"[git_provenance] snapshot/branch failed: {e}")
-        return {"git_sha": head, "git_head": head, "git_branch": source_branch, "git_dirty": dirty, "wandb_branch": None, "wandb_branch_pushed": False}
+        return {
+            "git_sha": head,
+            "git_head": head,
+            "git_branch": source_branch,
+            "git_dirty": dirty,
+            "wandb_branch": None,
+            "wandb_branch_pushed": False,
+        }
 
     pushed = _push_branch(branch)
 

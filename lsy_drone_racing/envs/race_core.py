@@ -410,7 +410,9 @@ class RaceCoreEnv:
 
         # 5) Generate functions
         # Default reward ignores prev_data and uses the module-level sparse reward.
-        self._reward_fn = reward_fn if reward_fn is not None else (lambda data, prev_data: reward(data))
+        self._reward_fn = (
+            reward_fn if reward_fn is not None else (lambda data, prev_data: reward(data))
+        )
         self._setup_sim(randomizations, drones)
         self._reset = self.build_reset_fn()
         self._step = self.build_step_fn()

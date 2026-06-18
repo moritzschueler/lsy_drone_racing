@@ -36,14 +36,20 @@ class Agent(nnx.Module):
         zeros = nnx.initializers.zeros
 
         # Critic
-        self.critic1 = nnx.Linear(obs_dim, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
+        self.critic1 = nnx.Linear(
+            obs_dim, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
+        )
         self.critic2 = nnx.Linear(64, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
         self.critic_out = nnx.Linear(64, 1, kernel_init=orth(1.0), bias_init=zeros, rngs=rngs)
 
         # Actor
-        self.actor1 = nnx.Linear(obs_dim, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
+        self.actor1 = nnx.Linear(
+            obs_dim, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
+        )
         self.actor2 = nnx.Linear(64, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
-        self.actor_mean = nnx.Linear(64, action_dim, kernel_init=orth(0.01), bias_init=zeros, rngs=rngs)
+        self.actor_mean = nnx.Linear(
+            64, action_dim, kernel_init=orth(0.01), bias_init=zeros, rngs=rngs
+        )
 
         # Learnable log std: lower for roll/pitch/yaw, higher for thrust (last action dim)
         self.log_std = nnx.Param(jnp.full((1, action_dim), -1.0).at[0, -1].set(1.0))

@@ -34,7 +34,7 @@ PARAMS_MD = ROOT / "lsy_drone_racing/rl/PARAMETERS.md"
 SCAN_DIRS = [ROOT / "lsy_drone_racing/rl", ROOT / "lsy_drone_racing/envs"]
 
 
-def _literal(node: ast.AST):
+def _literal(node: ast.AST) -> object:
     """Best-effort constant eval of an AST value node; returns a string if not literal."""
     try:
         return ast.literal_eval(node)
@@ -88,6 +88,7 @@ def chart_inventory() -> dict[str, set[str]]:
 
 
 def main() -> None:
+    """Print the effective hyperparameters, curriculum schedule, and chart inventory."""
     args = dataclass_defaults(CONFIG_PY, "Args")
     racing = dict_literal(RACING_PY, "RACING_CONFIG")
     spawn = dataclass_defaults(SPAWN_PY, "SegmentSpawnConfig")
@@ -124,7 +125,11 @@ def main() -> None:
         ("initial speed  [c0,c1]", "c0", "c1"),
     ]:
         a, b = spawn.get(lo), spawn.get(hi)
-        steps = f"  ({int(a * T):,} -> {int(b * T):,} steps)" if (T and isinstance(a, (int, float))) else ""
+        steps = (
+            f"  ({int(a * T):,} -> {int(b * T):,} steps)"
+            if (T and isinstance(a, (int, float)))
+            else ""
+        )
         print(f"   {label:26s} tau {a} -> {b}{steps}")
     print("   spawn config:", {k: spawn[k] for k in spawn})
 

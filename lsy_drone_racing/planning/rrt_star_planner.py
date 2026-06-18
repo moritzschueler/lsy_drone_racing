@@ -36,9 +36,6 @@ def plan_rrt_star_path(
     obstacle_radius = getattr(config, 'obstacle_radius', 0.15)
     max_planning_time = getattr(config, 'rrt_max_time', 5.0)
     
-    # Generate virtual obstacle points around gates
-    gate_obstacles = _gate_frame_obstacles(gates_pos, gates_quat, gate_offset)
-    
     # Sample obstacle columns
     sampled_rods = []
     ROD_MAX_HEIGHT = 2.0
@@ -48,10 +45,8 @@ def plan_rrt_star_path(
         for z in zs:
             sampled_rods.append(np.array([rod_pos[0], rod_pos[1], z]))
     
-    all_obstacles = gate_obstacles + sampled_rods
-    
-    # For approach/transition segments, exclude gate frame obstacles since we're planning to go through the gates
-    # Only use rod obstacles for transitions
+    # For approach/transition segments, exclude gate frame obstacles since we're planning to go
+    # through the gates. Only use rod obstacles for transitions
     inter_gate_obstacles = sampled_rods  # Rod obstacles only
     
     # Generate pre/post gate waypoints and collect all targets
@@ -148,7 +143,7 @@ def _plan_rrt_star_segment(
     min_dist_sq = float((obstacle_radius + 0.05) ** 2)
 
     class CollisionChecker(ob.StateValidityChecker):
-        def isValid(self, state):
+        def isValid(self, state: Any) -> bool:
             pos = np.array([state[0], state[1], state[2]])
             if not obs_arr.size:
                 return True
@@ -201,7 +196,11 @@ def _plan_rrt_star_segment(
         pos = np.array([float(state[j]) for j in range(3)])
         waypoints.append(pos)
 
-    return waypoints if waypoints else [start + (goal - start) * t for t in np.linspace(0.1, 0.9, 5)]
+    return (
+        waypoints
+        if waypoints
+        else [start + (goal - start) * t for t in np.linspace(0.1, 0.9, 5)]
+    )
 
 
 def _gate_frame_obstacles(

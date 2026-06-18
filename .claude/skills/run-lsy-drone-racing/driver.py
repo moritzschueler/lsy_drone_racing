@@ -38,7 +38,7 @@ from PIL import Image
 from lsy_drone_racing.utils import load_config, load_controller
 
 logger = logging.getLogger(__name__)
-ROOT = Path(__file__).resolve().parents[3]  # .claude/skills/run-lsy-drone-racing/driver.py -> repo root
+ROOT = Path(__file__).resolve().parents[3]  # driver.py -> repo root
 
 
 def run(

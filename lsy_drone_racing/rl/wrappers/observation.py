@@ -116,7 +116,9 @@ def _relative_racing_obs(obs: dict) -> dict:
     gates_visited = obs["gates_visited"][env_idx, idx]  # (E, k)
     # Gate position in the drone frame, and gate orientation relative to the drone (rot_bw^T @ R_g).
     gates_rel_pos = to_body_vec(gates_pos - pos[:, None, :])
-    gates_rot_bw = R.from_quat(gates_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, N_NEXT_GATES, 3, 3)
+    gates_rot_bw = (
+        R.from_quat(gates_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, N_NEXT_GATES, 3, 3)
+    )
     gates_rot = jp.einsum("eji,ekjl->ekil", rot_bw, gates_rot_bw).reshape(n_envs, N_NEXT_GATES, 9)
     return {
         "ang_vel": to_body_vec(obs["ang_vel"]),
