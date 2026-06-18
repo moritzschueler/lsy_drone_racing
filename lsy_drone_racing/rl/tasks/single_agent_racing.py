@@ -39,7 +39,7 @@ class RacingArgs(Args):
     target_kl: float = 0.03
     update_epochs: int = 4
     clip_coef: float = 0.2
-    ent_coef: float = 0.007
+    ent_coef: float = 0.01
     anneal_ent_coef: bool = False  # decay entropy to 0 if True
     # Champion-paper progress: weight on the per-step distance-to-gate REDUCTION (now in metres, not a
     # bounded 0-1 potential). At cruise (~1-2 m/s, 50 Hz) the per-step reduction is ~0.02-0.04 m, so
@@ -54,10 +54,10 @@ class RacingArgs(Args):
     # rpy / act / d_act_xy / d_act_th stack. Whisper-level relative to progress; tune up only once
     # gate-passing is solid (a too-large smoothness penalty rewards "fly calm" over "pass gates").
     d_act_coef: float = 0.001
-    gate_bonus: float = 10.0
-    finish_bonus: float = 20.0
-    crash_penalty: float = 3.0
-    timeout_penalty: float = 3.0  # Penalize timeout if drone doesn't finish
+    gate_bonus: float = 20.0
+    finish_bonus: float = 30.0
+    crash_penalty: float = 5.0
+    timeout_penalty: float = 5.0  # Penalize timeout if drone doesn't finish
     num_steps: int = 128
 
 
