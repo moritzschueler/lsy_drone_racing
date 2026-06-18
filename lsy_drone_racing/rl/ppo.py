@@ -26,6 +26,7 @@ from jax import Array
 
 from lsy_drone_racing.rl.agents.ppo_agent import Agent, _entropy, _log_prob
 from lsy_drone_racing.rl.config import Args
+from lsy_drone_racing.rl.git_provenance import pin_run_to_branch
 
 MakeEnv = Callable[[Args, int, str], VectorEnv]
 
@@ -53,6 +54,13 @@ def train_ppo(
     """
     if wandb_enabled and wandb.run is None:
         wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args))
+        # Pin the exact code behind this run to a branch wandb-runs/<name>-<id> so the chart legend
+        # maps straight to reproducible code. Best-effort; never aborts training (see git_provenance).
+        prov = pin_run_to_branch(wandb.run.name, wandb.run.id)
+        wandb.config.update(prov, allow_val_change=True)
+        if prov.get("wandb_branch"):
+            backup = "pushed to remote" if prov.get("wandb_branch_pushed") else "local only"
+            print(f"[git_provenance] pinned code to branch: {prov['wandb_branch']} ({prov['git_sha'][:8]}, {backup})")
     train_start_time = time.time()
     set_seeds(args.seed)
     print("Training on device:", jax_device)
@@ -452,7 +460,10 @@ def train_ppo(
                 "losses/approx_kl": float(jnp.mean(kl_arr)),
                 "losses/clipfrac": float(jnp.mean(jnp.abs(ratio_arr - 1.0) > args.clip_coef)),
                 "losses/explained_variance": explained_var,
-                "charts/SPS": int(global_step / (end_time - start_time)),
+                # Instantaneous throughput: env steps processed *this iteration* (one rollout =
+                # batch_size steps) per wall-clock second. Flat line at steady state; reads straight
+                # off the y-axis. (Was global_step/iter_time, which ramped up with the step count.)
+                "charts/SPS": int(args.batch_size / (end_time - start_time)),
                 "charts/ent_coef": float(ent_coef_now),
             }
             # Fraction (0-1) of cone-spawned episodes this iteration that passed their spawn gate.
@@ -532,9 +543,12 @@ def train_ppo(
 
 
 def evaluate_ppo(
-    args: Args, make_env: MakeEnv, n_eval: int, model_path: Path
+    args: Args, make_env: MakeEnv, n_eval: int, model_path: Path, render: bool = True
 ) -> tuple[list, list]:
-    """Evaluate a trained PPO agent."""
+    """Evaluate a trained PPO agent.
+
+    Set ``render=False`` to run evaluation headless (no viewer window).
+    """
     set_seeds(args.seed)
     eval_env = make_env(args, 1, args.jax_device)
     action_dim = int(np.prod(eval_env.single_action_space.shape))
@@ -563,13 +577,15 @@ def evaluate_ppo(
             obs_jax = jnp.asarray(obs)
             act = deterministic_action(agent, obs_jax)
             obs, reward, terminated, truncated, _ = eval_env.step(act)
-            eval_env.render()
+            if render:
+                eval_env.render()
             done = bool(jnp.any(jnp.asarray(terminated) | jnp.asarray(truncated)))
             episode_reward += float(jnp.asarray(reward)[0])
             steps += 1
         sim = eval_env.unwrapped.sim
         while (
-            sim.viewer is not None
+            render
+            and sim.viewer is not None
             and sim.viewer.viewer is not None
             and sim.viewer.viewer.window is not None
         ):

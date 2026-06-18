@@ -58,16 +58,16 @@ class SegmentSpawnConfig:
     # the deployment distribution is always represented and gate-progress metrics are never empty.
     b0: float = 0.25
     b1: float = 0.85
-    p_start_min: float = 0.05
-    p_start_max: float = 0.80
+    p_start_min: float = 0.20
+    p_start_max: float = 0.90
     # (c) initial-speed schedule: cone spawns start with speed v0 along the gate normal (through the
-    # opening), annealed v0_max -> 0 over [c0, c1]. Early momentum carries the drone through the gate
-    # so it collects gate_bonus and gets a positive "through-the-gate" signal to bootstrap from;
-    # removing it later forces the policy to generate its own forward speed. Only cone spawns get it
-    # (true-start envs keep their grounded zero-velocity reset).
+    # opening), annealed v0_max -> 0 over [c0, c1]. DISABLED (v0_max = 0): the momentum crutch masked
+    # that the policy never learned self-propulsion (early vel_along tracked v0_max and collapsed as
+    # it annealed out), so cone spawns now start at rest, facing the gate, and the policy must
+    # generate its own forward speed from the first step. Set v0_max > 0 to re-enable bootstrapping.
     c0: float = 0.0
-    c1: float = 0.5
-    v0_max: float = 0.5  # m/s along the gate normal at tau=0
+    c1: float = 0.7
+    v0_max: float = 0.25  # m/s along the gate normal at tau=0 (0 = propulsion crutch off)
 
 
 def cosine_ramp(tau: Array, t0: float, t1: float, v0: float, v1: float) -> Array:

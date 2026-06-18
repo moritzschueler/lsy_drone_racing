@@ -1,7 +1,7 @@
 """Hovering task: drive the drone to and hold a fixed goal position."""
 
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Callable, Literal
 
 import jax
 import jax.numpy as jnp
@@ -25,9 +25,6 @@ from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, AngleReward
 from lsy_drone_racing.utils import load_config
 
 jp = jnp
-
-# Default Args overrides for this task (merged by the CLI before Args.create).
-DEFAULTS: dict[str, Any] = {}
 
 
 class HoverEnv(DroneEnv):
