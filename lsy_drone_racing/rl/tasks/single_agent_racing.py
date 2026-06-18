@@ -40,13 +40,7 @@ class RacingArgs(Args):
     update_epochs: int = 4
     clip_coef: float = 0.2
     ent_coef: float = 0.008
-    anneal_ent_coef: bool = False  # decay entropy to 0 if True
-    # Champion-paper progress: weight on the per-step distance-to-gate REDUCTION (now in metres,
-    # not a bounded 0-1 potential). At cruise (~1-2 m/s, 50 Hz) the per-step reduction is
-    # ~0.02-0.04 m, so coef=1 gives ~0.02-0.04/step -- already several x the dense penalties and the
-    # clearly-positive workhorse the bounded potential never was. Raise it to make progress more
-    # dominant (champion leans heavily on it), but high values get reckless. Lambda_1 = 1.0 in the
-    # paper.
+    anneal_ent_coef: bool = False  # decay entropy if True
     progress_coef: float = 5
     speed_coef: float = 0.00  # exponential speed-barrier weight
     max_speed: float = 3.0  # speed ceiling (m/s)
@@ -54,11 +48,14 @@ class RacingArgs(Args):
     # Single action-smoothness penalty (champion-style) on the bounded action; replaces the old
     # rpy / act / d_act_xy / d_act_th stack. Whisper-level relative to progress; tune up only once
     # gate-passing is solid (a too-large smoothness penalty rewards "fly calm" over "pass gates").
-    d_act_coef: float = 0.001
+    d_act_coef: float = 0.000 
+    d_act_th_coef: float = 0.0005 # Coefficient for thrust change penalty (thrust smoothness)
+    d_act_xy_coef: float = 0.001 # Coefficient for xy action change penalty (attitude smoothness)
+    act_coef: float = 0.00 # Coefficient for action penalty (energy smoothness)
     gate_bonus: float = 20.0
     finish_bonus: float = 30.0
     crash_penalty: float = 3.0
-    #timeout_penalty: float = 5.0  # Terminal penalty if sim truncates without drone finished
+    timeout_penalty: float = 0.0  # Terminal penalty if sim truncates without drone finished
     time_alive_penalty: float = 1.0 # Continous penalty for each step alive and not finished
     num_steps: int = 128
     max_episode_length: int = 1500
@@ -362,21 +359,6 @@ class LogRewardComponents(VectorWrapper):
 
         self._components = components
 
-        @jax.jit
-        def vel_diag(data: Any) -> tuple[Array, Array, Array]:
-            """Velocity along the target gate normal (forward), world-up, and its magnitude."""
-            _, rot, _ = _target_gate_frame(
-                data.sim_data.states.pos, data.gates_pos, data.gates_quat, data.target_gate
-            )
-            normal = rot[..., :, 0]  # (E, D, 3) through-gate (+x) direction in world
-            vel = data.sim_data.states.vel  # (E, D, 3)
-            along = jnp.sum(vel * normal, axis=-1)  # (E, D) forward speed toward the gate
-            speed = jnp.linalg.norm(vel, axis=-1)  # (E, D) speed magnitude
-            return along, vel[..., 2], speed
-
-        self._vel_diag = v# Relative geometry + next-2-gates + rotation matrices (must come after
-    # ActionSmoothnessPenalty so last_action is present in the dict it transforms).el_diag
-
     def step(self, action: Array) -> tuple[Any, Array, Array, Array, dict]:
         """Step, then stash the per-component env-side reward terms (one drone) into ``info``."""
         prev_data = self.env.unwrapped.data  # pre-step base data == the env reward_fn's prev_data
@@ -410,7 +392,7 @@ def make_env(
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
         timeout_penalty=args.timeout_penalty,
-        time_penalty=args.time_penalty,
+        time_penalty=args.time_alive_penalty,
         speed_coef=args.speed_coef,
         max_speed=args.max_speed,
         speed_penalty_slope=args.speed_penalty_slope,
@@ -438,15 +420,11 @@ def make_env(
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
         timeout_penalty=args.timeout_penalty,
-        time_penalty=args.time_penalty,
+        time_penalty=args.time_alive_penalty,
         gate_half_extent=GATE_HALF_EXTENT,
         speed_coef=args.speed_coef,
         max_speed=args.max_speed,
         speed_penalty_slope=args.speed_penalty_slope,
-        act_coef = args.act_coef,
-        d_acth_th_coef = args.d_act_coef,
-        d_act_xy_coef = args.d_act_xy_coef
-
     )
     # Curriculum: respawn drones in per-gate approach cones on (auto)reset. Manages the base data
     # and returns base-format obs (the monitor below it is transparent); inactive until training
