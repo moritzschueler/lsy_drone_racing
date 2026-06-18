@@ -13,8 +13,6 @@ from gymnasium.vector.utils import batch_space
 from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
 
-jp = jnp
-
 
 def action_smoothness_penalty(action: Array, last_action: Array, coef: float) -> Array:
     """Champion-style action-smoothness penalty: ``-coef * ||clip(a) - clip(a_prev)||**2``.
@@ -43,7 +41,7 @@ class AngleReward(VectorRewardWrapper):
     def step(self, actions: Array) -> tuple[Array, Array, Array, Array, dict]:
         """Step and add the orientation penalty to the reward."""
         observations, rewards, terminations, truncations, infos = self.env.step(actions)
-        rpy_norm = jp.linalg.norm(R.from_quat(observations["quat"]).as_euler("xyz"), axis=-1)
+        rpy_norm = jnp.linalg.norm(R.from_quat(observations["quat"]).as_euler("xyz"), axis=-1)
         rpy_term = -self.rpy_coef * rpy_norm
         # Surface the term for per-component reward logging (summed per iteration in PPO).
         infos = {**infos, "rew/rpy": rpy_term}
@@ -52,7 +50,7 @@ class AngleReward(VectorRewardWrapper):
     def rewards(self, rewards: Array, observations: dict[str, Array]) -> Array:
         """Additional angular rewards."""
         # apply rpy penalty
-        rpy_norm = jp.linalg.norm(R.from_quat(observations["quat"]).as_euler("xyz"), axis=-1)
+        rpy_norm = jnp.linalg.norm(R.from_quat(observations["quat"]).as_euler("xyz"), axis=-1)
         rewards -= self.rpy_coef * rpy_norm
         return rewards
 
@@ -74,7 +72,7 @@ class ActionPenalty(VectorObservationWrapper):
         spec["last_action"] = spaces.Box(-np.inf, np.inf, shape=(4,))
         self.single_observation_space = spaces.Dict(spec)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
-        self._last_action = jp.zeros((self.num_envs, 4))
+        self._last_action = jnp.zeros((self.num_envs, 4))
         self.act_coef = act_coef
         self.d_act_th_coef = d_act_th_coef
         self.d_act_xy_coef = d_act_xy_coef
@@ -86,7 +84,7 @@ class ActionPenalty(VectorObservationWrapper):
         act_term = -self.act_coef * action[..., -1] ** 2  # energy
         d_act_th_term = -self.d_act_th_coef * action_diff[..., -1] ** 2  # thrust smoothness
         # rp smoothness
-        d_act_xy_term = -self.d_act_xy_coef * jp.sum(action_diff[..., :3] ** 2, axis=-1)
+        d_act_xy_term = -self.d_act_xy_coef * jnp.sum(action_diff[..., :3] ** 2, axis=-1)
         reward = reward + act_term + d_act_th_term + d_act_xy_term
         self._last_action = action
         # Surface the terms for per-component reward logging (summed per iteration in PPO).
@@ -100,7 +98,7 @@ class ActionPenalty(VectorObservationWrapper):
         # lean magnitude. Distinguishes "climbs because it over-thrusts and never tilts"
         # (act_thrust>0, act_tilt~0) from a thrust deficit. Logged as diagnostics/* (mean-per-step)
         # by PPO.
-        act_tilt = jp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
+        act_tilt = jnp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
         info = {**info, "diagnostics/act_thrust": action[..., -1], "diagnostics/act_tilt": act_tilt}
         return self.observations(obs), reward, terminated, truncated, info
 
@@ -128,20 +126,20 @@ class ActionSmoothnessPenalty(VectorObservationWrapper):
         spec["last_action"] = spaces.Box(-1.0, 1.0, shape=(4,))
         self.single_observation_space = spaces.Dict(spec)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
-        self._last_action = jp.zeros((self.num_envs, 4))
+        self._last_action = jnp.zeros((self.num_envs, 4))
         self.d_act_coef = d_act_coef
 
     def step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:
         """Step, add the smoothness penalty, and refresh the observed last (bounded) action."""
         obs, reward, terminated, truncated, info = super().step(action)
-        bounded = jp.clip(action, -1.0, 1.0)
+        bounded = jnp.clip(action, -1.0, 1.0)
         d_act_term = action_smoothness_penalty(action, self._last_action, self.d_act_coef)
         reward = reward + d_act_term
         self._last_action = bounded
         # Surface the single smoothness term for per-component reward logging (summed in PPO).
         info = {**info, "rew/d_act": d_act_term}
         # Diagnostics on the bounded command (thrust 0 == hover, +1 == max; lean = roll/pitch mag).
-        act_tilt = jp.sqrt(bounded[..., 0] ** 2 + bounded[..., 1] ** 2)
+        act_tilt = jnp.sqrt(bounded[..., 0] ** 2 + bounded[..., 1] ** 2)
         info = {
             **info,
             "diagnostics/act_thrust": bounded[..., -1],

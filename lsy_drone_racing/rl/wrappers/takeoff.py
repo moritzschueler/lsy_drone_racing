@@ -5,9 +5,6 @@ from crazyflow.utils import leaf_replace
 from gymnasium.vector import VectorEnv, VectorWrapper
 from jax import Array
 
-jp = jnp
-
-
 class SpinUpRotors(VectorWrapper):
     """Seed the rotors at ~hover RPM whenever an env (auto)resets, to help the drone take off.
 
@@ -41,7 +38,7 @@ class SpinUpRotors(VectorWrapper):
         super().__init__(env)
         self.rotor_vel = rotor_vel
         # Envs reset during the *next* step are those done now; nothing is pending at construction.
-        self._done_last_step = jp.zeros(self.num_envs, dtype=bool)
+        self._done_last_step = jnp.zeros(self.num_envs, dtype=bool)
 
     @property
     def device(self) -> str:
@@ -52,15 +49,15 @@ class SpinUpRotors(VectorWrapper):
         """Set rotor_vel to the seed value for the masked envs in the base env's sim state."""
         data = self.env.unwrapped.data
         states = data.sim_data.states
-        target = jp.full_like(states.rotor_vel, self.rotor_vel)
+        target = jnp.full_like(states.rotor_vel, self.rotor_vel)
         states = leaf_replace(states, mask, rotor_vel=target)
         self.env.unwrapped.data = data.replace(sim_data=data.sim_data.replace(states=states))
 
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[dict, dict]:
         """Reset all envs and warm every drone's rotors."""
         obs, info = self.env.reset(seed=seed, options=options)
-        self._warm_rotors(jp.ones(self.num_envs, dtype=bool))
-        self._done_last_step = jp.zeros(self.num_envs, dtype=bool)
+        self._warm_rotors(jnp.ones(self.num_envs, dtype=bool))
+        self._done_last_step = jnp.zeros(self.num_envs, dtype=bool)
         return obs, info
 
     def step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:

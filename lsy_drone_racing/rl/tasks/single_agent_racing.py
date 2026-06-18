@@ -14,7 +14,7 @@ from jax.scipy.spatial.transform import Rotation as R
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
 from lsy_drone_racing.rl.config import Args
 from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, RelativeRacingObs
-from lsy_drone_racing.rl.wrappers.reward import ActionSmoothnessPenalty, ZeroYaw
+from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, ActionSmoothnessPenalty, ZeroYaw
 from lsy_drone_racing.rl.wrappers.segment_spawn import SegmentSpawn
 from lsy_drone_racing.rl.wrappers.takeoff import SpinUpRotors
 from lsy_drone_racing.utils import load_config
@@ -39,7 +39,7 @@ class RacingArgs(Args):
     target_kl: float = 0.03
     update_epochs: int = 4
     clip_coef: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.008
     anneal_ent_coef: bool = False  # decay entropy to 0 if True
     # Champion-paper progress: weight on the per-step distance-to-gate REDUCTION (now in metres,
     # not a bounded 0-1 potential). At cruise (~1-2 m/s, 50 Hz) the per-step reduction is
@@ -57,18 +57,11 @@ class RacingArgs(Args):
     d_act_coef: float = 0.001
     gate_bonus: float = 20.0
     finish_bonus: float = 30.0
-    crash_penalty: float = 5.0
-    timeout_penalty: float = 5.0  # Terminal penalty on truncation without finishing
-    # Dense per-step "living"/time cost charged every step the drone is still racing (active and not
-    # yet finished). Unlike the terminal timeout_penalty -- which fires once at step 1500 and is
-    # discounted (gamma=0.99 over a 30 s horizon) to a near-zero gradient at the moment the policy
-    # picks its pace -- this pays a constant per-step gradient toward finishing sooner, the actual
-    # racing pressure. The telescoping progress term makes creeping and sprinting collect the same
-    # cumulative progress, so without this dense cost the safe slow basin wins. Start ~0.03 (≈ the
-    # ~0.04/step progress while creeping, so dwelling visibly costs reward); raise to push pace, but
-    # too high and the policy crashes early to escape the clock.
-    time_penalty: float = 0.03
+    crash_penalty: float = 3.0
+    #timeout_penalty: float = 5.0  # Terminal penalty if sim truncates without drone finished
+    time_alive_penalty: float = 1.0 # Continous penalty for each step alive and not finished
     num_steps: int = 128
+    max_episode_length: int = 1500
 
 
 def _target_gate_frame(
@@ -381,7 +374,8 @@ class LogRewardComponents(VectorWrapper):
             speed = jnp.linalg.norm(vel, axis=-1)  # (E, D) speed magnitude
             return along, vel[..., 2], speed
 
-        self._vel_diag = vel_diag
+        self._vel_diag = v# Relative geometry + next-2-gates + rotation matrices (must come after
+    # ActionSmoothnessPenalty so last_action is present in the dict it transforms).el_diag
 
     def step(self, action: Array) -> tuple[Any, Array, Array, Array, dict]:
         """Step, then stash the per-component env-side reward terms (one drone) into ``info``."""
@@ -433,6 +427,7 @@ def make_env(
         seed=config.env.seed,
         device=jax_device,
         reward_fn=reward_fn,
+        max_episode_steps=args.max_episode_length
     )
     # Transparent monitor (innermost): surface each env-side reward term in info for per-component
     # wandb charts. Recomputes the same terms reward_fn used; does not alter obs/reward/done.
@@ -448,6 +443,10 @@ def make_env(
         speed_coef=args.speed_coef,
         max_speed=args.max_speed,
         speed_penalty_slope=args.speed_penalty_slope,
+        act_coef = args.act_coef,
+        d_acth_th_coef = args.d_act_coef,
+        d_act_xy_coef = args.d_act_xy_coef
+
     )
     # Curriculum: respawn drones in per-gate approach cones on (auto)reset. Manages the base data
     # and returns base-format obs (the monitor below it is transparent); inactive until training
@@ -458,16 +457,9 @@ def make_env(
     # first (leaving rotor_vel untouched), then this warms rotor_vel for the same just-reset envs
     # (true-start and cone-spawned alike), so no spawn begins with dead rotors.
     env = SpinUpRotors(env)
+    env = ActionPenalty(env, act_coef=args.act_coef, d_act_th_coef = args.d_act_th_coef, d_act_xy_coef = args.d_act_xy_coef)
     env = NormalizeActions(env)
-    # Single champion-style action-smoothness penalty on the bounded action (replaces the old
-    # AngleReward attitude-magnitude + ActionPenalty energy/split-smoothness stack). Also adds the
-    # bounded last_action to the obs dict.
-    env = ActionSmoothnessPenalty(env, d_act_coef=args.d_act_coef)
-    # Zero yaw outside ActionSmoothnessPenalty so the redundant yaw DOF is excluded from the action
-    # penalty and last_action (yaw is unused for this yaw-symmetric racing task).
     env = ZeroYaw(env)
-    # Relative geometry + next-2-gates + rotation matrices (must come after
-    # ActionSmoothnessPenalty so last_action is present in the dict it transforms).
     env = RelativeRacingObs(env)
     env = FlattenJaxObservation(env)
     return env
