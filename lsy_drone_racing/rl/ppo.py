@@ -11,7 +11,7 @@ import signal
 import time
 import warnings
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import glfw
 import gymnasium as gym
@@ -19,14 +19,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import wandb
 from flax import nnx
 from gymnasium.vector import VectorEnv
 from jax import Array
 
+import wandb
 from lsy_drone_racing.rl.agents.ppo_agent import Agent, _entropy, _log_prob
 from lsy_drone_racing.rl.config import Args
 from lsy_drone_racing.rl.git_provenance import pin_run_to_branch
+
+if TYPE_CHECKING:
+    from types import FrameType
 
 MakeEnv = Callable[[Args, int, str], VectorEnv]
 
@@ -54,13 +57,17 @@ def train_ppo(
     """
     if wandb_enabled and wandb.run is None:
         wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args))
-        # Pin the exact code behind this run to a branch wandb-runs/<name>-<id> so the chart legend
-        # maps straight to reproducible code. Best-effort; never aborts training (see git_provenance).
+        # Pin the exact code behind this run to a branch wandb-runs/<name>-<id> so the chart
+        # legend maps straight to reproducible code. Best-effort; never aborts training (see
+        # git_provenance).
         prov = pin_run_to_branch(wandb.run.name, wandb.run.id)
         wandb.config.update(prov, allow_val_change=True)
         if prov.get("wandb_branch"):
             backup = "pushed to remote" if prov.get("wandb_branch_pushed") else "local only"
-            print(f"[git_provenance] pinned code to branch: {prov['wandb_branch']} ({prov['git_sha'][:8]}, {backup})")
+            print(
+                f"[git_provenance] pinned code to branch: {prov['wandb_branch']} "
+                f"({prov['git_sha'][:8]}, {backup})"
+            )
     train_start_time = time.time()
     set_seeds(args.seed)
     print("Training on device:", jax_device)
@@ -267,10 +274,10 @@ def train_ppo(
     # episode_true_start flag is absent (other tasks / no curriculum).
     true_start_hist: list[float] = []
     # Per true-start episode racing *progress* = gates passed (n_gates if the track was completed).
-    # Skill measure on the fixed deployment distribution, unaffected by reward shaping (crash/timeout/
-    # smoothness penalties), so unlike return it rises with competence and peaks late rather than
-    # early. Drives best-checkpoint + early-stop; empty for non-racing tasks (then we fall back to
-    # return). See best_score selection below.
+    # Skill measure on the fixed deployment distribution, unaffected by reward shaping
+    # (crash/timeout/smoothness penalties), so unlike return it rises with competence and peaks
+    # late rather than early. Drives best-checkpoint + early-stop; empty for non-racing tasks (then
+    # we fall back to return). See best_score selection below.
     true_start_progress_hist: list[float] = []
     # Best checkpoint tracking: snapshot the params whenever the recent mean true-start *score*
     # (gates-passed for racing, else return) improves, then write that snapshot (not the final
@@ -285,7 +292,7 @@ def train_ppo(
     # save (evaluation/render then runs on it). A second Ctrl-C forces an immediate abort.
     stop_requested = {"flag": False}
 
-    def _handle_sigint(signum, frame):
+    def _handle_sigint(signum: int, frame: "FrameType | None") -> None:
         if stop_requested["flag"]:
             raise KeyboardInterrupt  # second press -> hard abort
         stop_requested["flag"] = True
@@ -302,18 +309,19 @@ def train_ppo(
 
         # -- Rollout --
         obs_list, act_list, logp_list, val_list, rew_list, done_list = [], [], [], [], [], []
-        # Cone-spawn gate-pass tally for this iteration: of curriculum (non-true-start) episodes that
-        # finish, how many advanced past the gate they were spawned in front of.
+        # Cone-spawn gate-pass tally for this iteration: of curriculum (non-true-start) episodes
+        # that finish, how many advanced past the gate they were spawned in front of.
         cone_passed, cone_total = 0, 0
-        # Start-mix tally for this iteration: how many finished episodes started from the true race
-        # start vs a cone spawn. The realized true-start fraction should track p_start_schedule(tau).
+        # Start-mix tally for this iteration: how many finished episodes started from the true
+        # race start vs a cone spawn. The realized true-start fraction should track
+        # p_start_schedule(tau).
         true_start_count = 0
         # Per-step metric accumulators: each wrapper stashes a per-env value under a "rew/<name>"
         # (reward component) or "diagnostics/<name>" (diagnostic, e.g. commanded thrust / velocity)
         # info key; we sum them over the rollout (lazily, on-device) and log mean-per-step values so
         # the reward composition and the policy's behavior over training are visible. A "max/<name>"
-        # key is instead reduced with a running max over the rollout and logged as the iteration peak
-        # under diagnostics/<name>_max (e.g. peak speed).
+        # key is instead reduced with a running max over the rollout and logged as the iteration
+        # peak under diagnostics/<name>_max (e.g. peak speed).
         step_metric_sums: dict[str, Array] = {}
         step_metric_max: dict[str, Array] = {}
 
@@ -336,7 +344,9 @@ def train_ppo(
             # Accumulate per-step metrics (reward components + diagnostics; kept on-device,
             # summed across steps & envs, divided by step*env count at log time -> mean per step).
             for key, val in info.items():
-                if isinstance(key, str) and (key.startswith("rew/") or key.startswith("diagnostics/")):
+                if isinstance(key, str) and (
+                    key.startswith("rew/") or key.startswith("diagnostics/")
+                ):
                     step_metric_sums[key] = step_metric_sums.get(key, jnp.zeros(())) + jnp.sum(
                         jnp.asarray(val)
                     )
@@ -368,7 +378,8 @@ def train_ppo(
                     else None
                 )
                 # Start gate of each finishing episode (cone spawns); paired with the terminal
-                # target_gate to detect whether the gate the drone was spawned in front of was passed.
+                # target_gate to detect whether the gate the drone was spawned in front of was
+                # passed.
                 start_gate = (
                     np.array(info["episode_start_gate"]) if "episode_start_gate" in info else None
                 )
@@ -472,8 +483,9 @@ def train_ppo(
             if cone_total > 0:
                 log_metrics["train/cone_gate_pass_rate"] = cone_passed / cone_total
             # Realized true-start fraction among finished episodes this iteration (cone fraction is
-            # 1 - this); should track p_start_schedule(tau). n_starts > 0 only when the curriculum is
-            # active (both counters increment solely when episode_true_start is present).
+            # 1 - this); should track p_start_schedule(tau). n_starts > 0 only when the
+            # curriculum is active (both counters increment solely when episode_true_start is
+            # present).
             n_starts = true_start_count + cone_total
             if n_starts > 0:
                 log_metrics["train/true_start_frac"] = true_start_count / n_starts
@@ -489,11 +501,11 @@ def train_ppo(
             wandb.log(log_metrics, step=global_step)
 
         # -- Best-checkpoint snapshot --
-        # Snapshot params when the recent mean true-start *score* improves. The score is gates-passed
-        # (skill on the fixed deployment distribution, unshaped) for racing, falling back to return
-        # when no gate progress is available (other tasks). pickle.dumps takes an immutable snapshot
-        # now (the optimizer mutates `agent` in place each update, so a live reference would not
-        # preserve this iteration's weights).
+        # Snapshot params when the recent mean true-start *score* improves. The score is
+        # gates-passed (skill on the fixed deployment distribution, unshaped) for racing, falling
+        # back to return when no gate progress is available (other tasks). pickle.dumps takes an
+        # immutable snapshot now (the optimizer mutates `agent` in place each update, so a live
+        # reference would not preserve this iteration's weights).
         best_hist = true_start_progress_hist if true_start_progress_hist else true_start_hist
         best_is_progress = bool(true_start_progress_hist)
         if checkpoint_dir is not None and len(best_hist) >= best_min_episodes:
@@ -502,7 +514,9 @@ def train_ppo(
                 best_score = mean_score
                 best_state_bytes = pickle.dumps(nnx.state(agent, nnx.Param))
                 if wandb_enabled:
-                    key = "charts/best_true_start_gates" if best_is_progress else "charts/best_reward"
+                    key = (
+                        "charts/best_true_start_gates" if best_is_progress else "charts/best_reward"
+                    )
                     wandb.log({key: best_score}, step=global_step)
 
         print(f"Iter {iteration}/{args.num_iterations} took {end_time - start_time:.2f} seconds")

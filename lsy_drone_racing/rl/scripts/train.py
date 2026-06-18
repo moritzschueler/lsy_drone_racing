@@ -8,11 +8,12 @@ Examples:
 
 import os
 from pathlib import Path
+from typing import Any
 
 import fire
 import numpy as np
-import wandb
 
+import wandb
 from lsy_drone_racing.rl.ppo import evaluate_ppo, train_ppo
 from lsy_drone_racing.rl.tasks import get_task
 
@@ -31,7 +32,7 @@ def main(
     train: bool = True,
     num_eval_iterations: int = 1,
     render_eval: bool = True,
-    **kwargs,
+    **kwargs: Any,
 ):
     """Train and/or evaluate a PPO agent on the given task.
 
@@ -59,7 +60,10 @@ def main(
     if num_eval_iterations > 0:
         eval_path = model_path or _latest_checkpoint(task)
         if eval_path is None:
-            raise FileNotFoundError(f"Can't evaluate because there is no checkpoint for task {task} in {task_dir} and training is disabled.")
+            raise FileNotFoundError(
+                f"Can't evaluate because there is no checkpoint for task {task} in {task_dir} "
+                "and training is disabled."
+            )
         episode_rewards, episode_lengths = evaluate_ppo(
             args, task_spec.make_env, num_eval_iterations, eval_path, render=render_eval
         )
