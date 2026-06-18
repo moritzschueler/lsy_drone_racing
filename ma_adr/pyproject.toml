@@ -1,0 +1,30 @@
+[project]
+name = "ma-adr"
+version = "0.1.0"
+description = "Standalone PPO training for the Crazyflow hovering & figure-8 tasks."
+requires-python = ">=3.11,<3.14"  # MuJoCo has no wheels for python 3.14
+dependencies = [
+    # Simulator stack. crazyflow is installed from PyPI (latest published release is 0.1.0);
+    # it pulls in mujoco, scipy, numpy, ml_collections, casadi, einops, drone-models and
+    # drone-controllers transitively, but we pin the drone packages so the lock is explicit.
+    "crazyflow==0.1.0",
+    "drone-controllers==0.1.0",
+    "drone-models==0.1.0",
+    # RL stack used by train.py.
+    "jax[cuda12]>=0.7.2",
+    "flax>=0.10",
+    "optax>=0.2",
+    "gymnasium>=1.2",
+    "fire>=0.5",
+    "matplotlib>=3.8",
+    "numpy>=2.0.0,<3",
+    "scipy>=1.17.0",
+]
+
+# This is a "run the scripts" project, not an installable package — there is nothing to build.
+[tool.uv]
+package = false
+
+[tool.uv.pip]
+# crazyflow's deps use a pre-release of array-api-typing; allow pre-releases during resolution.
+prerelease = "allow"
