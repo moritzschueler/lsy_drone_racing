@@ -39,7 +39,7 @@ class RacingArgs(Args):
     target_kl: float = 0.03
     update_epochs: int = 4
     clip_coef: float = 0.2
-    ent_coef: float = 0.007
+    ent_coef: float = 0.01
     anneal_ent_coef: bool = False  # decay entropy to 0 if True
     # Champion-paper progress: weight on the per-step distance-to-gate REDUCTION (now in metres, not a
     # bounded 0-1 potential). At cruise (~1-2 m/s, 50 Hz) the per-step reduction is ~0.02-0.04 m, so
