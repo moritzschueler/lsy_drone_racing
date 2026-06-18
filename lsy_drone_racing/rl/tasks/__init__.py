@@ -6,26 +6,31 @@ reward, the observation/wrapper stack, and default ``Args`` overrides. The PPO a
 """
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 from gymnasium.vector import VectorEnv
 
 from lsy_drone_racing.rl.config import Args
-from lsy_drone_racing.rl.tasks import hover, racing, trajectory
+from lsy_drone_racing.rl.tasks import hover, single_agent_racing, trajectory
 
 
 @dataclass
 class Task:
-    """A trainable task: an env factory plus default Args overrides."""
+    """A trainable task: an env factory plus the ``Args`` subclass holding its defaults.
+
+    ``args_cls`` is an ``Args`` (sub)class whose field defaults are this task's hyperparameters;
+    the CLI builds the run config with ``args_cls.create(**cli_overrides)``. Tasks without
+    task-specific defaults point at the base ``Args`` directly.
+    """
 
     make_env: Callable[[Args, int, str], VectorEnv]
-    defaults: dict[str, Any]
+    args_cls: type[Args]
 
 
 TASKS: dict[str, Task] = {
-    "single_agent_racing": Task(racing.make_env, racing.RACING_CONFIG),
-    "hover": Task(hover.make_env, hover.DEFAULTS),
-    "random_trajectory_following": Task(trajectory.make_env, trajectory.DEFAULTS),
+    "single_agent_racing": Task(single_agent_racing.make_env, single_agent_racing.RacingArgs),
+    "hover": Task(hover.make_env, Args),
+    "random_trajectory_following": Task(trajectory.make_env, Args),
 }
 
 
