@@ -58,7 +58,7 @@ class RacingArgs(Args):
     gate_bonus: float = 20.0
     finish_bonus: float = 30.0
     crash_penalty: float = 3.0
-    #timeout_penalty: float = 5.0  # Terminal penalty if sim truncates without drone finished
+    timeout_penalty: float = 0.0  # Terminal penalty if sim truncates without drone finished
     time_alive_penalty: float = 1.0 # Continous penalty for each step alive and not finished
     num_steps: int = 128
     max_episode_length: int = 1500
@@ -410,7 +410,7 @@ def make_env(
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
         timeout_penalty=args.timeout_penalty,
-        time_penalty=args.time_penalty,
+        time_penalty=args.time_alive_penalty,
         speed_coef=args.speed_coef,
         max_speed=args.max_speed,
         speed_penalty_slope=args.speed_penalty_slope,
@@ -438,7 +438,7 @@ def make_env(
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
         timeout_penalty=args.timeout_penalty,
-        time_penalty=args.time_penalty,
+        time_penalty=args.time_alive_penalty,
         gate_half_extent=GATE_HALF_EXTENT,
         speed_coef=args.speed_coef,
         max_speed=args.max_speed,
