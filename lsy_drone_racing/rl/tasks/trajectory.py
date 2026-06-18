@@ -25,8 +25,6 @@ from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, Stac
 from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, AngleReward
 from lsy_drone_racing.utils import load_config
 
-jp = jnp
-
 
 class RandTrajEnv(DroneEnv):
     """Drone environment for following a random trajectory.
@@ -187,9 +185,9 @@ class RandTrajEnv(DroneEnv):
             :, 0, :
         ]  # (num_envs, 3)
         # distance to next trajectory point
-        norm_distance = jp.linalg.norm(pos - goal, axis=-1)
-        reward = jp.exp(-2.0 * norm_distance)  # encourage flying close to goal
-        reward = jp.where(
+        norm_distance = jnp.linalg.norm(pos - goal, axis=-1)
+        reward = jnp.exp(-2.0 * norm_distance)  # encourage flying close to goal
+        reward = jnp.where(
             self.terminated(), -1.0, reward
         )  # penalize drones that crash into the ground
         return reward
@@ -217,9 +215,9 @@ class RandTrajEnv(DroneEnv):
     @staticmethod
     @jax.jit
     def _terminated(pos: Array) -> Array:
-        lower_bounds = jp.array([-4.0, -4.0, -0.0])
-        upper_bounds = jp.array([4.0, 4.0, 4.0])
-        terminate = jp.any((pos[:, 0, :] < lower_bounds) | (pos[:, 0, :] > upper_bounds), axis=-1)
+        lower_bounds = jnp.array([-4.0, -4.0, -0.0])
+        upper_bounds = jnp.array([4.0, 4.0, 4.0])
+        terminate = jnp.any((pos[:, 0, :] < lower_bounds) | (pos[:, 0, :] > upper_bounds), axis=-1)
         return terminate
 
     def build_reset_randomization_fn(self, physics: str) -> Callable[[SimData, Array], SimData]:
@@ -227,14 +225,14 @@ class RandTrajEnv(DroneEnv):
 
         # Spin up rotors to help takeoff
         def _reset_randomization_so_rpy(data: SimData, mask: Array) -> SimData:
-            rotor_vel = 0.05 * jp.ones(
+            rotor_vel = 0.05 * jnp.ones(
                 (data.core.n_worlds, data.core.n_drones, data.states.rotor_vel.shape[-1])
             )
             data = data.replace(states=leaf_replace(data.states, mask, rotor_vel=rotor_vel))
             return data
 
         def _reset_randomization_first_principles(data: SimData, mask: Array) -> SimData:
-            rotor_vel = 10000.0 * jp.ones(
+            rotor_vel = 10000.0 * jnp.ones(
                 (data.core.n_worlds, data.core.n_drones, data.states.rotor_vel.shape[-1])
             )
             data = data.replace(states=leaf_replace(data.states, mask, rotor_vel=rotor_vel))

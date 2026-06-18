@@ -30,8 +30,6 @@ from lsy_drone_racing.envs.race_core import obs as race_obs
 from lsy_drone_racing.envs.segment_spawn import SegmentSpawnConfig, apply_spawn, segment_spawn
 from lsy_drone_racing.envs.utils import load_track
 
-jp = jnp
-
 
 class SegmentSpawn(VectorWrapper):
     """Override (auto)reset spawns with cone samples in a target gate's approach corridor."""
@@ -49,18 +47,18 @@ class SegmentSpawn(VectorWrapper):
         super().__init__(env)
         self.cfg = config if config is not None else SegmentSpawnConfig()
         _, _, drones = load_track(env.unwrapped.track)
-        nominal_start = jp.asarray(drones["pos"])[0]  # (3,), the true race start position
+        nominal_start = jnp.asarray(drones["pos"])[0]  # (3,), the true race start position
         self._key = jax.random.key(seed)
-        self._tau = jp.asarray(0.0, dtype=jp.float32)
+        self._tau = jnp.asarray(0.0, dtype=jnp.float32)
         self._active = False  # inactive until training pushes progress via set_progress
-        self._done_last_step = jp.zeros(self.num_envs, dtype=bool)
+        self._done_last_step = jnp.zeros(self.num_envs, dtype=bool)
         # Per-env flag: did the *current* episode start from the true race start (vs a cone spawn)?
         # Used to filter training metrics to genuine full-track attempts.
-        self._true_start = jp.ones(self.num_envs, dtype=bool)
+        self._true_start = jnp.ones(self.num_envs, dtype=bool)
         # Per-env target gate at the start of the *current* episode. Paired with the terminal target
         # gate, this lets training measure whether a cone-spawned episode passed the gate it was
         # spawned in front of (cone-spawn gate-pass rate).
-        self._start_gate = jp.zeros(self.num_envs, dtype=jp.int32)
+        self._start_gate = jnp.zeros(self.num_envs, dtype=jnp.int32)
 
         cfg = self.cfg
 
@@ -88,7 +86,7 @@ class SegmentSpawn(VectorWrapper):
 
         Training calls this once per iteration; evaluation never does, so eval keeps the true start.
         """
-        self._tau = jp.asarray(min(max(tau, 0.0), 1.0), dtype=jp.float32)
+        self._tau = jnp.asarray(min(max(tau, 0.0), 1.0), dtype=jnp.float32)
         self._active = True
 
     def _spawn(self, mask: Array) -> dict:
@@ -97,18 +95,18 @@ class SegmentSpawn(VectorWrapper):
         base = self.env.unwrapped
         base.data, cone_mask = self._respawn(base.data, mask, subkey, self._tau)
         # Masked envs that were cone-spawned no longer start from the true start; the rest do.
-        self._true_start = jp.where(mask, ~cone_mask, self._true_start)
+        self._true_start = jnp.where(mask, ~cone_mask, self._true_start)
         # Record the start gate for the (re)spawned envs so the cone-spawn pass-rate metric can
         # compare it against the terminal target gate at episode end.
-        self._start_gate = jp.where(mask, base.data.target_gate[:, 0], self._start_gate)
+        self._start_gate = jnp.where(mask, base.data.target_gate[:, 0], self._start_gate)
         return self._obs(base.data)
 
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[dict, dict]:
         """Reset all envs, then cone-spawn the curriculum subset."""
         obs, info = self.env.reset(seed=seed, options=options)
-        self._done_last_step = jp.zeros(self.num_envs, dtype=bool)
+        self._done_last_step = jnp.zeros(self.num_envs, dtype=bool)
         if self._active:
-            obs = self._spawn(jp.ones(self.num_envs, dtype=bool))
+            obs = self._spawn(jnp.ones(self.num_envs, dtype=bool))
         return obs, info
 
     def step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:

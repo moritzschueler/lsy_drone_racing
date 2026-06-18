@@ -9,8 +9,6 @@ from gymnasium.vector.utils import batch_space
 from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
 
-jp = jnp
-
 # Number of upcoming gates (current target + the following one) exposed to the policy.
 N_NEXT_GATES = 2
 
@@ -47,7 +45,7 @@ class StackObs(VectorObservationWrapper):
             # Init obs buffer. VecDroneRaceEnv has no standalone obs() method, so seed the
             # history from the initial observation returned by reset().
             init_obs, _ = env.reset()
-            self._prev_obs = jp.zeros((self.num_envs, self.n_obs, 13))
+            self._prev_obs = jnp.zeros((self.num_envs, self.n_obs, 13))
             for _ in range(n_obs):
                 self._prev_obs = self._update_prev_obs(self._prev_obs, init_obs)
 
@@ -63,10 +61,10 @@ class StackObs(VectorObservationWrapper):
     def _update_prev_obs(prev_obs: Array, obs: dict) -> Array:
         """Update previous observations."""
         basic_obs_key = ["pos", "quat", "vel", "ang_vel"]
-        basic_obs = jp.concatenate(
-            [jp.reshape(obs[k], (obs[k].shape[0], -1)) for k in basic_obs_key], axis=-1
+        basic_obs = jnp.concatenate(
+            [jnp.reshape(obs[k], (obs[k].shape[0], -1)) for k in basic_obs_key], axis=-1
         )
-        prev_obs = jp.concatenate([prev_obs[:, 1:, :], basic_obs[:, None, :]], axis=1)
+        prev_obs = jnp.concatenate([prev_obs[:, 1:, :], basic_obs[:, None, :]], axis=1)
         return prev_obs
 
 
@@ -98,9 +96,9 @@ class FlattenJaxObservation(VectorObservationWrapper):
 
     def observations(self, observations: dict) -> Array:
         """Flatten observations into one float32 vector per environment."""
-        return jp.concatenate(
+        return jnp.concatenate(
             [
-                jp.reshape(observations[k], (observations[k].shape[0], -1)).astype(jnp.float32)
+                jnp.reshape(observations[k], (observations[k].shape[0], -1)).astype(jnp.float32)
                 for k in self._keys
             ],
             axis=-1,
@@ -118,15 +116,15 @@ def _relative_racing_obs(obs: dict) -> dict:
     rot_bw = R.from_quat(obs["quat"]).as_matrix()  # (E, 3, 3)
 
     def to_body_vec(v_world: Array) -> Array:  # (E, ..., 3) world vectors -> drone frame
-        return jp.einsum("eji,e...j->e...i", rot_bw, v_world)
+        return jnp.einsum("eji,e...j->e...i", rot_bw, v_world)
 
     # Gravity direction in the body frame: the only world reference a relative observation needs
     # (tells the policy which way is "down" for thrust/attitude). Equals -rot_bw[:, 2, :].
-    grav_body = to_body_vec(jp.array([0.0, 0.0, -1.0]) + jp.zeros_like(pos))
+    grav_body = to_body_vec(jnp.array([0.0, 0.0, -1.0]) + jnp.zeros_like(pos))
     # Indices of the next N_NEXT_GATES gates, clamped to the last gate (and to 0 once finished).
-    base_idx = jp.maximum(obs["target_gate"], 0)  # target_gate is -1 when the track is done
-    idx = jp.minimum(base_idx[:, None] + jp.arange(N_NEXT_GATES)[None, :], n_gates - 1)  # (E, k)
-    env_idx = jp.arange(n_envs)[:, None]
+    base_idx = jnp.maximum(obs["target_gate"], 0)  # target_gate is -1 when the track is done
+    idx = jnp.minimum(base_idx[:, None] + jnp.arange(N_NEXT_GATES)[None, :], n_gates - 1)  # (E, k)
+    env_idx = jnp.arange(n_envs)[:, None]
     gates_pos = obs["gates_pos"][env_idx, idx]  # (E, k, 3)
     gates_quat = obs["gates_quat"][env_idx, idx]  # (E, k, 4)
     gates_visited = obs["gates_visited"][env_idx, idx]  # (E, k)
@@ -138,7 +136,7 @@ def _relative_racing_obs(obs: dict) -> dict:
     gates_rot_bw = (
         R.from_quat(gates_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, N_NEXT_GATES, 3, 3)
     )
-    corners_world = gates_pos[:, :, None, :] + jp.einsum(
+    corners_world = gates_pos[:, :, None, :] + jnp.einsum(
         "ekij,cj->ekci", gates_rot_bw, _GATE_CORNERS_LOCAL
     )  # (E, k, 4, 3)
     gates_corners = to_body_vec(corners_world - pos[:, None, None, :])

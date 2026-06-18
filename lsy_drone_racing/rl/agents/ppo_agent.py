@@ -37,18 +37,18 @@ class Agent(nnx.Module):
 
         # Critic
         self.critic1 = nnx.Linear(
-            obs_dim, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
+            obs_dim, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
         )
-        self.critic2 = nnx.Linear(64, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
-        self.critic_out = nnx.Linear(64, 1, kernel_init=orth(1.0), bias_init=zeros, rngs=rngs)
+        self.critic2 = nnx.Linear(128, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
+        self.critic_out = nnx.Linear(128, 1, kernel_init=orth(1.0), bias_init=zeros, rngs=rngs)
 
         # Actor
         self.actor1 = nnx.Linear(
-            obs_dim, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
+            obs_dim, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
         )
-        self.actor2 = nnx.Linear(64, 64, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
+        self.actor2 = nnx.Linear(128, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
         self.actor_mean = nnx.Linear(
-            64, action_dim, kernel_init=orth(0.01), bias_init=zeros, rngs=rngs
+            128, action_dim, kernel_init=orth(0.01), bias_init=zeros, rngs=rngs
         )
 
         # Learnable log std: lower for roll/pitch/yaw, higher for thrust (last action dim)
@@ -65,14 +65,14 @@ class Agent(nnx.Module):
             (batch, action_dim), (1, action_dim), (batch, 1).
         """
         # Critic
-        v = jnp.tanh(self.critic1(x))
-        v = jnp.tanh(self.critic2(v))
+        v = nnx.leaky_relu(self.critic1(x), 0.2)
+        v = nnx.leaky_relu(self.critic2(v), 0.2)
         value = self.critic_out(v)
 
         # Actor
-        m = jnp.tanh(self.actor1(x))
-        m = jnp.tanh(self.actor2(m))
-        mean = jnp.tanh(self.actor_mean(m))
+        m = nnx.leaky_relu(self.actor1(x), 0.2)
+        m = nnx.leaky_relu(self.actor2(m), 0.2)
+        mean = nnx.leaky_relu(self.actor_mean(m), 0.2)
 
         # Floor the std so the policy keeps exploring (prevents entropy/policy collapse).
         log_std = jnp.clip(self.log_std[...], min=MIN_LOG_STD)
