@@ -45,7 +45,8 @@ class Args:
     ent_coef: float = 0.007
     """coefficient of the entropy (initial value when anneal_ent_coef is set)"""
     anneal_ent_coef: bool = False
-    """linearly anneal ent_coef from its initial value to 0 over training (like anneal_lr), so the policy explores early and sharpens late instead of growing more stochastic"""
+    """linearly anneal ent_coef from its initial value to 0 over training (like anneal_lr), so the
+    policy explores early and sharpens late instead of growing more stochastic"""
     vf_coef: float = 0.7
     """coefficient of the value function"""
     max_grad_norm: float = 1.5
@@ -71,8 +72,8 @@ class Args:
     tasks). The racing task uses the single ``d_act_coef`` below instead."""
     d_act_coef: float = 0.01
     """racing task only: weight of the single champion-style action-smoothness penalty
-    ``-d_act_coef * ||clip(a) - clip(a_prev)||**2`` (ActionSmoothnessPenalty), on the bounded action.
-    Replaces rpy_coef / act_coef / d_act_th_coef / d_act_xy_coef for racing."""
+    ``-d_act_coef * ||clip(a) - clip(a_prev)||**2`` (ActionSmoothnessPenalty), on the bounded
+    action. Replaces rpy_coef / act_coef / d_act_th_coef / d_act_xy_coef for racing."""
 
     # Env (in-step) racing reward coefficients. Only used by the racing task; other tasks
     # compute their reward inside their env class and ignore these.
@@ -81,17 +82,19 @@ class Args:
     finish_bonus: float = 10.0
     crash_penalty: float = 5.0
     timeout_penalty: float = 5.0
-    """dense racing reward coefficients (computed inside the env step). progress_coef now weights the
-    champion-paper progress term: the per-step REDUCTION in distance (m) to the target gate opening
-    (see gate_opening_distance), positive while approaching and proportional to metres covered."""
+    """dense racing reward coefficients (computed inside the env step). progress_coef now weights
+    the champion-paper progress term: the per-step REDUCTION in distance (m) to the target gate
+    opening (see gate_opening_distance), positive while approaching and proportional to metres
+    covered."""
     speed_coef: float = 0.0
     """overall weight of the exponential speed-barrier penalty; 0 disables it."""
     max_speed: float = 3.0
-    """speed ceiling (m/s). Soft barrier: the penalty grows exponentially toward this and diverges at
-    it (saturated to a finite cap), so the drone effectively cannot exceed max_speed."""
+    """speed ceiling (m/s). Soft barrier: the penalty grows exponentially toward this and diverges
+    at it (saturated to a finite cap), so the drone effectively cannot exceed max_speed."""
     speed_penalty_slope: float = 0.3
-    """slope of the exponential speed barrier: larger = the wall rises earlier/steeper (firmer, lower
-    effective ceiling), smaller = the drone can get closer to max_speed before the penalty bites."""
+    """slope of the exponential speed barrier: larger = the wall rises earlier/steeper (firmer,
+    lower effective ceiling), smaller = the drone can get closer to max_speed before the penalty
+    bites."""
 
     @classmethod
     def create(cls, **kwargs: Any) -> "Args":

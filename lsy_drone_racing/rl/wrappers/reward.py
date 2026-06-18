@@ -20,12 +20,12 @@ def action_smoothness_penalty(action: Array, last_action: Array, coef: float) ->
     """Champion-style action-smoothness penalty: ``-coef * ||clip(a) - clip(a_prev)||**2``.
 
     Penalizes the squared change between consecutive *bounded* commands (clipped to the [-1, 1]
-    normalized action range -- i.e. what ``NormalizeActions`` actually applies). Computing it on the
-    bounded action rather than the raw, unbounded policy output keeps the coefficient tied to a fixed
-    command range, so a high-variance policy cannot inflate the penalty and it does not double as a
-    second entropy penalty (the failure mode of the old raw-output version). Summed over all action
-    dims with a single coefficient -- the champion reward (Kaufmann et al. 2023) uses one smoothness
-    weight, not the per-channel split (thrust vs roll/pitch) this replaces.
+    normalized action range -- i.e. what ``NormalizeActions`` actually applies). Computing it on
+    the bounded action rather than the raw, unbounded policy output keeps the coefficient tied to a
+    fixed command range, so a high-variance policy cannot inflate the penalty and it does not double
+    as a second entropy penalty (the failure mode of the old raw-output version). Summed over all
+    action dims with a single coefficient -- the champion reward (Kaufmann et al. 2023) uses one
+    smoothness weight, not the per-channel split (thrust vs roll/pitch) this replaces.
     """
     a = jnp.clip(action, -1.0, 1.0)
     a_prev = jnp.clip(last_action, -1.0, 1.0)
@@ -85,14 +85,21 @@ class ActionPenalty(VectorObservationWrapper):
         action_diff = action - self._last_action
         act_term = -self.act_coef * action[..., -1] ** 2  # energy
         d_act_th_term = -self.d_act_th_coef * action_diff[..., -1] ** 2  # thrust smoothness
-        d_act_xy_term = -self.d_act_xy_coef * jp.sum(action_diff[..., :3] ** 2, axis=-1)  # rp smoothness
+        # rp smoothness
+        d_act_xy_term = -self.d_act_xy_coef * jp.sum(action_diff[..., :3] ** 2, axis=-1)
         reward = reward + act_term + d_act_th_term + d_act_xy_term
         self._last_action = action
         # Surface the terms for per-component reward logging (summed per iteration in PPO).
-        info = {**info, "rew/act": act_term, "rew/d_act_th": d_act_th_term, "rew/d_act_xy": d_act_xy_term}
+        info = {
+            **info,
+            "rew/act": act_term,
+            "rew/d_act_th": d_act_th_term,
+            "rew/d_act_xy": d_act_xy_term,
+        }
         # Diagnostics (normalized action: thrust 0 == hover, +1 == max): mean commanded thrust and
-        # lean magnitude. Distinguishes "climbs because it over-thrusts and never tilts" (act_thrust>0,
-        # act_tilt~0) from a thrust deficit. Logged as diagnostics/* (mean-per-step) by PPO.
+        # lean magnitude. Distinguishes "climbs because it over-thrusts and never tilts"
+        # (act_thrust>0, act_tilt~0) from a thrust deficit. Logged as diagnostics/* (mean-per-step)
+        # by PPO.
         act_tilt = jp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
         info = {**info, "diagnostics/act_thrust": action[..., -1], "diagnostics/act_tilt": act_tilt}
         return self.observations(obs), reward, terminated, truncated, info
@@ -106,15 +113,16 @@ class ActionPenalty(VectorObservationWrapper):
 class ActionSmoothnessPenalty(VectorObservationWrapper):
     """Single champion-style action-smoothness penalty + ``last_action`` in the observation.
 
-    Replaces the racing task's stack of ``AngleReward`` (attitude-magnitude penalty) + ``ActionPenalty``
-    (absolute-thrust energy + split per-channel smoothness) with one term: ``action_smoothness_penalty``
-    on the bounded action. One coefficient, and no attitude/energy bias -- matching the champion reward,
-    which penalizes only the *change* in command. Also exposes the previous (bounded) action in the obs
-    dict for ``RelativeRacingObs`` and logs the commanded thrust / lean diagnostics.
+    Replaces the racing task's stack of ``AngleReward`` (attitude-magnitude penalty) +
+    ``ActionPenalty`` (absolute-thrust energy + split per-channel smoothness) with one term:
+    ``action_smoothness_penalty`` on the bounded action. One coefficient, and no attitude/energy
+    bias -- matching the champion reward, which penalizes only the *change* in command. Also
+    exposes the previous (bounded) action in the obs dict for ``RelativeRacingObs`` and logs the
+    commanded thrust / lean diagnostics.
     """
 
     def __init__(self, env: VectorEnv, d_act_coef: float = 0.01):
-        """Init; add ``last_action`` (bounded) to the observation space and stash the coefficient."""
+        """Add ``last_action`` (bounded) to the observation space and stash the coefficient."""
         super().__init__(env)
         spec = {k: v for k, v in self.single_observation_space.items()}
         spec["last_action"] = spaces.Box(-1.0, 1.0, shape=(4,))
@@ -124,7 +132,7 @@ class ActionSmoothnessPenalty(VectorObservationWrapper):
         self.d_act_coef = d_act_coef
 
     def step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:
-        """Step, add the action-smoothness penalty, and refresh the observed last (bounded) action."""
+        """Step, add the smoothness penalty, and refresh the observed last (bounded) action."""
         obs, reward, terminated, truncated, info = super().step(action)
         bounded = jp.clip(action, -1.0, 1.0)
         d_act_term = action_smoothness_penalty(action, self._last_action, self.d_act_coef)
@@ -134,7 +142,11 @@ class ActionSmoothnessPenalty(VectorObservationWrapper):
         info = {**info, "rew/d_act": d_act_term}
         # Diagnostics on the bounded command (thrust 0 == hover, +1 == max; lean = roll/pitch mag).
         act_tilt = jp.sqrt(bounded[..., 0] ** 2 + bounded[..., 1] ** 2)
-        info = {**info, "diagnostics/act_thrust": bounded[..., -1], "diagnostics/act_tilt": act_tilt}
+        info = {
+            **info,
+            "diagnostics/act_thrust": bounded[..., -1],
+            "diagnostics/act_tilt": act_tilt,
+        }
         return self.observations(obs), reward, terminated, truncated, info
 
     def observations(self, observations: dict) -> dict:

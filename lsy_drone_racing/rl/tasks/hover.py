@@ -110,7 +110,9 @@ class HoverEnv(DroneEnv):
 
     def render(self):
         """Render."""
-        draw_points(self.sim, np.array([self.hover_goal]), rgba=np.array([1.0, 0.0, 0.0, 1.0]), size=0.03)
+        draw_points(
+            self.sim, np.array([self.hover_goal]), rgba=np.array([1.0, 0.0, 0.0, 1.0]), size=0.03
+        )
         self.sim.render()
 
     def obs(self) -> dict[str, Array]:
@@ -187,7 +189,9 @@ class HoverEnv(DroneEnv):
                 return _reset_randomization_so_rpy
 
 
-def make_env(args: Args, num_envs: int, jax_device: str = "cpu", config: str = "level0.toml") -> VectorEnv:
+def make_env(
+    args: Args, num_envs: int, jax_device: str = "cpu", config: str = "level0.toml"
+) -> VectorEnv:
     """Build the vectorized, fully-wrapped hovering environment."""
     config = load_config(Path(__file__).parents[3] / "config" / config)
     env = HoverEnv(

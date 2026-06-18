@@ -43,15 +43,15 @@ class SegmentSpawnConfig:
 
     gate_offset: float = 0.1  # exit-point offset of the predecessor gate, defines segment length
     d_min: float = 0.25  # min standoff from the gate (always leave runway), meters
-    d_max_cap: float = 1.5  # global cap on segment length, meters
-    theta_max: float = 0.4  # cone half-angle at kappa=1, radians (~34 deg)
+    d_max_cap: float = 1.0  # global cap on segment length, meters
+    theta_max: float = 0.2  # cone half-angle at kappa=1, radians (~34 deg)
     margin: float = 0.30  # required horizontal clearance to any obstacle, meters
     z_min: float = 0.20  # spawn altitude floor, meters
     z_max: float = 2.0  # spawn altitude ceiling, meters
     n_candidates: int = 12  # fixed rejection budget per env
     # (a) cone-size schedule: kappa ramps kappa_min -> 1 over [a0, a1]
     a0: float = 0.05
-    a1: float = 0.7
+    a1: float = 0.85
     kappa_min: float = 0.10
     # (b) true-start mixture schedule: p_start_position ramps p_start_min -> p_start_max over
     # [b0, b1]. p_start_min keeps a constant trickle of true-start episodes from the very start, so
@@ -61,13 +61,15 @@ class SegmentSpawnConfig:
     p_start_min: float = 0.20
     p_start_max: float = 0.90
     # (c) initial-speed schedule: cone spawns start with speed v0 along the gate normal (through the
-    # opening), annealed v0_max -> 0 over [c0, c1]. DISABLED (v0_max = 0): the momentum crutch masked
-    # that the policy never learned self-propulsion (early vel_along tracked v0_max and collapsed as
-    # it annealed out), so cone spawns now start at rest, facing the gate, and the policy must
-    # generate its own forward speed from the first step. Set v0_max > 0 to re-enable bootstrapping.
+    # opening), annealed v0_max -> 0 over [c0, c1]. DISABLED (v0_max = 0): the momentum crutch
+    # masked that the policy never learned self-propulsion (early vel_along tracked v0_max and
+    # collapsed as it annealed out), so cone spawns now start at rest, facing the gate, and the
+    # policy must generate its own forward speed from the first step. Set v0_max > 0 to re-enable
+    # bootstrapping.
     c0: float = 0.0
     c1: float = 0.7
-    v0_max: float = 0.25  # m/s along the gate normal at tau=0 (0 = propulsion crutch off)
+    v0_max: float = 0.35  # m/s along the gate normal at tau=0 (0 = propulsion crutch off)
+    v0_min: float = 0.1
 
 
 def cosine_ramp(tau: Array, t0: float, t1: float, v0: float, v1: float) -> Array:
@@ -96,7 +98,7 @@ def p_start_schedule(tau: Array, cfg: SegmentSpawnConfig) -> Array:
 
 def v0_schedule(tau: Array, cfg: SegmentSpawnConfig) -> Array:
     """Cone-spawn initial speed v0(tau): v0_max -> 0 over the (c) window. Ramps down early."""
-    return cosine_ramp(tau, cfg.c0, cfg.c1, cfg.v0_max, 0.0)
+    return cosine_ramp(tau, cfg.c0, cfg.c1, cfg.v0_max, cfg.v0_min)
 
 
 def gate_normals(gates_quat: Array) -> Array:
@@ -146,7 +148,12 @@ def _sample_cone_spawn(
         d_max: Segment length cap for this gate (already min'd with the global cap), scalar.
         obstacles_pos: Obstacle centers, (n_obstacles, 3); only xy is used.
         kappa: Cone-size fraction in (0, 1], scalar (curriculum knob).
-        d_min, theta_max, margin, z_min, z_max, n_candidates: see ``SegmentSpawnConfig``.
+        d_min: Minimum standoff distance from the gate; see ``SegmentSpawnConfig``.
+        theta_max: Cone half-angle at kappa=1; see ``SegmentSpawnConfig``.
+        margin: Required horizontal clearance to obstacles; see ``SegmentSpawnConfig``.
+        z_min: Spawn altitude floor; see ``SegmentSpawnConfig``.
+        z_max: Spawn altitude ceiling; see ``SegmentSpawnConfig``.
+        n_candidates: Rejection-sampling budget; see ``SegmentSpawnConfig``.
 
     Returns:
         Spawn position, (3,).
@@ -254,7 +261,9 @@ def segment_spawn(
     return spawn_pos, spawn_vel, target_gate, cone_mask
 
 
-def apply_spawn(data: Any, mask: Array, spawn_pos: Array, spawn_vel: Array, target_gate: Array) -> Any:
+def apply_spawn(
+    data: Any, mask: Array, spawn_pos: Array, spawn_vel: Array, target_gate: Array
+) -> Any:
     """Write cone spawns into the environment data for the masked envs.
 
     Pure function on ``EnvData`` (does not touch the reset pipeline). For each env where ``mask`` is
