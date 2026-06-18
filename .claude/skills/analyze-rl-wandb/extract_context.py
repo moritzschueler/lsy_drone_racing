@@ -28,7 +28,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]  # .claude/skills/analyze-rl-wandb/ -> repo root
 CONFIG_PY = ROOT / "lsy_drone_racing/rl/config.py"
-RACING_PY = ROOT / "lsy_drone_racing/rl/tasks/racing.py"
+RACING_PY = ROOT / "lsy_drone_racing/rl/tasks/single_agent_racing.py"
 SPAWN_PY = ROOT / "lsy_drone_racing/envs/segment_spawn.py"
 PARAMS_MD = ROOT / "lsy_drone_racing/rl/PARAMETERS.md"
 SCAN_DIRS = [ROOT / "lsy_drone_racing/rl", ROOT / "lsy_drone_racing/envs"]
@@ -55,16 +55,20 @@ def dataclass_defaults(path: Path, class_name: str) -> dict:
     return out
 
 
-def dict_literal(path: Path, var_name: str) -> dict:
-    """Pull a module-level `VAR = { ... }` dict literal out by name (plain or annotated)."""
+def return_dict_keys(path: Path, func_name: str) -> list[str]:
+    """String-literal keys of the dict a named function returns (e.g. the reward components).
+
+    The racing reward terms are logged as ``rew/<name>`` via an f-string, so the literal chart
+    strings never appear in the source for ``chart_inventory``'s regex to find. Instead read them at
+    their source of truth: the ``return {...}`` dict of ``racing_reward_components``.
+    """
     tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
-        targets = node.targets if isinstance(node, ast.Assign) else (
-            [node.target] if isinstance(node, ast.AnnAssign) else []
-        )
-        if any(isinstance(t, ast.Name) and t.id == var_name for t in targets) and node.value:
-            return _literal(node.value)
-    return {}
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            for stmt in ast.walk(node):
+                if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Dict):
+                    return [k.value for k in stmt.value.keys if isinstance(k, ast.Constant)]
+    return []
 
 
 def chart_inventory() -> dict[str, set[str]]:
@@ -81,6 +85,10 @@ def chart_inventory() -> dict[str, set[str]]:
                     keys.add("diagnostics/" + m[len("max/"):] + "_max")
                 else:
                     keys.add(m)
+    # The racing reward components are emitted via f-string (f"rew/{name}"), invisible to the regex
+    # above -- add them from the racing_reward_components return dict (the single best chart group).
+    for name in return_dict_keys(RACING_PY, "racing_reward_components"):
+        keys.add(f"reward/{name}")
     groups: dict[str, set[str]] = {}
     for k in keys:
         groups.setdefault(k.split("/", 1)[0], set()).add(k)
@@ -90,7 +98,9 @@ def chart_inventory() -> dict[str, set[str]]:
 def main() -> None:
     """Print the effective hyperparameters, curriculum schedule, and chart inventory."""
     args = dataclass_defaults(CONFIG_PY, "Args")
-    racing = dict_literal(RACING_PY, "RACING_CONFIG")
+    # The racing task overrides Args via the RacingArgs(Args) dataclass subclass (formerly a
+    # RACING_CONFIG dict merged before Args.create). Its declared fields are exactly the overrides.
+    racing = dataclass_defaults(RACING_PY, "RacingArgs")
     spawn = dataclass_defaults(SPAWN_PY, "SegmentSpawnConfig")
 
     effective = {**args, **racing}  # CLI kwargs override both at runtime; HEAD run = these.
@@ -98,7 +108,7 @@ def main() -> None:
     racing_only = set(racing) - set(args)
 
     print("=" * 78)
-    print("EFFECTIVE HYPERPARAMETERS (Args defaults <- RACING_CONFIG overrides)")
+    print("EFFECTIVE HYPERPARAMETERS (Args defaults <- RacingArgs overrides)")
     print("HEAD run uses these unless overridden on the CLI. [*]=task override, [+]=task-only key")
     print("=" * 78)
     for k in sorted(effective):
