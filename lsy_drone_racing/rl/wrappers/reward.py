@@ -77,6 +77,13 @@ class ActionPenalty(VectorObservationWrapper):
         self.d_act_th_coef = d_act_th_coef
         self.d_act_xy_coef = d_act_xy_coef
 
+    @property
+    def device(self):
+        """Forward the base env's compute device. gymnasium's VectorWrapper does not forward
+        unknown attributes, so NormalizeActions (which wraps this) can't reach ``env.device``
+        without this passthrough."""
+        return self.unwrapped.device
+
     def step(self, action: Array) -> tuple[Array, Array, Array, Array, dict]:
         """Override step."""
         obs, reward, terminated, truncated, info = super().step(action)
@@ -128,6 +135,12 @@ class ActionSmoothnessPenalty(VectorObservationWrapper):
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
         self._last_action = jnp.zeros((self.num_envs, 4))
         self.d_act_coef = d_act_coef
+
+    @property
+    def device(self):
+        """Forward the base env's compute device (see ActionPenalty.device) so NormalizeActions,
+        which wraps this, can reach ``env.device`` through gymnasium's VectorWrapper."""
+        return self.unwrapped.device
 
     def step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:
         """Step, add the smoothness penalty, and refresh the observed last (bounded) action."""
