@@ -43,15 +43,15 @@ class SegmentSpawnConfig:
 
     gate_offset: float = 0.1  # exit-point offset of the predecessor gate, defines segment length
     d_min: float = 0.25  # min standoff from the gate (always leave runway), meters
-    d_max_cap: float = 1.5  # global cap on segment length, meters
-    theta_max: float = 0.4  # cone half-angle at kappa=1, radians (~34 deg)
+    d_max_cap: float = 1.0  # global cap on segment length, meters
+    theta_max: float = 0.2  # cone half-angle at kappa=1, radians (~34 deg)
     margin: float = 0.30  # required horizontal clearance to any obstacle, meters
     z_min: float = 0.20  # spawn altitude floor, meters
     z_max: float = 2.0  # spawn altitude ceiling, meters
     n_candidates: int = 12  # fixed rejection budget per env
     # (a) cone-size schedule: kappa ramps kappa_min -> 1 over [a0, a1]
     a0: float = 0.05
-    a1: float = 0.7
+    a1: float = 0.85
     kappa_min: float = 0.10
     # (b) true-start mixture schedule: p_start_position ramps p_start_min -> p_start_max over
     # [b0, b1]. p_start_min keeps a constant trickle of true-start episodes from the very start, so
