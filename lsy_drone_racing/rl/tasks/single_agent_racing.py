@@ -58,7 +58,16 @@ class RacingArgs(Args):
     gate_bonus: float = 20.0
     finish_bonus: float = 30.0
     crash_penalty: float = 5.0
-    timeout_penalty: float = 20.0  # Penalize timeout if drone doesn't finish
+    timeout_penalty: float = 5.0  # Terminal penalty on truncation without finishing
+    # Dense per-step "living"/time cost charged every step the drone is still racing (active and not
+    # yet finished). Unlike the terminal timeout_penalty -- which fires once at step 1500 and is
+    # discounted (gamma=0.99 over a 30 s horizon) to a near-zero gradient at the moment the policy
+    # picks its pace -- this pays a constant per-step gradient toward finishing sooner, the actual
+    # racing pressure. The telescoping progress term makes creeping and sprinting collect the same
+    # cumulative progress, so without this dense cost the safe slow basin wins. Start ~0.03 (≈ the
+    # ~0.04/step progress while creeping, so dwelling visibly costs reward); raise to push pace, but
+    # too high and the policy crashes early to escape the clock.
+    time_penalty: float = 0.03
     num_steps: int = 128
 
 
@@ -162,6 +171,7 @@ def racing_reward_components(
     finish_bonus: float,
     crash_penalty: float,
     timeout_penalty: float,
+    time_penalty: float,
     gate_half_extent: float,
     speed_coef: float,
     max_speed: float,
@@ -208,6 +218,12 @@ def racing_reward_components(
     speed = jnp.linalg.norm(data.sim_data.states.vel, axis=-1)
     speed_term = -speed_coef * soft_speed_penalty(speed, max_speed, speed_penalty_slope)
 
+    # Dense per-step time cost: charged every step the drone is actively racing and not yet finished
+    # (the finishing step itself has not_finished == False, so finishing is never time-penalized; the
+    # already-finished/idle steps have active == False -> exempt). This is the per-step pace pressure
+    # the terminal timeout_penalty cannot provide across a 1500-step / gamma=0.99 horizon.
+    racing = not_finished & active
+
     # Zero every term on auto-reset transition steps (prev/post straddle an episode boundary).
     keep = (~prev_data.marked_for_reset[:, None]).astype(jnp.float32)
     return {
@@ -216,6 +232,7 @@ def racing_reward_components(
         "finish": finish_bonus * finished * keep,
         "crash": -crash_penalty * crashed * keep,
         "timeout": -timeout_penalty * timed_out * keep,
+        "time": -time_penalty * racing * keep,
         "speed": speed_term * keep,
     }
 
@@ -226,6 +243,7 @@ def build_racing_reward(
     finish_bonus: float = 10.0,
     crash_penalty: float = 5.0,
     timeout_penalty: float = 5.0,
+    time_penalty: float = 0.0,
     gate_half_extent: float = GATE_HALF_EXTENT,
     speed_coef: float = 0.0,
     max_speed: float = 3.0,
@@ -247,14 +265,17 @@ def build_racing_reward(
     * finish_bonus: a large one-off bonus when the final gate is passed (target_gate -> -1),
     * crash_penalty: a penalty when the drone is disabled without finishing (out of bounds
       or collision),
-    * timeout_penalty: a penalty when the episode truncates (hits ``max_episode_steps``) without
-      finishing. Penalizing timeout *symmetrically* with crashing is what stops the policy from
-      treating the clock as a safe harbor -- otherwise the dense progress term (fully collected just
-      by approaching a gate) plus a free timeout make "approach, bank progress, then idle until
-      truncation" dominate actually crossing, so cone_gate_pass_rate peaks then collapses. With both
-      failure modes costing the same, the only way to avoid the end-penalty is to finish, and since
-      parking banks less progress than flying on (and each gate_bonus already exceeds the penalty),
-      forward flight strictly wins.
+    * timeout_penalty: a one-off penalty when the episode truncates (hits ``max_episode_steps``)
+      without finishing. Being terminal and discounted over the full horizon it exerts little
+      *pace* pressure on its own (the ``time`` term below does that); it mainly discourages the
+      pathological "idle out the clock" end-state,
+    * time: a dense per-step "living"/time cost charged every step the drone is still actively racing
+      (not yet finished). This is the racing pressure the terminal ``timeout_penalty`` cannot
+      provide: the progress term telescopes (creeping and sprinting to a gate bank the *same*
+      cumulative progress), and a single penalty at step ``max_episode_steps`` is discounted
+      (gamma over a 1500-step horizon) to a near-zero gradient when the policy chooses its pace.
+      A constant per-step cost gives a non-vanishing gradient toward finishing sooner, so forward
+      flight beats the safe-but-slow basin. Disabled when ``time_penalty == 0``.
     * speed: an exponential barrier that diverges toward ``max_speed`` (see
       :func:`soft_speed_penalty`), an effective ceiling the drone cannot exceed;
       ``speed_penalty_slope`` sets how early/steep the wall rises. It pushes the policy toward a
@@ -270,6 +291,8 @@ def build_racing_reward(
         finish_bonus: Bonus added when the whole track is completed.
         crash_penalty: Penalty subtracted on a crash (collision / out of bounds).
         timeout_penalty: Penalty subtracted on truncation (max_episode_steps) without finishing.
+        time_penalty: Dense per-step cost charged every step the drone is still racing (not finished);
+            0 = off. Provides the pace pressure the terminal timeout_penalty cannot.
         gate_half_extent: Half-extent (m) of the square gate opening used by the progress term as
             the cuboid corridor of equally-good crossing points.
         speed_coef: Overall weight of the exponential speed-barrier penalty; 0 = off.
@@ -286,6 +309,7 @@ def build_racing_reward(
             finish_bonus=finish_bonus,
             crash_penalty=crash_penalty,
             timeout_penalty=timeout_penalty,
+            time_penalty=time_penalty,
             gate_half_extent=gate_half_extent,
             speed_coef=speed_coef,
             max_speed=max_speed,
@@ -317,6 +341,7 @@ class LogRewardComponents(VectorWrapper):
         finish_bonus: float,
         crash_penalty: float,
         timeout_penalty: float,
+        time_penalty: float = 0.0,
         gate_half_extent: float = GATE_HALF_EXTENT,
         speed_coef: float = 0.0,
         max_speed: float = 3.0,
@@ -335,6 +360,7 @@ class LogRewardComponents(VectorWrapper):
                 finish_bonus=finish_bonus,
                 crash_penalty=crash_penalty,
                 timeout_penalty=timeout_penalty,
+                time_penalty=time_penalty,
                 gate_half_extent=gate_half_extent,
                 speed_coef=speed_coef,
                 max_speed=max_speed,
@@ -390,6 +416,7 @@ def make_env(
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
         timeout_penalty=args.timeout_penalty,
+        time_penalty=args.time_penalty,
         speed_coef=args.speed_coef,
         max_speed=args.max_speed,
         speed_penalty_slope=args.speed_penalty_slope,
@@ -416,6 +443,7 @@ def make_env(
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
         timeout_penalty=args.timeout_penalty,
+        time_penalty=args.time_penalty,
         gate_half_extent=GATE_HALF_EXTENT,
         speed_coef=args.speed_coef,
         max_speed=args.max_speed,

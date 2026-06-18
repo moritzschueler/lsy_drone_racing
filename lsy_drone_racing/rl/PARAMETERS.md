@@ -8,7 +8,7 @@ are the current task defaults; treat them as a starting point, not gospel.
 | Source | Holds |
 | --- | --- |
 | [`config.py`](config.py) (`Args`) | All PPO / optimization hyperparameters + the reward-coefficient *defaults* (shared across tasks). |
-| [`tasks/racing.py`](tasks/racing.py) (`RACING_CONFIG`, `GATE_HALF_EXTENT`) | Per-task overrides merged over `Args` before `Args.create`, plus the gate-opening half-extent used by the progress term. **This is what the racing runs actually use.** |
+| [`tasks/single_agent_racing.py`](tasks/single_agent_racing.py) (`RacingArgs`, `GATE_HALF_EXTENT`) | The `RacingArgs(Args)` subclass whose field defaults override `Args` for racing, plus the gate-opening half-extent used by the progress term. **This is what the racing runs actually use** (CLI `--flag`s still layer on top). |
 | [`../envs/segment_spawn.py`](../envs/segment_spawn.py) (`SegmentSpawnConfig`) | The curriculum (cone-spawn geometry + annealing schedules). |
 
 **Environment constants** (not in the config, but you need them to reason about the rest):
@@ -25,22 +25,23 @@ are computed in `racing_reward_components`; the single wrapper term (`d_act`) is
 all in the same units (mean reward contribution per env-step), so they're directly comparable and
 sum to the per-step total reward.
 
-> **Reading the component charts.** Dense terms (`progress`, `d_act`, `speed`) fire every step,
-> so the chart ≈ their typical per-step size. Sparse/event terms (`gate_bonus`, `finish`, `crash`,
-> `timeout`) fire only on the rare step the event happens, so chart value = event value × event rate.
-> A small `gate_bonus` chart (e.g. 0.05) with `gate_bonus=5` means passes happen on ~1 % of steps,
-> not that a pass is worth 0.05. To recover the per-event size, divide by the event rate
-> (e.g. `crash`: −0.010 ÷ (1 / 290 steps) ≈ −3 = `crash_penalty`).
+> **Reading the component charts.** Dense terms (`progress`, `d_act`, `speed`, `time`) fire every
+> step, so the chart ≈ their typical per-step size. Sparse/event terms (`gate_bonus`, `finish`,
+> `crash`, `timeout`) fire only on the rare step the event happens, so chart value = event value ×
+> event rate. A small `gate_bonus` chart (e.g. 0.2) with `gate_bonus=20` means passes happen on ~1 %
+> of steps, not that a pass is worth 0.2. To recover the per-event size, divide by the event rate
+> (e.g. `crash`: −0.017 ÷ (1 / 290 steps) ≈ −5 = `crash_penalty`).
 
-### `progress_coef` (current **1.5**, champion paper λ₁ = 1.0)
+### `progress_coef` (current **5.0**, champion paper λ₁ = 1.0)
 Weight on the dense progress term: `progress_coef · (dₜ₋₁ − dₜ)`, the per-step **reduction in distance
 to the target gate opening** `d` (see `gate_opening_distance`) — the champion-paper progress reward
 (Kaufmann et al. 2023). This is the **workhorse** positive reward: clearly positive whenever the drone
 closes on the gate, proportional to the metres covered, with a *constant* gradient right into the
 opening (no saturation). The champion policy leans almost entirely on it.
 - **Units matter:** `d` is in **metres**, so at cruise (~1–2 m/s, 50 Hz) the per-step reduction is
-  ~0.02–0.04 m and `reward/progress ≈ progress_coef · 0.02–0.04`. This is a different scale from the
-  old bounded 0–1 potential — hence the coef dropped from ~5 to ~1.5.
+  ~0.02–0.04 m and `reward/progress ≈ progress_coef · 0.02–0.04` (≈ 0.1–0.2/step at the current 5.0).
+  This is a different scale from the old bounded 0–1 potential, so the metres-based term is weighted
+  heavily (the champion leans almost entirely on progress).
 - **↑** Stronger, more continuous pull toward gates; the dominant driver. Too high → reckless (dive at
   gates, clip frames) and can drown out the value signal.
 - **↓** Weaker forward pull; the policy has less reason to move and tends to loiter/hover.
@@ -52,12 +53,13 @@ opening (no saturation). The champion policy leans almost entirely on it.
   ~0 or negative means it's loitering / drifting from its target — fix that before adding sparse
   incentives. (The old bounded potential sat at ~0 by construction; this term should not.)
 
-### `gate_bonus` (current **5.0**)
+### `gate_bonus` (current **20.0**)
 One-off bonus each time `target_gate` advances (an actual pass). Provides the discrete "go *through*,
 not just *near*" incentive that the telescoping progress term can't.
 - **↑** Crossing becomes worth more risk. The crash-vs-cross break-even success probability is
-  `crash / (gate_bonus + crash)` — at 5/3 that's `3/8 ≈ 0.38`; at 10 it's `3/13 ≈ 0.23`. Lower
-  threshold ⇒ the policy attempts crossings even when it's only moderately likely to make it.
+  `crash / (gate_bonus + crash)` — at 5/5 that's `5/25 = 0.20`; raising `gate_bonus` lowers it
+  further. Lower threshold ⇒ the policy attempts crossings even when it's only moderately likely to
+  make it.
 - **↓** Crossing has to "pay for itself" via progress alone; with imprecise control the policy backs
   off and the cone-pass rate collapses as exploration anneals.
 - **No floor any more.** With the champion distance-reduction progress there is no full-range crossing
@@ -67,28 +69,47 @@ not just *near*" incentive that the telescoping progress term can't.
   `timeout_penalty` (see that). With the directional progress potential (a non-gameable potential,
   see `GATE_HALF_EXTENT`) and symmetric failure penalties, raising it is safe.
 
-### `finish_bonus` (current **10.0**)
+### `finish_bonus` (current **30.0**)
 Large one-off bonus when the final gate is passed (`target_gate → −1`).
 - **↑** Stronger pull to complete the *whole* track vs. stopping after a few gates.
 - **↓** Less incentive to finish; the policy may settle for partial laps.
 - **Note:** keep it clearly above `gate_bonus` and the failure penalties so finishing always wins.
 
-### `crash_penalty` (current **3.0**)
+### `crash_penalty` (current **5.0**)
 Penalty when a drone is disabled without finishing (`p_z < 0` floor-sink or gate-frame collision).
 The crash also **ends the episode**, so its true cost is `crash_penalty` **plus the forfeited future
-return** — usually much larger than 3.
+return** — usually much larger than 5.
 - **↑** More crash-averse → safer but more timid; can suppress crossing attempts entirely.
 - **↓** Bolder, but risks the drone flailing/out-of-bounds with no deterrent.
 
-### `timeout_penalty` (current **3.0**)
-Penalty when the episode truncates at `max_episode_steps` (30 s) without finishing.
-- **Keep it ≈ `crash_penalty` (symmetric).** Both are "failed to finish"; making them equal means the
-  policy is indifferent to *how* it fails and just maximizes progress/bonuses before the end.
+### `timeout_penalty` (current **5.0**)
+One-off penalty when the episode truncates at `max_episode_steps` (30 s) without finishing.
+- **Terminal ⇒ little pace pressure.** Fired once at step 1500 and discounted over the whole horizon
+  (`γ=0.99` ⇒ `γ¹⁰⁰⁰ ≈ 4e-5`), it has a near-zero gradient at the moment the policy picks its pace —
+  raising it (a 20→5 walk-back happened after 20 did nothing) doesn't make the drone race. The dense
+  `time_penalty` (below) now owns pace pressure; `timeout_penalty` just discourages the degenerate
+  "idle out the clock" end-state.
+- **Keep it ≈ `crash_penalty` (symmetric).** Both are "failed to finish"; equal cost means the policy
+  is indifferent to *how* it fails and won't game one against the other.
 - **Trap (suicide):** if `timeout_penalty ≫ crash_penalty` (e.g. 30 vs 5), surviving-without-finishing
   becomes worse than crashing, so once a drone exhausts the easy progress it **deliberately crashes**
   (−5) rather than loiter to timeout (−30). This is what made earlier runs "commit suicide."
-- **Note:** in practice timeout rarely fires (drones crash at ~290 steps, far short of 1500), so this
-  term is mostly latent — but a bad value still distorts the value function. Don't set it large.
+
+### `time_penalty` (current **0.03**)
+Dense per-step "living"/time cost charged **every step the drone is still actively racing** (not yet
+finished); the finishing step and post-finish idle steps are exempt. This is the racing *pace*
+pressure that the terminal `timeout_penalty` structurally cannot provide.
+- **Why it's needed:** the progress term telescopes — creeping and sprinting to a gate bank the *same*
+  cumulative progress — and a single penalty at the horizon is discounted to nothing at decision time.
+  A constant per-step cost gives a non-vanishing gradient toward finishing *sooner*, so forward flight
+  beats the safe-but-slow basin where the drone hovers/creeps and times out (the failure that
+  motivated this term: `diagnostics/vel_mean` decaying to ~0.4 m/s, timeout firing nearly every
+  episode).
+- **Scale:** at 0.03 it's ≈ the ~0.04/step `progress` while creeping, so dwelling visibly costs reward.
+- **↑** Stronger pace pressure (faster racing); too high and the policy may crash early just to escape
+  the clock — watch `reward/crash` worsening. **↓ / 0** removes pace pressure; the creep returns.
+- **Watch:** `diagnostics/vel_along` / `vel_mean` should *rise*; `reward/timeout` rate should fall
+  toward zero as the drone starts finishing. `reward/time ≈ −0.03 × (fraction of steps still racing)`.
 
 ### `d_act_coef` (current **0.001**; champion λ₅ ≈ 1e-4 relative to λ₁=1.0)
 The **single** champion-style action-smoothness penalty (`ActionSmoothnessPenalty`):
@@ -127,7 +148,7 @@ An earlier `(u)**power` ramp barely bit below the limit; this **diverges toward 
 an effective ceiling the drone cannot exceed (no discontinuous clip).
 - **`max_speed`** is the asymptote: the penalty is 0 at rest, grows exponentially, and blows up at
   `‖vel‖ = max_speed`. (At `slope = 0.15` the unweighted barrier ≈ 0.16 at 0.5×, 0.42 at 0.7×, 2.9 at
-  0.9×, then a wall.) The exponent is **clamped** (`_SPEED_ARG_CAP` in `racing.py`) so the penalty
+  0.9×, then a wall.) The exponent is **clamped** (`_SPEED_ARG_CAP` in `single_agent_racing.py`) so the penalty
   saturates at a large-but-finite value (`expm1(6) ≈ 402`, times `speed_coef`) instead of `inf` —
   required for float32 / advantage stability; `speed >= max_speed` is clipped onto the wall.
 - **`speed_penalty_slope`** sets where the wall rises: **↑** → earlier/steeper (firmer, lower effective
@@ -186,22 +207,24 @@ practiced from varied, recoverable poses. Two cosine schedules anneal it over tr
 | --- | --- | --- | --- |
 | `gate_offset` | 0.1 | **Segment length** def: predecessor gate's exit offset (⚠ *not* the reward `GATE_OFFSET`). | ↑ longer segments / ↓ shorter. |
 | `d_min` | 0.25 | Min standoff from the gate (always leave runway), m. | ↑ farther minimum spawn / ↓ closer (harder, may spawn in the frame). |
-| `d_max_cap` | 1.5 | Global cap on segment length, m. | ↑ allows farther spawns / ↓ keeps spawns near gates. |
-| `theta_max` | 0.4 (~23°) | Cone half-angle at `kappa=1`. | ↑ more off-axis (harder) / ↓ more on-axis (easier). |
+| `d_max_cap` | 1.0 | Global cap on segment length, m. | ↑ allows farther spawns / ↓ keeps spawns near gates. |
+| `theta_max` | 0.2 (~11°) | Cone half-angle at `kappa=1`. | ↑ more off-axis (harder) / ↓ more on-axis (easier). |
 | `margin` | 0.30 | Required horizontal clearance to obstacles, m. | ↑ safer spawns / ↓ riskier, may spawn near obstacles. |
 | `z_min`,`z_max` | 0.20, 2.0 | Spawn altitude floor/ceiling, m. | widen ↔ narrow the vertical spawn band. |
 | `n_candidates` | 12 | Rejection-sampling budget per env for clearance. | ↑ better-cleared spawns, slower / ↓ faster, more rejects. |
-| **`a0`, `a1`** | 0.05, 0.70 | τ-window over which **cone size `kappa`** ramps `kappa_min → 1`. | Earlier/wider window ⇒ difficulty ramps sooner. |
+| **`a0`, `a1`** | 0.05, 0.85 | τ-window over which **cone size `kappa`** ramps `kappa_min → 1`. | Earlier/wider window ⇒ difficulty ramps sooner. |
 | `kappa_min` | 0.10 | Cone-size floor before `a0`. | ↑ starts harder / ↓ starts trivially easy (spawns hug the gate axis). |
 | **`b0`, `b1`** | 0.25, 0.85 | τ-window over which **true-start probability `p_start`** ramps `p_start_min → p_start_max`. | Earlier window ⇒ converge to the real start distribution sooner. |
-| `p_start_min` | 0.05 | Floor fraction of episodes starting from the *true race start*. | ↑ more full-track practice early (but harder) / ↓ almost all cone spawns early. |
-| `p_start_max` | 0.80 | Final true-start fraction. | ↑ ends closer to deployment distribution. |
-| **`c0`, `c1`** | 0.0, 0.50 | τ-window over which **cone-spawn initial speed `v0`** anneals `v0_max → 0` (momentum crutch through the gate; cone spawns only). | Later/wider window ⇒ crutch withdrawn more slowly, longer to learn self-propulsion. |
-| `v0_max` | 0.5 | Through-gate spawn speed at `τ=0`, m/s. | ↑ stronger early momentum crutch (masks propulsion learning) / 0 ⇒ drone must self-propel from rest. |
+| `p_start_min` | 0.20 | Floor fraction of episodes starting from the *true race start*. | ↑ more full-track practice early (but harder) / ↓ almost all cone spawns early. |
+| `p_start_max` | 0.90 | Final true-start fraction. | ↑ ends closer to deployment distribution. |
+| **`c0`, `c1`** | 0.0, 0.70 | τ-window over which **cone-spawn initial speed `v0`** anneals `v0_max → v0_min` (momentum crutch through the gate; cone spawns only). | Later/wider window ⇒ crutch withdrawn more slowly, longer to learn self-propulsion. |
+| `v0_max` | 0.35 | Through-gate spawn speed at `τ=0`, m/s. | ↑ stronger early momentum crutch (masks propulsion learning) / ↓ less. |
+| `v0_min` | 0.1 | Through-gate spawn speed after the (c) window (floor; the crutch is **not** fully withdrawn). | ↑ keeps a permanent momentum crutch / 0 ⇒ drone must self-propel from rest late in training. |
 
 > **Diagnostic tie-in:** `kappa` is *flat at `kappa_min`* until `τ = a0` (= 2.5M steps at 50M total),
-> so during the first ~2.5M steps spawns are point-blank (0.25–0.38 m, ≤3.4° off-axis) and *static*.
-> If `cone_gate_pass_rate` collapses in that window, it's genuine policy degradation, **not** the
+> so during the first ~2.5M steps spawns are point-blank (just past `d_min` = 0.25 m, ≈1° off-axis at
+> `kappa_min·theta_max`) and nearly on-axis, with a small through-gate momentum (`v0 ≈ v0_max` = 0.35
+> m/s). If `cone_gate_pass_rate` collapses in that window, it's genuine policy degradation, **not** the
 > curriculum getting harder.
 
 ---
@@ -214,7 +237,7 @@ practiced from varied, recoverable poses. Two cosine schedules anneal it over tr
 | `gae_lambda` | 0.97 | GAE bias/variance trade-off. | Lower bias, higher variance. | Higher bias, lower variance. |
 | `learning_rate` | 3e-4 | Adam step size (annealed to 0 if `anneal_lr`). | Faster but less stable / can diverge. | Slower, steadier. |
 | `anneal_lr` | true | Linearly decay LR to 0 over training. | — | constant LR. |
-| `ent_coef` | 0.007 | Entropy bonus (exploration). | More exploration; delays premature convergence to risk-averse local optima (the collapse). Too high ⇒ noisy, imprecise control. | Sharper, more deterministic policy sooner — can lock in "don't cross" before the skill forms. |
+| `ent_coef` | 0.01 | Entropy bonus (exploration). | More exploration; delays premature convergence to risk-averse local optima (the collapse). Too high ⇒ noisy, imprecise control (and `losses/entropy` *rising* over training = the policy paid to stay diffuse — consider `anneal_ent_coef`). | Sharper, more deterministic policy sooner — can lock in "don't cross" before the skill forms. |
 | `anneal_ent_coef` | false | Linearly anneal `ent_coef` → 0 over training (like `anneal_lr`). | explores early, sharpens late. | constant entropy bonus throughout. |
 | `clip_coef` (ε) | 0.2 | PPO ratio clip (champion: 0.2). | Bigger policy steps / less conservative. | Smaller, safer updates. |
 | `clip_vloss` | true | Clip the value loss too. | — | unclipped value loss. |
@@ -259,5 +282,8 @@ stops gracefully at the end of the current iteration, writing out that best chec
 - **Make `progress` the positive workhorse; keep it positive.** Bonuses are seasoning.
 - **`gate_offset = 0`** unless you have a specific reason — positive values invite the fly-around exploit.
 - **`crash_penalty ≈ timeout_penalty`** — symmetric failure, no suicide/park incentive.
+- **Pace pressure is dense, not terminal** — `time_penalty` (per-step) makes the drone race; the
+  terminal `timeout_penalty` is discounted to nothing at decision time and won't. If the drone creeps,
+  raise `time_penalty`, don't raise `timeout_penalty`.
 - **Action-smoothness penalties stay tiny** (~1e-3) until passing is solid; they're for polish, not discovery.
 - **A peak-then-collapse in `cone_gate_pass_rate` is a red flag** — instrument the `reward/*` components before touching coefficients.
