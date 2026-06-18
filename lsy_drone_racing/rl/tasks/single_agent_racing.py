@@ -39,7 +39,7 @@ class RacingArgs(Args):
     target_kl: float = 0.03
     update_epochs: int = 4
     clip_coef: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.008
     anneal_ent_coef: bool = False  # decay entropy to 0 if True
     # Champion-paper progress: weight on the per-step distance-to-gate REDUCTION (now in metres,
     # not a bounded 0-1 potential). At cruise (~1-2 m/s, 50 Hz) the per-step reduction is
@@ -57,7 +57,7 @@ class RacingArgs(Args):
     d_act_coef: float = 0.001
     gate_bonus: float = 20.0
     finish_bonus: float = 30.0
-    crash_penalty: float = 5.0
+    crash_penalty: float = 3.0
     timeout_penalty: float = 5.0  # Terminal penalty on truncation without finishing
     # Dense per-step "living"/time cost charged every step the drone is still racing (active and not
     # yet finished). Unlike the terminal timeout_penalty -- which fires once at step 1500 and is
@@ -67,8 +67,9 @@ class RacingArgs(Args):
     # cumulative progress, so without this dense cost the safe slow basin wins. Start ~0.03 (≈ the
     # ~0.04/step progress while creeping, so dwelling visibly costs reward); raise to push pace, but
     # too high and the policy crashes early to escape the clock.
-    time_penalty: float = 0.03
+    time_penalty: float = 0.0
     num_steps: int = 128
+    max_episode_length: int = 1000
 
 
 def _target_gate_frame(
@@ -433,6 +434,7 @@ def make_env(
         seed=config.env.seed,
         device=jax_device,
         reward_fn=reward_fn,
+        max_episode_steps=args.max_episode_length
     )
     # Transparent monitor (innermost): surface each env-side reward term in info for per-component
     # wandb charts. Recomputes the same terms reward_fn used; does not alter obs/reward/done.
