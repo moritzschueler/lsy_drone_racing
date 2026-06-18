@@ -56,7 +56,7 @@ class RacingArgs(Args):
     finish_bonus: float = 30.0
     crash_penalty: float = 3.0
     timeout_penalty: float = 0.0  # Terminal penalty if sim truncates without drone finished
-    time_alive_penalty: float = 1.0 # Continous penalty for each step alive and not finished
+    time_alive_penalty: float = 0.03 # Continous penalty for each step alive and not finished
     num_steps: int = 128
     max_episode_length: int = 1500
 
