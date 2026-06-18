@@ -149,7 +149,8 @@ class RelativeRacingObs(VectorObservationWrapper):
       the body frame -- the only world reference a body-frame observation still needs (which way
       is "down" for thrust/attitude). Yaw-about-vertical is intentionally not observable.
 
-    Requires ``last_action`` to already be present (i.e. wrap *after* ``ActionPenalty``).
+    Requires ``last_action`` to already be present (i.e. wrap *after* the wrapper that adds it:
+    ``ActionSmoothnessPenalty`` for racing, ``ActionPenalty`` for hover / trajectory).
     """
 
     def __init__(self, env: VectorEnv):

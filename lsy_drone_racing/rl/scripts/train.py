@@ -13,7 +13,6 @@ import fire
 import numpy as np
 import wandb
 
-from lsy_drone_racing.rl.config import Args
 from lsy_drone_racing.rl.ppo import evaluate_ppo, train_ppo
 from lsy_drone_racing.rl.tasks import get_task
 
@@ -31,6 +30,7 @@ def main(
     wandb_enabled: bool = True,
     train: bool = True,
     num_eval_iterations: int = 1,
+    render_eval: bool = True,
     **kwargs,
 ):
     """Train and/or evaluate a PPO agent on the given task.
@@ -40,11 +40,12 @@ def main(
         wandb_enabled: Whether to log to Weights & Biases.
         train: Whether to run training. If False, only evaluation runs.
         num_eval_iterations: Number of evaluation episodes to run after training.
+        render_eval: Whether to render evaluation episodes. Set False to run headless.
         **kwargs: Any ``Args`` field override (e.g. num_envs=2048).
     """
     os.environ.pop("WAYLAND_DISPLAY", None)
     task_spec = get_task(task)
-    args = Args.create(**{**task_spec.defaults, **kwargs})
+    args = task_spec.args_cls.create(**kwargs)
 
     # Each task gets its own checkpoint subfolder; runs are saved with a timestamp + reward.
     task_dir = CHECKPOINT_DIR / task
@@ -60,7 +61,7 @@ def main(
         if eval_path is None:
             raise FileNotFoundError(f"Can't evaluate because there is no checkpoint for task {task} in {task_dir} and training is disabled.")
         episode_rewards, episode_lengths = evaluate_ppo(
-            args, task_spec.make_env, num_eval_iterations, eval_path
+            args, task_spec.make_env, num_eval_iterations, eval_path, render=render_eval
         )
         if wandb_enabled and train:
             wandb.log(

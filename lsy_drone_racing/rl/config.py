@@ -67,7 +67,12 @@ class Args:
     d_act_th_coef: float = 0.4
     d_act_xy_coef: float = 1.0
     act_coef: float = 0.02
-    """reward coefficients applied by the wrappers during training"""
+    """reward coefficients applied by the AngleReward + ActionPenalty wrappers (hover / trajectory
+    tasks). The racing task uses the single ``d_act_coef`` below instead."""
+    d_act_coef: float = 0.01
+    """racing task only: weight of the single champion-style action-smoothness penalty
+    ``-d_act_coef * ||clip(a) - clip(a_prev)||**2`` (ActionSmoothnessPenalty), on the bounded action.
+    Replaces rpy_coef / act_coef / d_act_th_coef / d_act_xy_coef for racing."""
 
     # Env (in-step) racing reward coefficients. Only used by the racing task; other tasks
     # compute their reward inside their env class and ignore these.
@@ -76,17 +81,9 @@ class Args:
     finish_bonus: float = 10.0
     crash_penalty: float = 5.0
     timeout_penalty: float = 5.0
-    """dense racing reward coefficients (computed inside the env step)"""
-    progress_reach: float = 2.0
-    """length scale (m) of the progress potential's far field: how far from the gate the term still
-    pulls. Sized to the largest gate-to-gate gap so there is no flat dead zone between gates."""
-    progress_sharpness: float = 0.3
-    """length scale (m) over which the progress potential's near-gate funnel acts; smaller = the
-    through-gate funnel is concentrated closer to the opening."""
-    exit_scale: float = 3.0
-    """entry/exit asymmetry of the progress potential (>= 1). The gate-local along coordinate is
-    inflated by this factor on the exit (already-passed) side, so the field decays faster behind the
-    gate -- a through-gate funnel that pulls the drone in from the entry side. 1 = symmetric."""
+    """dense racing reward coefficients (computed inside the env step). progress_coef now weights the
+    champion-paper progress term: the per-step REDUCTION in distance (m) to the target gate opening
+    (see gate_opening_distance), positive while approaching and proportional to metres covered."""
     speed_coef: float = 0.0
     """overall weight of the exponential speed-barrier penalty; 0 disables it."""
     max_speed: float = 3.0
@@ -96,10 +93,15 @@ class Args:
     """slope of the exponential speed barrier: larger = the wall rises earlier/steeper (firmer, lower
     effective ceiling), smaller = the drone can get closer to max_speed before the penalty bites."""
 
-    @staticmethod
-    def create(**kwargs: Any) -> "Args":
-        """Create arguments class."""
-        args = Args(**kwargs)
+    @classmethod
+    def create(cls, **kwargs: Any) -> "Args":
+        """Create arguments class.
+
+        ``cls`` is the (possibly task-specific) subclass this is called on, so per-task
+        ``Args`` subclasses (e.g. ``RacingArgs``) supply their own field defaults while the
+        runtime-computed sizes below are filled identically for every task.
+        """
+        args = cls(**kwargs)
         args.batch_size = int(args.num_envs * args.num_steps)
         args.minibatch_size = int(args.batch_size // args.num_minibatches)
         args.num_iterations = args.total_timesteps // args.batch_size
