@@ -20,7 +20,7 @@ actually changed, and flag anything structural that needs a human-written prose 
 Run this **every time** a change lands (or is requested) that affects either doc:
 
 - a reward coefficient (`progress_coef`, `gate_bonus`, `finish_bonus`, `crash_penalty`,
-  `timeout_penalty`, `d_act_coef`, `speed_coef`, `max_speed`, `speed_penalty_slope`, `GATE_HALF_EXTENT`),
+  `timeout_penalty`, `d_act_coef`, `speed_coef`, `speed_threshold`, `speed_softness`, `GATE_HALF_EXTENT`),
 - a PPO / optimization hyperparameter (`gamma`, `learning_rate`, `ent_coef`, `clip_coef`, `update_epochs`,
   `target_kl`, `num_steps`, `total_timesteps`, …),
 - a curriculum value in `SegmentSpawnConfig` (`a0/a1`, `b0/b1`, `c0/c1`, `kappa_min`, `theta_max`,

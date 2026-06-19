@@ -32,12 +32,28 @@ sum to the per-step total reward.
 > of steps, not that a pass is worth 0.2. To recover the per-event size, divide by the event rate
 > (e.g. `crash`: −0.017 ÷ (1 / 290 steps) ≈ −5 = `crash_penalty`).
 
-### `progress_coef` (current **5.0**, champion paper λ₁ = 1.0)
-Weight on the dense progress term: `progress_coef · (dₜ₋₁ − dₜ)`, the per-step **reduction in distance
-to the target gate opening** `d` (see `gate_opening_distance`) — the champion-paper progress reward
-(Kaufmann et al. 2023). This is the **workhorse** positive reward: clearly positive whenever the drone
-closes on the gate, proportional to the metres covered, with a *constant* gradient right into the
-opening (no saturation). The champion policy leans almost entirely on it.
+### `progress` (current **`("champion", 5.0)`**, champion paper λ₁ = 1.0)
+The dense progress term is **swappable**: `progress = (variant, coef)` selects which per-gate potential
+`Φ` is used, and `coef` weights it. The per-step reward is always the telescoping increase
+`coef · (Φₜ − Φₜ₋₁)` (measured against the gate that was the target at the *start* of the step), so it
+is a true potential — non-farmable by looping — for every variant. Variants live in
+[`tasks/progress_variants.py`](tasks/progress_variants.py) (`PROGRESS_VARIANTS`); per-variant shape
+params live in `progress_params` (a dict that **always carries every variant's knobs**, so switching the
+active variant never drops a param). CLI: `--progress champion,5.0` (and e.g.
+`--progress asymmetric,4.0`).
+
+The three shipped variants:
+- **`champion`** (default) — `Φ = −gate_opening_distance`: the per-step **reduction in distance to the
+  target gate opening** `d` (the champion-paper reward, Kaufmann et al. 2023). The **workhorse**
+  positive reward: clearly positive whenever the drone closes on the gate, proportional to the metres
+  covered, with a *constant* gradient right into the opening (no saturation). `Φ ≤ 0`, unbounded.
+- **`asymmetric`** — a non-negative through-gate funnel (`Φ ∈ (0, 1]`) peaking at the opening and
+  decaying *faster* on the already-passed (exit) side (params `reach`, `sharpness`, `exit_scale` in
+  `progress_params["asymmetric"]`, defaults `2.0 / 0.3 / 3.0`). The old "bounded potential".
+- **`fancy`** — a blended angle/distance potential (exponential distance bump near the opening handing
+  off to a through-gate alignment term, `gamma_angle = exp(−2·distance)`); no tunable shape params.
+
+`coef` (the workhorse weight, currently **5.0** with `champion`):
 - **Units matter:** `d` is in **metres**, so at cruise (~1–2 m/s, 50 Hz) the per-step reduction is
   ~0.02–0.04 m and `reward/progress ≈ progress_coef · 0.02–0.04` (≈ 0.1–0.2/step at the current 5.0).
   This is a different scale from the old bounded 0–1 potential, so the metres-based term is weighted
@@ -132,33 +148,33 @@ which penalizes only the *change* in command, not attitude or thrust level.
 > by the **hover / trajectory** tasks (their `AngleReward` + `ActionPenalty` wrappers). Racing ignores
 > them and uses `d_act_coef` alone.
 
-### `speed_coef` (current **0.00 — disabled**) / `max_speed` (current **3.0 m/s**) / `speed_penalty_slope` (current **0.15**)
-Exponential **speed barrier**, env-side dense term (logged as `reward/speed`). With normalized speed
-`u = ‖vel‖ / max_speed`:
+### `speed_coef` (current **0.1**) / `speed_threshold` (current **4.0 m/s**) / `speed_softness` (current **3.0**)
+**Softplus speed hinge**, env-side dense term (logged as `reward/speed`). A smooth one-sided penalty on
+speed above `speed_threshold`:
 
 ```
-reward_speed = −speed_coef · ( exp( speed_penalty_slope · u/(1−u) ) − 1 )
+reward_speed = −speed_coef · softplus( speed_softness · (‖vel‖ − speed_threshold) ) / speed_softness
 ```
 
-**Currently disabled** (`speed_coef = 0`): isolation runs showed it suppressed forward flight (a convex
-barrier penalizes speed *variance*, not just its level, choking exploration toward higher cruise), so
-it was turned off while the propulsion problem is being chased. Originally introduced because the
-bounded progress potential let the policy race **too fast to learn the track**.
-An earlier `(u)**power` ramp barely bit below the limit; this **diverges toward `max_speed`** so it is
-an effective ceiling the drone cannot exceed (no discontinuous clip).
-- **`max_speed`** is the asymptote: the penalty is 0 at rest, grows exponentially, and blows up at
-  `‖vel‖ = max_speed`. (At `slope = 0.15` the unweighted barrier ≈ 0.16 at 0.5×, 0.42 at 0.7×, 2.9 at
-  0.9×, then a wall.) The exponent is **clamped** (`_SPEED_ARG_CAP` in `single_agent_racing.py`) so the penalty
-  saturates at a large-but-finite value (`expm1(6) ≈ 402`, times `speed_coef`) instead of `inf` —
-  required for float32 / advantage stability; `speed >= max_speed` is clipped onto the wall.
-- **`speed_penalty_slope`** sets where the wall rises: **↑** → earlier/steeper (firmer, lower effective
-  ceiling); **↓** → the drone can get closer to `max_speed` before the penalty bites.
+This approximates the ReLU hinge `max(0, ‖vel‖ − speed_threshold)`: the drone races **freely below the
+threshold** and pays a smooth, roughly **linear** cost per m/s above it. Introduced because the policy
+raced **too fast (~8 m/s) to learn to brake for the two U-turns** — the hinge caps top speed without
+taxing the straights. It replaces the earlier exponential barrier (`max_speed` / `speed_penalty_slope`),
+which had no free zone (a small penalty/gradient at *every* speed) and so suppressed forward flight.
+- **`speed_threshold`** is where the penalty turns on: ↑ → the drone may cruise faster before it bites;
+  ↓ → a lower effective speed cap. The penalty is ~0 well below it (softplus leaks only a small amount
+  near the knee) and rises ~linearly above it.
+- **`speed_softness`** sets the knee sharpness (units `1/(m/s)`): ↑ → a sharper, more ReLU-like hinge
+  that bites closer to the threshold and leaks less below it; ↓ → a softer, rounder knee. The transition
+  spans ~`1/speed_softness` m/s. At the threshold the unweighted penalty is `log(2)/speed_softness`.
+  `jax.nn.softplus` is float32-stable for large args (grows linearly, no `inf`/NaN), so no exponent cap
+  is needed.
 - **`speed_coef`** trades against `progress_coef`. It's **dense** (every step), so even a small value
   competes with per-step progress (≈ `progress_coef · ΔΦ`, ~0.01–0.05/step at cruise on this 50 Hz
-  track). Watch `reward/speed` vs `reward/progress` and the `diagnostics/vel_along` chart: if the drone
-  creeps, lower `speed_coef` / `speed_penalty_slope` or raise `max_speed`; if it still dives through
-  gates, raise them or lower `max_speed`. Set `speed_coef = 0` to disable entirely.
-- Visualised in [`parameter_visualizations.ipynb`](parameter_visualizations.ipynb) §6 (drag the slope).
+  track). Watch `reward/speed` vs `reward/progress` and the `diagnostics/vel_along` / `diagnostics/vel_max`
+  charts: if the drone creeps, lower `speed_coef` or raise `speed_threshold`; if it still blows through
+  the U-turns, raise `speed_coef` or lower `speed_threshold`. Set `speed_coef = 0` to disable entirely.
+- Visualised in [`parameter_visualizations.ipynb`](parameter_visualizations.ipynb) §6.
 
 ---
 
@@ -170,8 +186,12 @@ champion-paper progress term rewards the per-step reduction of the distance to t
 
 ```
 distance = sqrt(along² + max(|y| − h, 0)² + max(|z| − h, 0)²)   # h = GATE_HALF_EXTENT
-progress = progress_coef · (distanceₜ₋₁ − distanceₜ)
+progress = coef · (distanceₜ₋₁ − distanceₜ)                     # champion variant; coef = progress[1]
 ```
+
+`GATE_HALF_EXTENT` feeds the `champion` and `asymmetric` variants (both use this cuboid opening); the
+`fancy` variant uses the same 0.45 m square internally. The formula block below is the `champion` case.
+
 
 (gate frame: `along` = traversal-axis gap to the gate plane, `y`/`z` span the opening; lateral offsets
 inside the opening clamp to 0, so any crossing point counts equally).
@@ -181,16 +201,19 @@ inside the opening clamp to 0, so any crossing point counts equally).
   same per-metre reward far out and right at the opening (no near-gate saturation). This replaces the
   old bounded `exp` potential whose gain vanished near the gate and whose crossing drop pushed
   `reward/progress` to ~0.
-- **No entry/exit asymmetry.** Crossing the gate the *right* way (−x → +x) is enforced by `gate_passed`
-  / the gate-advance and the crash penalty — matching the paper — not by an `exit_scale` term (removed).
+- **No entry/exit asymmetry (champion).** Crossing the gate the *right* way (−x → +x) is enforced by
+  `gate_passed` / the gate-advance and the crash penalty — matching the paper — not by an `exit_scale`
+  term. (The `asymmetric` variant *does* fold an `exit_scale` asymmetry into its distance; champion does
+  not.)
 - **Potential ⇒ non-farmable.** `Φ = −distance` is a deterministic function of state, so progress
   telescopes and can't be farmed by looping. `gate_bonus` confirms the actual crossing.
 - **Keep in sync** with the `gate_size` used by `gate_passed` in `race_core._update_target_gates`
   (currently `(0.45, 0.45)` → `h = 0.225`) so "inside the opening" matches the env's pass detection.
 
-> **Removed knobs:** `progress_reach`, `progress_sharpness`, `exit_scale` belonged to the old bounded
-> potential and no longer exist. The distance-reduction term has no length scales to tune — only
-> `progress_coef` (its weight) and `GATE_HALF_EXTENT` (the opening size).
+> **Variant-specific knobs:** `reach`, `sharpness`, `exit_scale` are the `asymmetric` variant's length
+> scales — they live in `progress_params["asymmetric"]` (not as flat `Args` fields) and only bite when
+> `progress = ("asymmetric", …)`. The default `champion` distance-reduction term has no length scales to
+> tune — only its `coef` (`progress[1]`) and `GATE_HALF_EXTENT` (the opening size).
 
 - **`GATE_HALF_EXTENT` (`h`)**: shrinking `h` tightens the corridor of equally-good crossing points
   (demands a more accurate lineup); enlarging it loosens it. Keep it matched to `gate_passed`'s box.
