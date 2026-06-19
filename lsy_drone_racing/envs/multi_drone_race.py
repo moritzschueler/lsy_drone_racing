@@ -166,6 +166,8 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
             device=device,
         )
         self.num_envs = num_envs
+        self.freq = freq
+        self.max_episode_time = max_episode_steps
         self.single_action_space = batch_space(
             build_action_space(control_mode, sim_config.drone_model), n_drones
         )
