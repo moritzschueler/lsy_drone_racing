@@ -32,12 +32,28 @@ sum to the per-step total reward.
 > of steps, not that a pass is worth 0.2. To recover the per-event size, divide by the event rate
 > (e.g. `crash`: −0.017 ÷ (1 / 290 steps) ≈ −5 = `crash_penalty`).
 
-### `progress_coef` (current **5.0**, champion paper λ₁ = 1.0)
-Weight on the dense progress term: `progress_coef · (dₜ₋₁ − dₜ)`, the per-step **reduction in distance
-to the target gate opening** `d` (see `gate_opening_distance`) — the champion-paper progress reward
-(Kaufmann et al. 2023). This is the **workhorse** positive reward: clearly positive whenever the drone
-closes on the gate, proportional to the metres covered, with a *constant* gradient right into the
-opening (no saturation). The champion policy leans almost entirely on it.
+### `progress` (current **`("champion", 5.0)`**, champion paper λ₁ = 1.0)
+The dense progress term is **swappable**: `progress = (variant, coef)` selects which per-gate potential
+`Φ` is used, and `coef` weights it. The per-step reward is always the telescoping increase
+`coef · (Φₜ − Φₜ₋₁)` (measured against the gate that was the target at the *start* of the step), so it
+is a true potential — non-farmable by looping — for every variant. Variants live in
+[`tasks/progress_variants.py`](tasks/progress_variants.py) (`PROGRESS_VARIANTS`); per-variant shape
+params live in `progress_params` (a dict that **always carries every variant's knobs**, so switching the
+active variant never drops a param). CLI: `--progress champion,5.0` (and e.g.
+`--progress asymmetric,4.0`).
+
+The three shipped variants:
+- **`champion`** (default) — `Φ = −gate_opening_distance`: the per-step **reduction in distance to the
+  target gate opening** `d` (the champion-paper reward, Kaufmann et al. 2023). The **workhorse**
+  positive reward: clearly positive whenever the drone closes on the gate, proportional to the metres
+  covered, with a *constant* gradient right into the opening (no saturation). `Φ ≤ 0`, unbounded.
+- **`asymmetric`** — a non-negative through-gate funnel (`Φ ∈ (0, 1]`) peaking at the opening and
+  decaying *faster* on the already-passed (exit) side (params `reach`, `sharpness`, `exit_scale` in
+  `progress_params["asymmetric"]`, defaults `2.0 / 0.3 / 3.0`). The old "bounded potential".
+- **`fancy`** — a blended angle/distance potential (exponential distance bump near the opening handing
+  off to a through-gate alignment term, `gamma_angle = exp(−2·distance)`); no tunable shape params.
+
+`coef` (the workhorse weight, currently **5.0** with `champion`):
 - **Units matter:** `d` is in **metres**, so at cruise (~1–2 m/s, 50 Hz) the per-step reduction is
   ~0.02–0.04 m and `reward/progress ≈ progress_coef · 0.02–0.04` (≈ 0.1–0.2/step at the current 5.0).
   This is a different scale from the old bounded 0–1 potential, so the metres-based term is weighted
@@ -170,8 +186,12 @@ champion-paper progress term rewards the per-step reduction of the distance to t
 
 ```
 distance = sqrt(along² + max(|y| − h, 0)² + max(|z| − h, 0)²)   # h = GATE_HALF_EXTENT
-progress = progress_coef · (distanceₜ₋₁ − distanceₜ)
+progress = coef · (distanceₜ₋₁ − distanceₜ)                     # champion variant; coef = progress[1]
 ```
+
+`GATE_HALF_EXTENT` feeds the `champion` and `asymmetric` variants (both use this cuboid opening); the
+`fancy` variant uses the same 0.45 m square internally. The formula block below is the `champion` case.
+
 
 (gate frame: `along` = traversal-axis gap to the gate plane, `y`/`z` span the opening; lateral offsets
 inside the opening clamp to 0, so any crossing point counts equally).
@@ -181,16 +201,19 @@ inside the opening clamp to 0, so any crossing point counts equally).
   same per-metre reward far out and right at the opening (no near-gate saturation). This replaces the
   old bounded `exp` potential whose gain vanished near the gate and whose crossing drop pushed
   `reward/progress` to ~0.
-- **No entry/exit asymmetry.** Crossing the gate the *right* way (−x → +x) is enforced by `gate_passed`
-  / the gate-advance and the crash penalty — matching the paper — not by an `exit_scale` term (removed).
+- **No entry/exit asymmetry (champion).** Crossing the gate the *right* way (−x → +x) is enforced by
+  `gate_passed` / the gate-advance and the crash penalty — matching the paper — not by an `exit_scale`
+  term. (The `asymmetric` variant *does* fold an `exit_scale` asymmetry into its distance; champion does
+  not.)
 - **Potential ⇒ non-farmable.** `Φ = −distance` is a deterministic function of state, so progress
   telescopes and can't be farmed by looping. `gate_bonus` confirms the actual crossing.
 - **Keep in sync** with the `gate_size` used by `gate_passed` in `race_core._update_target_gates`
   (currently `(0.45, 0.45)` → `h = 0.225`) so "inside the opening" matches the env's pass detection.
 
-> **Removed knobs:** `progress_reach`, `progress_sharpness`, `exit_scale` belonged to the old bounded
-> potential and no longer exist. The distance-reduction term has no length scales to tune — only
-> `progress_coef` (its weight) and `GATE_HALF_EXTENT` (the opening size).
+> **Variant-specific knobs:** `reach`, `sharpness`, `exit_scale` are the `asymmetric` variant's length
+> scales — they live in `progress_params["asymmetric"]` (not as flat `Args` fields) and only bite when
+> `progress = ("asymmetric", …)`. The default `champion` distance-reduction term has no length scales to
+> tune — only its `coef` (`progress[1]`) and `GATE_HALF_EXTENT` (the opening size).
 
 - **`GATE_HALF_EXTENT` (`h`)**: shrinking `h` tightens the corridor of equally-good crossing points
   (demands a more accurate lineup); enlarging it loosens it. Keep it matched to `gate_passed`'s box.

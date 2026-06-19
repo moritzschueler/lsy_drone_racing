@@ -1,6 +1,6 @@
 """Single-agent drone racing task: env factory + dense in-step reward."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -9,21 +9,25 @@ import jax.numpy as jnp
 from crazyflow.envs.norm_actions_wrapper import NormalizeActions
 from gymnasium.vector import VectorEnv, VectorWrapper
 from jax import Array
-from jax.scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
 from lsy_drone_racing.rl.config import Args
+from lsy_drone_racing.rl.tasks.progress_variants import (
+    GATE_HALF_EXTENT,
+    PotentialFn,
+    _target_gate_frame,
+    build_progress_potential,
+    default_progress_params,
+    gate_opening_distance,
+)
 from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, RelativeRacingObs
 from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, ActionSmoothnessPenalty, ZeroYaw
 from lsy_drone_racing.rl.wrappers.segment_spawn import SegmentSpawn
 from lsy_drone_racing.rl.wrappers.takeoff import SpinUpRotors
 from lsy_drone_racing.utils import load_config
 
-# Half-extent (m) of the square gate opening, used by the dense progress reward as the cuboid
-# corridor through which *any* crossing point is equally good. Matches the gate_size passed to
-# gate_passed in race_core's _update_target_gates ((0.45, 0.45) -> 0.225 half-extent); keep the two
-# in sync so the dense reward's notion of "inside the opening" agrees with the env's pass detection.
-GATE_HALF_EXTENT = 0.225
+# Re-exported from progress_variants for back-compat (tests / notebook import these from here).
+__all__ = ["GATE_HALF_EXTENT", "gate_opening_distance", "_target_gate_frame"]
 
 @dataclass
 class RacingArgs(Args):
@@ -41,7 +45,14 @@ class RacingArgs(Args):
     clip_coef: float = 0.2
     ent_coef: float = 0.008
     anneal_ent_coef: bool = False  # decay entropy if True
-    progress_coef: float = 5
+    # Swappable dense progress reward: (variant_name, coef). The variant selects the per-gate
+    # potential Phi (see progress_variants.PROGRESS_VARIANTS); the per-step reward is
+    # coef * (Phi(curr) - Phi(prev)). Per-variant shape params live in progress_params (inherited
+    # from Args), which always carries every variant's knobs so switching never drops a param.
+    progress: tuple[str, float] = ("fancy", 5.0)
+    # Per-variant progress shape params, keyed by variant name. Always carries every variant's knobs
+    # (see default_progress_params) so switching the active variant never requires dropping a param.
+    progress_params: dict = field(default_factory=default_progress_params)
     speed_coef: float = 0.00  # exponential speed-barrier weight
     max_speed: float = 3.0  # speed ceiling (m/s)
     speed_penalty_slope: float = 0.15  # how early/steep the exponential wall rises
@@ -56,76 +67,9 @@ class RacingArgs(Args):
     finish_bonus: float = 30.0
     crash_penalty: float = 3.0
     timeout_penalty: float = 0.0  # Terminal penalty if sim truncates without drone finished
-    time_alive_penalty: float = 1.0 # Continous penalty for each step alive and not finished
+    time_alive_penalty: float = 0.03 # Continous penalty for each step alive and not finished
     num_steps: int = 128
     max_episode_length: int = 1500
-
-
-def _target_gate_frame(
-    drone_pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array
-) -> tuple[Array, Array, Array]:
-    """Locate each drone's target gate and express the drone offset in that gate's frame.
-
-    Args:
-        drone_pos: Drone positions, shape (n_envs, n_drones, 3).
-        gates_pos: Gate centers, shape (n_envs, n_gates, 3).
-        gates_quat: Gate orientations (xyzw), shape (n_envs, n_gates, 4).
-        target_gate: Current target gate index per drone, shape (n_envs, n_drones). -1 (finished)
-            wraps to the last gate.
-
-    Returns:
-        ``(gate_pos, rot, local)``: the target gate center (n_envs, n_drones, 3), the gate's
-        rotation matrix gate->world (n_envs, n_drones, 3, 3), and the drone position in the gate
-        frame (n_envs, n_drones, 3) -- local x is the along-axis (traversal) coordinate, local y/z
-        span the gate opening.
-    """
-    n_gates = gates_pos.shape[1]
-    env_idx = jnp.arange(gates_pos.shape[0])[:, None]
-    idx = target_gate % n_gates  # -1 (finished) indicates the last gate
-    gate_pos = gates_pos[env_idx, idx]  # (E, D, 3)
-    gate_quat = gates_quat[env_idx, idx]  # (E, D, 4)
-    n_envs, n_drones = gate_pos.shape[:2]
-    rot = R.from_quat(gate_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, n_drones, 3, 3)
-    # rot maps gate-frame vectors to world; its transpose maps the world offset into the gate frame.
-    local = jnp.einsum("edji,edj->edi", rot, drone_pos - gate_pos)
-    return gate_pos, rot, local
-
-
-def gate_opening_distance(
-    drone_pos: Array,
-    gates_pos: Array,
-    gates_quat: Array,
-    target_gate: Array,
-    half_extent: float,
-) -> Array:
-    """Euclidean distance (m) from each drone to its target gate's *opening* (lower == closer).
-
-    This is the distance used by the champion-paper progress reward (Kaufmann et al.,
-    "Champion-level drone racing using deep RL", 2023): the per-step reward is the *reduction* of
-    this distance, so closing on the gate banks reward proportional to the metres covered, with a
-    constant gradient all the way into the opening (unlike a bounded/saturating potential, whose
-    gain vanishes near the gate and is cancelled by the crossing drop). It is unbounded but still a
-    deterministic function of state (a potential ``Phi = -distance``), so progress telescopes and
-    cannot be farmed by looping.
-
-    Geometry (in the gate frame; the +x column of the gate rotation is the traversal normal):
-    ``along`` is the gate-local x (traversal) coordinate; the lateral (y, z) offsets are clamped to
-    the opening half-extent per axis, giving a cuboid corridor of equally-good crossing points that
-    matches ``gate_passed``'s box test (distance to the gate *opening rectangle*, not its centre)::
-
-        oy = max(|y| - h, 0),  oz = max(|z| - h, 0)
-        distance = sqrt(along**2 + oy**2 + oz**2)
-
-    Direction (cross the gate the right way, -x -> +x) is enforced by ``gate_passed`` / the gate
-    advance and the crash penalty, not by an asymmetry in this distance, matching the paper.
-
-    Returns distance, shape (n_envs, n_drones).
-    """
-    _, _, local = _target_gate_frame(drone_pos, gates_pos, gates_quat, target_gate)
-    along = local[..., 0]
-    oy = jnp.maximum(jnp.abs(local[..., 1]) - half_extent, 0.0)
-    oz = jnp.maximum(jnp.abs(local[..., 2]) - half_extent, 0.0)
-    return jnp.sqrt(along**2 + oy**2 + oz**2)
 
 
 # Cap the barrier's exponent so the (unweighted) penalty stays finite and float32-safe. Without it
@@ -156,6 +100,7 @@ def racing_reward_components(
     data: Any,
     prev_data: Any,
     *,
+    progress_potential: PotentialFn,
     progress_coef: float,
     gate_bonus: float,
     finish_bonus: float,
@@ -174,23 +119,23 @@ def racing_reward_components(
     both the real reward (``build_racing_reward`` sums these) and the per-component wandb logging
     (``LogRewardComponents`` recomputes them), so the chart can never drift from what's optimized.
     """
-    # Progress = champion-paper reward: the per-step REDUCTION in distance to the target gate
-    # opening (see gate_opening_distance), measured against the gate that was the target at the
-    # start of the step (prev_data.target_gate for both terms, so the gate-advance is handled
-    # without an artifact). Positive while approaching, proportional to metres closed; the
-    # gate-advance resets the reference distance to the next gate (a one-step change bounded by the
-    # drone's per-step displacement, not by progress_coef -- so crossing is never meaningfully
-    # net-penalized). Left unmasked on the crossing step to keep it a pure distance difference (no
-    # bias, no flat step).
-    d_prev = gate_opening_distance(
+    # Progress = the per-step INCREASE of the selected progress potential Phi (progress_potential,
+    # one of progress_variants.PROGRESS_VARIANTS), measured against the gate that was the target at
+    # the start of the step (prev_data.target_gate for both terms, so the gate-advance is handled
+    # without an artifact). Every variant is a deterministic function of state, so this difference
+    # telescopes and cannot be farmed by looping; the gate-advance resets the reference potential to
+    # the next gate (a one-step change bounded by the drone's per-step displacement, not by
+    # progress_coef -- so crossing is never meaningfully net-penalized). Left unmasked on the
+    # crossing step to keep it a pure potential difference (no bias, no flat step).
+    phi_prev = progress_potential(
         prev_data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate,
         gate_half_extent,
     )
-    d_curr = gate_opening_distance(
+    phi_curr = progress_potential(
         data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate,
         gate_half_extent,
     )
-    progress = d_prev - d_curr
+    progress = phi_curr - phi_prev
 
     active = prev_data.target_gate != -1  # episode was not already finished
     passed_gate = (data.target_gate != prev_data.target_gate) & active
@@ -228,6 +173,7 @@ def racing_reward_components(
 
 
 def build_racing_reward(
+    progress_potential: PotentialFn | None = None,
     progress_coef: float = 1.0,
     gate_bonus: float = 2.0,
     finish_bonus: float = 10.0,
@@ -244,13 +190,13 @@ def build_racing_reward(
     The reward is computed inside the env (via ``reward_fn``) so it can use the *true* gate
     positions, which the observation only reveals once a gate is sensed. It combines:
 
-    * progress: the champion-paper reward (Kaufmann et al. 2023) -- the per-step *reduction* in
-      distance to the target gate opening (see :func:`gate_opening_distance`), measured against the
-      gate that was the target at the *start* of the step. Positive while approaching, proportional
-      to the metres closed, with a constant gradient into the opening; being a potential
-      (``Phi = -distance``) it cannot be farmed by looping. The gate-advance resets the reference
-      distance to the next gate, a one-step change bounded by the drone's per-step displacement (not
-      by ``progress_coef``), so crossing a gate is never meaningfully net-penalized,
+    * progress: the per-step *increase* of a swappable per-gate potential ``Phi``
+      (``progress_potential``, one of :data:`progress_variants.PROGRESS_VARIANTS`; defaults to the
+      champion-paper ``Phi = -gate_opening_distance``), measured against the gate that was the target
+      at the *start* of the step. Every variant is a deterministic function of state, so it cannot be
+      farmed by looping. The gate-advance resets the reference potential to the next gate, a one-step
+      change bounded by the drone's per-step displacement (not by ``progress_coef``), so crossing a
+      gate is never meaningfully net-penalized,
     * gate_bonus: a one-off bonus each time the target gate advances,
     * finish_bonus: a large one-off bonus when the final gate is passed (target_gate -> -1),
     * crash_penalty: a penalty when the drone is disabled without finishing (out of bounds
@@ -288,12 +234,18 @@ def build_racing_reward(
         speed_coef: Overall weight of the exponential speed-barrier penalty; 0 = off.
         max_speed: Speed ceiling (m/s) the barrier diverges toward (an effective hard limit).
         speed_penalty_slope: Slope of the barrier; larger = the wall rises earlier/steeper.
+        progress_potential: The per-gate potential ``Phi`` whose per-step increase is the progress
+            reward; ``None`` defaults to the champion variant. Build one with
+            :func:`progress_variants.build_progress_potential`.
     """
+    if progress_potential is None:
+        progress_potential = build_progress_potential("champion", default_progress_params())
 
     def reward(data: Any, prev_data: Any) -> Array:
         terms = racing_reward_components(
             data,
             prev_data,
+            progress_potential=progress_potential,
             progress_coef=progress_coef,
             gate_bonus=gate_bonus,
             finish_bonus=finish_bonus,
@@ -326,6 +278,7 @@ class LogRewardComponents(VectorWrapper):
         self,
         env: VectorEnv,
         *,
+        progress_potential: PotentialFn,
         progress_coef: float,
         gate_bonus: float,
         finish_bonus: float,
@@ -337,7 +290,7 @@ class LogRewardComponents(VectorWrapper):
         max_speed: float = 3.0,
         speed_penalty_slope: float = 0.3,
     ):
-        """Init; jit a closure over the (static) reward coefficients."""
+        """Init; jit a closure over the (static) progress potential + reward coefficients."""
         super().__init__(env)
 
         @jax.jit
@@ -345,6 +298,7 @@ class LogRewardComponents(VectorWrapper):
             return racing_reward_components(
                 data,
                 prev_data,
+                progress_potential=progress_potential,
                 progress_coef=progress_coef,
                 gate_bonus=gate_bonus,
                 finish_bonus=finish_bonus,
@@ -400,8 +354,13 @@ def make_env(
 ) -> VectorEnv:
     """Build the vectorized, fully-wrapped racing environment."""
     config = load_config(Path(__file__).parents[3] / "config" / config)
+    # Resolve the swappable progress potential once and share it between the env reward and the
+    # logging monitor so the logged components can never drift from what is optimized.
+    progress_variant, progress_coef = args.progress
+    progress_potential = build_progress_potential(progress_variant, args.progress_params)
     reward_fn = build_racing_reward(
-        progress_coef=args.progress_coef,
+        progress_potential=progress_potential,
+        progress_coef=progress_coef,
         gate_bonus=args.gate_bonus,
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
@@ -429,7 +388,8 @@ def make_env(
     # wandb charts. Recomputes the same terms reward_fn used; does not alter obs/reward/done.
     env = LogRewardComponents(
         env,
-        progress_coef=args.progress_coef,
+        progress_potential=progress_potential,
+        progress_coef=progress_coef,
         gate_bonus=args.gate_bonus,
         finish_bonus=args.finish_bonus,
         crash_penalty=args.crash_penalty,
