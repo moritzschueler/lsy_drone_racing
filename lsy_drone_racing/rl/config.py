@@ -71,25 +71,18 @@ class Args:
     d_act_coef: float = 0.01 # Coefficient for single action term penalty
 
     # Env (in-step) racing reward coefficients. Only used by the racing task; other tasks
-    # compute their reward inside their env class and ignore these.
-    progress_coef: float = 1.0
+    # compute their reward inside their env class and ignore these. The progress term itself is
+    # selected/weighted by ``RacingArgs.progress`` (variant, coef) + ``progress_params``.
     gate_bonus: float = 2.0
     finish_bonus: float = 10.0
     crash_penalty: float = 5.0
     timeout_penalty: float = 5.0
-    """dense racing reward coefficients (computed inside the env step). progress_coef now weights
-    the champion-paper progress term: the per-step REDUCTION in distance (m) to the target gate
-    opening (see gate_opening_distance), positive while approaching and proportional to metres
-    covered."""
+    """dense racing reward coefficients (computed inside the env step)."""
     speed_coef: float = 0.0
-    """overall weight of the exponential speed-barrier penalty; 0 disables it."""
-    max_speed: float = 3.0
-    """speed ceiling (m/s). Soft barrier: the penalty grows exponentially toward this and diverges
-    at it (saturated to a finite cap), so the drone effectively cannot exceed max_speed."""
-    speed_penalty_slope: float = 0.3
-    """slope of the exponential speed barrier: larger = the wall rises earlier/steeper (firmer,
-    lower effective ceiling), smaller = the drone can get closer to max_speed before the penalty
-    bites."""
+    """overall weight of the quadratic speed-hinge penalty; 0 disables it."""
+    speed_threshold: float = 4.0
+    """speed (m/s) above which the quadratic hinge penalizes; the drone races freely below it (zero
+    penalty and gradient) and pays a quadratically growing cost above it."""
 
     @classmethod
     def create(cls, **kwargs: Any) -> "Args":

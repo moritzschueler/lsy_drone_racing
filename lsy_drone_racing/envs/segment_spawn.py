@@ -51,13 +51,13 @@ class SegmentSpawnConfig:
     n_candidates: int = 12  # fixed rejection budget per env
     # (a) cone-size schedule: kappa ramps kappa_min -> 1 over [a0, a1]
     a0: float = 0.05
-    a1: float = 0.85
+    a1: float = 0.3
     kappa_min: float = 0.10
     # (b) true-start mixture schedule: p_start_position ramps p_start_min -> p_start_max over
     # [b0, b1]. p_start_min keeps a constant trickle of true-start episodes from the very start, so
     # the deployment distribution is always represented and gate-progress metrics are never empty.
     b0: float = 0.25
-    b1: float = 0.85
+    b1: float = 0.5
     p_start_min: float = 0.20
     p_start_max: float = 0.90
     # (c) initial-speed schedule: cone spawns start with speed v0 along the gate normal (through the
@@ -67,7 +67,7 @@ class SegmentSpawnConfig:
     # policy must generate its own forward speed from the first step. Set v0_max > 0 to re-enable
     # bootstrapping.
     c0: float = 0.0
-    c1: float = 0.7
+    c1: float = 0.3
     v0_max: float = 0.35  # m/s along the gate normal at tau=0 (0 = propulsion crutch off)
     v0_min: float = 0.1
 
