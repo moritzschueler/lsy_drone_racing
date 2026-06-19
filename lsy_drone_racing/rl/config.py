@@ -71,16 +71,13 @@ class Args:
     d_act_coef: float = 0.01 # Coefficient for single action term penalty
 
     # Env (in-step) racing reward coefficients. Only used by the racing task; other tasks
-    # compute their reward inside their env class and ignore these.
-    progress_coef: float = 1.0
+    # compute their reward inside their env class and ignore these. The progress term itself is
+    # selected/weighted by ``RacingArgs.progress`` (variant, coef) + ``progress_params``.
     gate_bonus: float = 2.0
     finish_bonus: float = 10.0
     crash_penalty: float = 5.0
     timeout_penalty: float = 5.0
-    """dense racing reward coefficients (computed inside the env step). progress_coef now weights
-    the champion-paper progress term: the per-step REDUCTION in distance (m) to the target gate
-    opening (see gate_opening_distance), positive while approaching and proportional to metres
-    covered."""
+    """dense racing reward coefficients (computed inside the env step)."""
     speed_coef: float = 0.0
     """overall weight of the exponential speed-barrier penalty; 0 disables it."""
     max_speed: float = 3.0
