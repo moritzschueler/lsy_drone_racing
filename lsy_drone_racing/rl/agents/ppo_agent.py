@@ -72,7 +72,7 @@ class Agent(nnx.Module):
         # Actor
         m = nnx.leaky_relu(self.actor1(x), 0.2)
         m = nnx.leaky_relu(self.actor2(m), 0.2)
-        mean = nnx.leaky_relu(self.actor_mean(m), 0.2)
+        mean = jnp.tanh(self.actor_mean(m))
 
         # Floor the std so the policy keeps exploring (prevents entropy/policy collapse).
         log_std = jnp.clip(self.log_std[...], min=MIN_LOG_STD)
