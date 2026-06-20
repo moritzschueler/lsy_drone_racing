@@ -12,6 +12,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+import shutil
 
 import glfw
 import gymnasium as gym
@@ -27,7 +28,7 @@ import wandb
 from lsy_drone_racing.rl.agents.ppo_agent import Agent, _entropy, _log_prob
 from lsy_drone_racing.rl.config import Args
 from lsy_drone_racing.rl.git_provenance import pin_run_to_branch
-
+from lsy_drone_racing.rl.wrappers.multi_agent import get_wrapper, OpponentWrapper, EgoOpponent, CheckpointPool
 if TYPE_CHECKING:
     from types import FrameType
 
@@ -83,6 +84,37 @@ def train_ppo(
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
+    multi_agent = hasattr(args,'opponent_start_step')
+    if multi_agent:
+        opponent_wrapper = get_wrapper(envs, OpponentWrapper)
+        opponent_active = False
+
+        # ── Self-play pool ────────────────────────────────────────────────
+        checkpoint_pool = CheckpointPool(
+            max_checkpoints=args.max_self_play_checkpoints,
+            save_dir=Path(__file__).parent / "checkpoints/multi_agent_racing/self_play_checkpoints",
+        )
+
+        self_play_checkpoint_dir = (
+            Path(__file__).parent / "checkpoints/multi_agent_racing/self_play_checkpoints"
+        )
+
+        if self_play_checkpoint_dir.exists() and self_play_checkpoint_dir.is_dir():
+            print(f"Purging all old checkpoints from: {self_play_checkpoint_dir}")
+
+            for item in self_play_checkpoint_dir.iterdir():
+                try:
+                    if item.is_file() or item.is_symlink():
+                        item.unlink()  # Delete individual files or symlinks
+                    elif item.is_dir():
+                        shutil.rmtree(item)  # Delete subdirectories and their contents
+                except Exception as e:
+                    print(f"Failed to delete {item}. Reason: {e}")
+
+            print("Folder cleared successfully.")
+        else:
+            print(f"Directory does not exist yet: {self_play_checkpoint_dir} (No action taken)")
+        last_checkpoint_step = 0
 
     # Curriculum hook: any wrapper in the chain exposing ``set_progress`` is fed training progress
     # (global_step / total_timesteps) each iteration. Check the class (not the instance) so the
@@ -306,7 +338,21 @@ def train_ppo(
     for iteration in range(1, args.num_iterations + 1):
         start_time = time.time()
         set_progress(global_step)  # advance the curriculum schedules (kappa, p_start_position)
-
+        if multi_agent:
+            # ── Activate opponent pool ────────────────────────────────
+            if not opponent_active and global_step >= args.opponent_start_step:
+                opponent_wrapper.set_opponent_active(True)
+                opponent_active = True
+                opponent_wrapper.update_opponent_pool(
+                    self_play_paths=[],
+                    latest_path=None,
+                    ratios=(1.0, 0.0, 0.0),
+                )
+                print(f"[Step {global_step}] Opponent pool activated (fixed only)")
+                next_obs, _ = envs.reset(seed=args.seed)
+                next_obs = jnp.asarray(next_obs)
+                next_done = jnp.zeros(args.num_envs)
+                sum_rewards = jnp.zeros(args.num_envs)
         # -- Rollout --
         obs_list, act_list, logp_list, val_list, rew_list, done_list = [], [], [], [], [], []
         # Cone-spawn gate-pass tally for this iteration: of curriculum (non-true-start) episodes
@@ -411,6 +457,33 @@ def train_ppo(
                             log["train/gates_passed"] = gates_passed
                             log["train/completed"] = float(gates_passed == n_gates)
                         wandb.log(log, step=global_step)
+
+            if multi_agent:
+                # ── Checkpoint save — checked per step, not per iteration ──
+                if (
+                    opponent_active
+                    and global_step - last_checkpoint_step >= args.checkpoint_save_interval
+                ):
+                    ckpt_path = checkpoint_pool.save(agent, global_step)
+                    last_checkpoint_step = global_step
+
+                    pool_fill = min(len(checkpoint_pool) / args.max_self_play_checkpoints, 1.0)
+                    self_ratio   = args.opponent_self_ratio   * pool_fill
+                    latest_ratio = args.opponent_latest_ratio * pool_fill
+                    fixed_ratio  = 1.0 - self_ratio - latest_ratio
+
+                    opponent_wrapper.update_opponent_pool(
+                        self_play_paths=checkpoint_pool.sample(
+                            n=max(1, len(checkpoint_pool))
+                        ),
+                        latest_path=checkpoint_pool.latest(),
+                        ratios=(fixed_ratio, self_ratio, latest_ratio),
+                    )
+                    print(
+                        f"[Step {global_step}] Checkpoint saved → {ckpt_path.name} | "
+                        f"Pool: {len(checkpoint_pool)} ckpts | "
+                        f"fixed={fixed_ratio:.2f} self={self_ratio:.2f} latest={latest_ratio:.2f}"
+                    )
 
         obs_buf = jnp.stack(obs_list)       # (T, E, obs_dim)
         act_buf = jnp.stack(act_list)       # (T, E, act_dim)
@@ -567,6 +640,36 @@ def evaluate_ppo(
     eval_env = make_env(args, 1, args.jax_device)
     action_dim = int(np.prod(eval_env.single_action_space.shape))
     obs_dim = int(np.prod(eval_env.single_observation_space.shape))
+
+    multi_agent = hasattr(args,'opponent_start_step')
+    if multi_agent:
+        # Find available self-play checkpoints
+        eval_opponent = args.eval_opponent
+        opponent_wrapper = get_wrapper(eval_env, OpponentWrapper)
+        opponent_wrapper.set_opponent_active(True)
+        ckpt_dir = Path(__file__).parent / "checkpoints/multi_agent_racing/self_play_checkpoints"
+        ckpt_files = sorted(ckpt_dir.glob("checkpoint_*.ckpt")) if ckpt_dir.exists() else []
+        match eval_opponent:
+            case "fixed": 
+                ratios=(1.0, 0.0, 0.0)
+                print("Evaluating agains a fixed single agent policy!")
+            case "past":
+                ratios=(0.0, 1.0, 0.0)
+                print("Evaluating agains a random checkpoint multiagent policy!")
+            case "latest":
+                ratios=(0.0, 0.0, 1.0)
+                print("Evaluating agains a the latest checkpoint multiagent policy!")
+        
+  
+        opponent_wrapper.update_opponent_pool(
+                self_play_paths=ckpt_files,
+                latest_path=ckpt_files[-1],
+                ratios=ratios,
+            )
+        
+        
+       
+
 
     # Build a fresh model and load the saved parameters into it (like load_state_dict).
     agent = Agent(obs_dim, action_dim, rngs=nnx.Rngs(0))

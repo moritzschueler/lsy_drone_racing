@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Callable, Any
 
 import gymnasium
 from gymnasium import Env
@@ -134,6 +134,7 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
         seed: int = 1337,
         max_episode_steps: int = 1500,
         device: Literal["cpu", "gpu"] = "cpu",
+        reward_fn: Callable[[Any, Any], Array] | None = None,
     ):
         """Vectorized multi-agent drone racing environment.
 
@@ -164,6 +165,7 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
             seed=seed,
             max_episode_steps=max_episode_steps,
             device=device,
+            reward_fn=reward_fn,
         )
         self.num_envs = num_envs
         self.single_action_space = batch_space(
@@ -188,7 +190,7 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
         VectorEnv.reset(self, seed=seed, options=options)
         self.data, (obs, info) = self._reset(self.data, seed=seed)
         return obs, info
-
+    
     def step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:
         """Step the environment for all drones.
 
@@ -196,4 +198,16 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
             action: Action for all drones, i.e., a batch of (n_drones, action_dim) arrays.
         """
         self.data, (obs, reward, terminated, truncated, info) = self._step(self.data, action)
+        
+        # 1. Extract the termination/truncation status of the first drone (index 0)
+        # terminated[:, 0] gives a 1D array of shape (num_envs,)
+        first_drone_terminated = terminated[:, 0]
+        first_drone_truncated = truncated[:, 0]
+
+        # 2. Broadcast that status to ALL drones in that environment
+        # Using [:, None] expands the shape to (num_envs, 1) so it can broadcast
+        # across the (num_envs, n_drones) shape via a bitwise OR (|)
+        terminated = terminated | first_drone_terminated[:, None]
+        truncated = truncated | first_drone_truncated[:, None]
+
         return obs, reward, terminated, truncated, info

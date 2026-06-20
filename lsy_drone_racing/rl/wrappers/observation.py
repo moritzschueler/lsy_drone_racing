@@ -96,13 +96,29 @@ class FlattenJaxObservation(VectorObservationWrapper):
 
     def observations(self, observations: dict) -> Array:
         """Flatten observations into one float32 vector per environment."""
-        return jnp.concatenate(
-            [
-                jnp.reshape(observations[k], (observations[k].shape[0], -1)).astype(jnp.float32)
-                for k in self._keys
-            ],
-            axis=-1,
-        )
+        obs_list = []
+        for k in self._keys:
+            if k in observations:
+                # Key is present: reshape normally
+                val = observations[k]
+                flat_val = jnp.reshape(val, (val.shape[0], -1)).astype(jnp.float32)
+            else:
+                # Key is missing during a trace or step 0 lifecycle hook: fill with zeros
+                space = self.env.single_observation_space[k]
+                flat_size = self._flat_size(space)
+                flat_val = jnp.zeros((self.num_envs, flat_size), dtype=jnp.float32)
+                
+            obs_list.append(flat_val)
+            
+        return jnp.concatenate(obs_list, axis=-1)
+    
+    def transform_extra(self, obs: dict) -> Array:
+        obs_list = []
+        for k in self._keys:
+            val = obs[k]
+            flat_val = jnp.reshape(val, (val.shape[0], -1)).astype(jnp.float32)
+            obs_list.append(flat_val)
+        return jnp.concatenate(obs_list, axis=-1)
 
 
 @jax.jit
@@ -111,6 +127,7 @@ def _relative_racing_obs(obs: dict) -> dict:
     pos = obs["pos"]  # (E, 3)
     n_envs = pos.shape[0]
     n_gates = obs["gates_pos"].shape[1]
+    
     # Drone attitude, body -> world. Its transpose (world -> body) rotates world quantities into
     # the drone frame.
     rot_bw = R.from_quat(obs["quat"]).as_matrix()  # (E, 3, 3)
@@ -118,21 +135,18 @@ def _relative_racing_obs(obs: dict) -> dict:
     def to_body_vec(v_world: Array) -> Array:  # (E, ..., 3) world vectors -> drone frame
         return jnp.einsum("eji,e...j->e...i", rot_bw, v_world)
 
-    # Gravity direction in the body frame: the only world reference a relative observation needs
-    # (tells the policy which way is "down" for thrust/attitude). Equals -rot_bw[:, 2, :].
+    # Gravity direction in the body frame
     grav_body = to_body_vec(jnp.array([0.0, 0.0, -1.0]) + jnp.zeros_like(pos))
-    # Indices of the next N_NEXT_GATES gates, clamped to the last gate (and to 0 once finished).
-    base_idx = jnp.maximum(obs["target_gate"], 0)  # target_gate is -1 when the track is done
+    
+    # Indices of the next N_NEXT_GATES gates
+    base_idx = jnp.maximum(obs["target_gate"], 0)  
     idx = jnp.minimum(base_idx[:, None] + jnp.arange(N_NEXT_GATES)[None, :], n_gates - 1)  # (E, k)
     env_idx = jnp.arange(n_envs)[:, None]
+    
     gates_pos = obs["gates_pos"][env_idx, idx]  # (E, k, 3)
     gates_quat = obs["gates_quat"][env_idx, idx]  # (E, k, 4)
     gates_visited = obs["gates_visited"][env_idx, idx]  # (E, k)
-    # Each gate is observed via the drone-frame positions of its four opening corners. Place the
-    # gate-local corner offsets (0, ±h, ±h) into the world (gate frame -> world via the gate
-    # rotation, then translate by the gate centre), offset from the drone, and rotate into the drone
-    # body frame. The corners jointly encode the gate centre, orientation and scale, so they replace
-    # the old centre + relative-rotation-matrix pair.
+    
     gates_rot_bw = (
         R.from_quat(gates_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, N_NEXT_GATES, 3, 3)
     )
@@ -140,7 +154,9 @@ def _relative_racing_obs(obs: dict) -> dict:
         "ekij,cj->ekci", gates_rot_bw, _GATE_CORNERS_LOCAL
     )  # (E, k, 4, 3)
     gates_corners = to_body_vec(corners_world - pos[:, None, None, :])
-    return {
+    
+    # Base dictionary containing single-agent keys
+    out = {
         "grav_body": grav_body,
         "gates_corners": gates_corners,
         "gates_visited": gates_visited,
@@ -149,6 +165,12 @@ def _relative_racing_obs(obs: dict) -> dict:
         "obstacles_visited": obs["obstacles_visited"],
         "vel": to_body_vec(obs["vel"]),
     }
+
+    if "opp_rel_pos" in obs:
+        out["opp_rel_pos"] = to_body_vec(obs["opp_rel_pos"])
+        out["opp_rel_vel"] = to_body_vec(obs["opp_rel_vel"])
+
+    return out
 
 
 class RelativeRacingObs(VectorObservationWrapper):
@@ -177,23 +199,40 @@ class RelativeRacingObs(VectorObservationWrapper):
     ``ActionSmoothnessPenalty`` for racing, ``ActionPenalty`` for hover / trajectory).
     """
 
-    def __init__(self, env: VectorEnv):
+    def __init__(self, env: VectorEnv, multi_agent: bool = False):
         """Init."""
         super().__init__(env)
         base = self.single_observation_space
         n_obstacles = base["obstacles_pos"].shape[0]
-        spec = {
-            "grav_body": spaces.Box(-1.0, 1.0, shape=(3,)),
-            "gates_corners": spaces.Box(-np.inf, np.inf, shape=(N_NEXT_GATES, 4, 3)),
-            "gates_visited": spaces.Box(0, 1, shape=(N_NEXT_GATES,), dtype=bool),
-            "last_action": base["last_action"],
-            "obstacles_rel_pos": spaces.Box(-np.inf, np.inf, shape=(n_obstacles, 3)),
-            "obstacles_visited": base["obstacles_visited"],
-            "vel": base["vel"],
-        }
+        if multi_agent:
+            spec = {
+                "grav_body": spaces.Box(-1.0, 1.0, shape=(3,)),
+                "gates_corners": spaces.Box(-np.inf, np.inf, shape=(N_NEXT_GATES, 4, 3)),
+                "gates_visited": spaces.Box(0, 1, shape=(N_NEXT_GATES,), dtype=bool),
+                "last_action": base["last_action"],
+                "obstacles_rel_pos": spaces.Box(-np.inf, np.inf, shape=(n_obstacles, 3)),
+                "obstacles_visited": base["obstacles_visited"],
+                "vel": base["vel"],
+                "opp_rel_pos": base["opp_rel_pos"],
+                "opp_rel_vel": base["opp_rel_vel"]
+
+            }
+        else:
+            spec = {
+                "grav_body": spaces.Box(-1.0, 1.0, shape=(3,)),
+                "gates_corners": spaces.Box(-np.inf, np.inf, shape=(N_NEXT_GATES, 4, 3)),
+                "gates_visited": spaces.Box(0, 1, shape=(N_NEXT_GATES,), dtype=bool),
+                "last_action": base["last_action"],
+                "obstacles_rel_pos": spaces.Box(-np.inf, np.inf, shape=(n_obstacles, 3)),
+                "obstacles_visited": base["obstacles_visited"],
+                "vel": base["vel"],
+            }
         self.single_observation_space = spaces.Dict(spec)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
     def observations(self, observations: dict) -> dict:
         """Transform the raw observation dict into the relative racing representation."""
         return _relative_racing_obs(observations)
+    
+    def transform_extra(self, obs: dict) -> dict:
+        return _relative_racing_obs(obs)

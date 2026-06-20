@@ -11,7 +11,7 @@ from typing import Callable
 from gymnasium.vector import VectorEnv
 
 from lsy_drone_racing.rl.config import Args
-from lsy_drone_racing.rl.tasks import hover, single_agent_racing, trajectory
+from lsy_drone_racing.rl.tasks import hover, single_agent_racing, trajectory, multi_agent_racing
 
 
 @dataclass
@@ -31,6 +31,7 @@ TASKS: dict[str, Task] = {
     "single_agent_racing": Task(single_agent_racing.make_env, single_agent_racing.RacingArgs),
     "hover": Task(hover.make_env, Args),
     "random_trajectory_following": Task(trajectory.make_env, Args),
+    "multi_agent_racing": Task(multi_agent_racing.make_env, multi_agent_racing.RacingArgs)
 }
 
 
