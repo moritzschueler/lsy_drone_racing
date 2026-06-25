@@ -663,7 +663,7 @@ def evaluate_ppo(
   
         opponent_wrapper.update_opponent_pool(
                 self_play_paths=ckpt_files,
-                latest_path=ckpt_files[-1],
+                latest_path=ckpt_files[-1] if ckpt_files else None,
                 ratios=ratios,
             )
         

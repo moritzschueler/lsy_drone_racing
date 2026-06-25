@@ -39,7 +39,7 @@ class RacingArgs(Args):
     layers any explicit ``--flag`` overrides on top via ``RacingArgs.create(**kwargs)``.
     """
 
-    total_timesteps: int = 15_000_000
+    total_timesteps: int = 1_000_000
     gamma: float = 0.99
     learning_rate: float = 3e-4
     target_kl: float = 0.03
@@ -72,16 +72,16 @@ class RacingArgs(Args):
     num_steps: int = 128
     max_episode_length: int = 1500
 
-    opponent_start_step: int = 10_000_000 # global step at which the opponent agent is introduced
+    opponent_start_step: int = 400_000 # global step at which the opponent agent is introduced
      # Opponent pool distribution (must sum to 1.0)
     opponent_fixed_ratio: float = 0.4    # fixed AttitudeRL policies
     opponent_self_ratio: float = 0.4     # own past checkpoints  
     opponent_latest_ratio: float = 0.2   # latest checkpoint (most recent self)
     # Self-play settings
-    checkpoint_save_interval: int = 1_000_000   # save own checkpoint every N steps
+    checkpoint_save_interval: int = 200_000   # save own checkpoint every N steps
     max_self_play_checkpoints: int = 10       # keep last N own checkpoints
     # eval multi agent race
-    eval_opponent: str = 'latest' # fixed, past, latest
+    eval_opponent: str = 'fixed' # fixed, past, latest
     # competitive reward coefs
     rank_coef: float = 0.1
     segment_lead_coef: float = 0.5

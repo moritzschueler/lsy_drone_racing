@@ -25,3 +25,8 @@ acados/
 
 # RL training checkpoints (artifacts, not source)
 lsy_drone_racing/rl/checkpoints/**/*.ckpt
+!lsy_drone_racing/rl/checkpoints/multi_agent_racing/fixed_policies/trajectory_follow_5s.ckpt
+!lsy_drone_racing/rl/checkpoints/multi_agent_racing/fixed_policies/trajectory_follow_8s.ckpt
+!lsy_drone_racing/rl/checkpoints/multi_agent_racing/fixed_policies/trajectory_follow_10s.ckpt
+!lsy_drone_racing/rl/checkpoints/multi_agent_racing/fixed_policies/trajectory_follow_15s.ckpt
+
