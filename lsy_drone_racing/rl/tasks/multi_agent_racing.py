@@ -88,6 +88,12 @@ class RacingArgs(Args):
     proximity_coef: float = 1.0
     proximity_threshold: float = 0.2
     victory_coef: float = 50.0
+    # Downwash penalty: penalizes ego for flying directly below the opponent drone.
+    # Models the turbulent downwash that a drone above creates.
+    downwash_coef: float = 1.0
+    downwash_base_radius: float = 0.2    # cone base radius (m) at zero vertical separation
+    downwash_expansion: float = 0.5      # cone radius growth per metre of vertical separation
+    downwash_vertical_softening: float = 0.5  # softens 1/(z+k); larger = gentler falloff
 
 
 def quadratic_speed_penalty(speed: Array, threshold: float) -> Array:
@@ -422,15 +428,19 @@ def make_env(
         _print_recursive(d)
         print("=" * (14 + len(label)))
     env = OpponentWrapper(
-        num_envs, 
-        env, 
+        num_envs,
+        env,
         config,
         rank_coef=args.rank_coef,
         segment_lead_coef=args.segment_lead_coef,
         proximity_coef=args.proximity_coef,
         proximity_threshold=args.proximity_threshold,
-        victory_coef=args.victory_coef
-        )
+        victory_coef=args.victory_coef,
+        downwash_coef=args.downwash_coef,
+        downwash_base_radius=args.downwash_base_radius,
+        downwash_expansion=args.downwash_expansion,
+        downwash_vertical_softening=args.downwash_vertical_softening,
+    )
     # Transparent monitor (innermost): surface each env-side reward term in info for per-component
     # wandb charts. Recomputes the same terms reward_fn used; does not alter obs/reward/done.
     # print_dict_shapes(env.single_observation_space, "Initial Dict Space")

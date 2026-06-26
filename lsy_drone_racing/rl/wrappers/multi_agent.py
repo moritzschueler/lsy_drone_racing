@@ -129,6 +129,10 @@ class OpponentWrapper(VectorWrapper):
         proximity_coef: float = 1.0,
         proximity_threshold: float = 0.1,
         victory_coef: float = 50.0,
+        downwash_coef: float = 1.0,
+        downwash_base_radius: float = 0.2,
+        downwash_expansion: float = 0.5,
+        downwash_vertical_softening: float = 0.5,
     ):
         inner_single_obs = env.single_observation_space
         assert isinstance(inner_single_obs, spaces.Dict), (
@@ -166,12 +170,12 @@ class OpponentWrapper(VectorWrapper):
         self._proximity_coef = proximity_coef
         self._proximity_threshold = proximity_threshold
         self._victory_coef = victory_coef
+        self._downwash_coef = downwash_coef
+        self._downwash_base_radius = downwash_base_radius
+        self._downwash_expansion = downwash_expansion
+        self._downwash_vertical_softening = downwash_vertical_softening
         self._prev_done: np.ndarray | None = None
 
-        self.track = env.track
-        self.device = env.device
-        self.data = env.data
-        self.sim = env.sim
 
         self._attitude_config = load_config(Path(__file__).parents[3] / "config" / "level0.toml")
         self._fixed_pool_weights = []
@@ -198,7 +202,8 @@ class OpponentWrapper(VectorWrapper):
 
         # Built once here; recompiled only if coefficients change (they don't during training).
         self._competition_reward_jit = self._build_competition_reward_jit(
-            rank_coef, segment_lead_coef, proximity_coef, proximity_threshold, victory_coef
+            rank_coef, segment_lead_coef, proximity_coef, proximity_threshold, victory_coef,
+            downwash_coef, downwash_base_radius, downwash_expansion, downwash_vertical_softening,
         )
 
         # Cached action bounds as JAX arrays for batched EgoOpponent denormalization (opt 1).
@@ -248,9 +253,11 @@ class OpponentWrapper(VectorWrapper):
         proximity_coef: float,
         proximity_threshold: float,
         victory_coef: float,
+        downwash_coef: float,
+        downwash_base_radius: float,
+        downwash_expansion: float,
+        downwash_vertical_softening: float,
     ):
-        """Return a jit-compiled function that computes all competition reward components."""
-
         @jax.jit
         def _jit_fn(
             ego_pos, ego_gate, ego_gates_pos,
@@ -269,7 +276,6 @@ class OpponentWrapper(VectorWrapper):
 
             # --- segment lead reward ---
             safe_gate = jnp.clip(ego_gate, 0, ego_gates_pos.shape[1] - 1)
-            # gather ego's next gate position per env
             ego_next_gate_pos = ego_gates_pos[jnp.arange(ego_gates_pos.shape[0]), safe_gate]
             ego_dist = jnp.linalg.norm(ego_next_gate_pos - ego_pos, axis=-1)
             opp_dist = jnp.linalg.norm(ego_next_gate_pos - opp_pos, axis=-1)
@@ -282,13 +288,28 @@ class OpponentWrapper(VectorWrapper):
             ego_leading = opp_gate != -1
             victory = (ego_finished & ego_leading & terminated).astype(jnp.float32) * 50.0
 
+            # --- downwash penalty ---
+            # rel_pos = opp_pos - ego_pos, so rel_pos[..., 2] > 0 means opponent is above ego.
+            # We penalize ego for flying directly below the opponent inside an expanding cone.
+            vertical_dist = rel_pos[..., 2]                          # positive = opp above ego
+            horizontal_dist = jnp.linalg.norm(rel_pos[..., :2], axis=-1)
+            cone_radius = downwash_base_radius + downwash_expansion * vertical_dist
+            # proximity_factor: 1 at cone centre, 0 at cone edge
+            proximity_factor = jnp.clip(1.0 - horizontal_dist / cone_radius, 0.0, 1.0)
+            # strength decays with vertical distance (worst directly below, fades as opp gets higher)
+            vertical_strength = 1.0 / (vertical_dist + downwash_vertical_softening)
+            raw_downwash = proximity_factor * vertical_strength
+            # Only active when opponent is above ego (vertical_dist > 0) and inside the cone
+            in_cone = (vertical_dist > 0.0) & (horizontal_dist < cone_radius)
+            downwash = -jnp.where(in_cone, raw_downwash, 0.0)
+
             return {
                 "rank":         rank_coef         * rank,
                 "segment_lead": segment_lead_coef * segment_lead,
                 "proximity":    proximity_coef    * proximity,
                 "victory":      victory_coef      * victory,
+                "downwash":     downwash_coef     * downwash,
             }
-
         return _jit_fn
 
     def _compute_competition_reward_components(
@@ -504,9 +525,12 @@ class OpponentWrapper(VectorWrapper):
         competition_reward = sum(competition_components.values())
         info["target_gate"] = np.asarray(ego_obs["target_gate"])
 
+        competition_components_log = {k: v for k, v in competition_components.items() if k != "downwash"}
+
         info = {
             **info,
-            **{f"rew/comp_{name}": v for name, v in competition_components.items()},
+            **{f"rew/comp_{name}": v for name, v in competition_components_log.items()},
+            "rew/downwash": competition_components["downwash"],
         }
 
         return (

@@ -59,7 +59,7 @@ class SegmentSpawnConfig:
     b0: float = 0.25
     b1: float = 0.5
     p_start_min: float = 0.20
-    p_start_max: float = 0.90
+    p_start_max: float = 1.0
     # (c) initial-speed schedule: cone spawns start with speed v0 along the gate normal (through the
     # opening), annealed v0_max -> 0 over [c0, c1]. DISABLED (v0_max = 0): the momentum crutch
     # masked that the policy never learned self-propulsion (early vel_along tracked v0_max and
