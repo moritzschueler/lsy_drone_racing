@@ -178,16 +178,17 @@ class OpponentWrapper(VectorWrapper):
 
         self._trajectory_times = [6.0, 8.0, 10.0, 15.0]
         self._attitude_config = load_config(Path(__file__).parents[3] / "config" / "level0.toml")
-        self._fixed_pool_weights = []
-        fixed_pool_dir = Path(__file__).parent.parent / "checkpoints/multi_agent_racing/fixed_policies"
-        if fixed_pool_dir is not None and fixed_pool_dir.exists():
-            checkpoint_paths = []
-            for ext in ["*.ckpt", "*.pth"]:
-                checkpoint_paths.extend(fixed_pool_dir.glob(ext))
-            for p in checkpoint_paths:
-                state = torch.load(p, map_location="cpu", weights_only=True)
-                self._fixed_pool_weights.append(state)
-            print(f"Loaded {len(self._fixed_pool_weights)} fixed models from {fixed_pool_dir}")
+        self._fixed_pool_weights = torch.load("lsy_drone_racing/rl/checkpoints/multi_agent_racing/fixed_policies/trajectory_follow_5s.ckpt", map_location="cpu", weights_only=True)
+        # fixed_pool_dir = Path(__file__).parent.parent / "checkpoints/multi_agent_racing/fixed_policies"
+        # if fixed_pool_dir is not None and fixed_pool_dir.exists():
+        #     checkpoint_paths = []
+        #     for ext in ["*.ckpt", "*.pth"]:
+        #         checkpoint_paths.extend(fixed_pool_dir.glob(ext))
+        #     for p in checkpoint_paths:
+
+        #         state = torch.load(p, map_location="cpu", weights_only=True)
+        #         self._fixed_pool_weights.append(state, str(p).split(".")[0][-2])
+        #     print(f"Loaded {len(self._fixed_pool_weights)} fixed models from {fixed_pool_dir}")
 
         self._opponents: list[AttitudeRL | EgoOpponent] | None = None
         self._opponent_active = False
@@ -367,20 +368,20 @@ class OpponentWrapper(VectorWrapper):
     def _get_weights_for_type(self, opponent_type: int) -> tuple[str, dict]:
         if opponent_type == 0 or self._ego_obs_shape is None:
             if self._fixed_pool_weights:
-                return "fixed", random.choice(self._fixed_pool_weights), random.choice(self._trajectory_times)
+                return "fixed", self._fixed_pool_weights, random.choice(self._trajectory_times)
             return "fixed", None, None
 
         if opponent_type == 1:
             if self._self_play_weights:
                 return "ego", random.choice(self._self_play_weights), None
             if self._fixed_pool_weights:
-                return "fixed", random.choice(self._fixed_pool_weights), random.choice(self._trajectory_times)
+                return "fixed", self._fixed_pool_weights, random.choice(self._trajectory_times)
             return "fixed", {}, None
         if opponent_type == 2:
             if self._latest_weights is not None:
                 return "ego", self._latest_weights, None
             if self._fixed_pool_weights:
-                return "fixed", random.choice(self._fixed_pool_weights), random.choice(self._trajectory_times)
+                return "fixed", self._fixed_pool_weights, random.choice(self._trajectory_times)
             return "fixed", {}, None
 
         return "fixed", {}, None
