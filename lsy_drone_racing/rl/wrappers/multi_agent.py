@@ -176,7 +176,7 @@ class OpponentWrapper(VectorWrapper):
         self._downwash_vertical_softening = downwash_vertical_softening
         self._prev_done: np.ndarray | None = None
 
-
+        self._trajectory_times = [6.0, 8.0, 10.0, 15.0]
         self._attitude_config = load_config(Path(__file__).parents[3] / "config" / "level0.toml")
         self._fixed_pool_weights = []
         fixed_pool_dir = Path(__file__).parent.parent / "checkpoints/multi_agent_racing/fixed_policies"
@@ -367,31 +367,31 @@ class OpponentWrapper(VectorWrapper):
     def _get_weights_for_type(self, opponent_type: int) -> tuple[str, dict]:
         if opponent_type == 0 or self._ego_obs_shape is None:
             if self._fixed_pool_weights:
-                return "fixed", random.choice(self._fixed_pool_weights)
-            return "fixed", None
+                return "fixed", random.choice(self._fixed_pool_weights), random.choice(self._trajectory_times)
+            return "fixed", None, None
 
         if opponent_type == 1:
             if self._self_play_weights:
-                return "ego", random.choice(self._self_play_weights)
+                return "ego", random.choice(self._self_play_weights), None
             if self._fixed_pool_weights:
-                return "fixed", random.choice(self._fixed_pool_weights)
-            return "fixed", {}
+                return "fixed", random.choice(self._fixed_pool_weights), random.choice(self._trajectory_times)
+            return "fixed", {}, None
         if opponent_type == 2:
             if self._latest_weights is not None:
-                return "ego", self._latest_weights
+                return "ego", self._latest_weights, None
             if self._fixed_pool_weights:
-                return "fixed", random.choice(self._fixed_pool_weights)
-            return "fixed", {}
+                return "fixed", random.choice(self._fixed_pool_weights), random.choice(self._trajectory_times)
+            return "fixed", {}, None
 
-        return "fixed", {}
+        return "fixed", {}, None
 
     def _build_single_opponent(self, opp_obs: dict, env_idx: int) -> AttitudeRL | EgoOpponent:
         t = self._opponent_types[env_idx] if self._opponent_types is not None else 0
-        kind, weights = self._get_weights_for_type(t)
+        kind, weights, trajectory_time = self._get_weights_for_type(t)
 
         if kind == "fixed":
             single_obs = self._make_single_obs(opp_obs, env_idx)
-            opp = AttitudeRL(single_obs, None, self._attitude_config)
+            opp = AttitudeRL(single_obs, None, self._attitude_config, trajectory_time)
             if weights is not None and weights:
                 (opp.agent.load_state_dict(weights)
                  if hasattr(opp, "agent") and hasattr(opp.agent, "load_state_dict")

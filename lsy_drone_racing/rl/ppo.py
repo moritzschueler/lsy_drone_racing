@@ -652,13 +652,13 @@ def evaluate_ppo(
         match eval_opponent:
             case "fixed": 
                 ratios=(1.0, 0.0, 0.0)
-                print("Evaluating agains a fixed single agent policy!")
+                print("Evaluating against a fixed single agent policy!")
             case "past":
                 ratios=(0.0, 1.0, 0.0)
-                print("Evaluating agains a random checkpoint multiagent policy!")
+                print("Evaluating against a random checkpoint multiagent policy!")
             case "latest":
                 ratios=(0.0, 0.0, 1.0)
-                print("Evaluating agains a the latest checkpoint multiagent policy!")
+                print("Evaluating against the latest checkpoint multiagent policy!")
         
   
         opponent_wrapper.update_opponent_pool(

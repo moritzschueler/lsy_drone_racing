@@ -208,7 +208,7 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
         # 2. Broadcast that status to ALL drones in that environment
         # Using [:, None] expands the shape to (num_envs, 1) so it can broadcast
         # across the (num_envs, n_drones) shape via a bitwise OR (|)
-        terminated = terminated | first_drone_terminated[:, None]
-        truncated = truncated | first_drone_truncated[:, None]
+        terminated = first_drone_terminated[:, None]
+        truncated = first_drone_truncated[:, None]
 
         return obs, reward, terminated, truncated, info
