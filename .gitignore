@@ -21,6 +21,7 @@ ros_ws/
 acados/
 
 /wandb
+ma_adr/
 
 
 # RL training checkpoints (artifacts, not source)
