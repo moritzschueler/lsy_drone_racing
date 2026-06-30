@@ -1,71 +1,79 @@
-"""Wrapper that spins the rotors up after every (auto)reset to assist takeoff."""
+"""Functional wrapper that spins the rotors up after every (auto)reset to assist takeoff."""
 
+from __future__ import annotations
+
+from typing import Any, Callable
+
+import flax.struct as struct
 import jax.numpy as jnp
 from crazyflow.utils import leaf_replace
-from gymnasium.vector import VectorEnv, VectorWrapper
 from jax import Array
 
-class SpinUpRotors(VectorWrapper):
+from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
+
+# Steady-state (hover) rotor speed for the cf21B_500 first_principles drone. Seeding rotor_vel to
+# this on (auto)reset starts the freshly reset drone in equilibrium, so a neutral action holds
+# altitude and any positive thrust lifts off immediately -- instead of sitting on the ground with
+# cold rotors and never exploring takeoff.
+HOVER_ROTOR_VEL = 16200.0
+
+
+@struct.dataclass
+class SpinUpRotors(Wrapper):
     """Seed the rotors at ~hover RPM whenever an env (auto)resets, to help the drone take off.
 
-    The racing env starts the drone on the ground (z ~ 0.01) with cold rotors (rotor_vel = 0),
-    so a neutral action keeps it grounded and the only safe behaviour the policy discovers is to
-    sit still -- it never explores taking off. The hover/trajectory tasks sidestep this by seeding
-    rotor_vel at reset; this wrapper replicates that *without* modifying the (competition) racing
-    env, by editing the env's sim state from the Python step boundary.
+    The racing env starts the drone on the ground with cold rotors (``rotor_vel = 0``), so a
+    neutral action keeps it grounded and the only safe behaviour the policy discovers is to sit
+    still. This wrapper seeds ``rotor_vel`` at the seed value on every (auto)reset without modifying
+    the (competition) racing env, by editing the innermost env's sim state.
 
-    Because the vectorized env uses NEXT_STEP autoreset, resets happen *inside* the jitted step
-    kernel: an env that returns ``done`` at step ``t`` is reset at the start of step ``t + 1``. We
-    therefore remember which envs were done last step and, after that reset has run (i.e. once the
-    next ``step`` returns), overwrite their ``rotor_vel`` before the next action is applied. The
-    overwritten state is what the env reads on the following step, so the freshly reset drone
-    starts with warm rotors.
+    Because the vectorized env uses NEXT_STEP autoreset (an env done at step ``t`` is reset at the
+    start of ``t + 1``), ``done_last_step`` is threaded through the scan carry: we remember which
+    envs were done last step and warm their (now reset, still cold) rotors after that reset has run.
+    ``rotor_vel`` is unobserved sim state, so warming it after the observation is computed does not
+    change the returned observation.
     """
 
-    def __init__(self, env: VectorEnv, rotor_vel: float = 16200.0):
-        """Initialize the wrapper.
+    base: struct.PyTreeNode = struct.field(pytree_node=True)
+    done_last_step: Array = struct.field(pytree_node=True)
 
-        Args:
-            env: The vectorized racing environment (any wrapper chain whose ``unwrapped`` is the
-                ``VecDroneRaceEnv``).
-            rotor_vel: Rotor angular velocity to seed on reset. The default ~16200 is the
-                steady-state (hover) rotor speed for the cf21B_500 ``first_principles`` drone, so
-                the freshly reset drone starts in equilibrium: a neutral action holds altitude and
-                any positive thrust lifts off immediately, with no spin-up dead time. (The
-                hover/trajectory tasks use 10000, which is well below hover for this model and
-                barely improves on cold rotors.)
-        """
-        super().__init__(env)
-        self.rotor_vel = rotor_vel
-        # Envs reset during the *next* step are those done now; nothing is pending at construction.
-        self._done_last_step = jnp.zeros(self.num_envs, dtype=bool)
+    step: Callable = struct.field(pytree_node=False)
+    reset: Callable = struct.field(pytree_node=False)
 
-    @property
-    def device(self) -> str:
-        """Delegate to the base env so downstream wrappers (e.g. NormalizeActions) find it."""
-        return self.env.unwrapped.device
+    @classmethod
+    def create(cls, base: struct.PyTreeNode, rotor_vel: float = HOVER_ROTOR_VEL) -> SpinUpRotors:
+        """Create a SpinUpRotors wrapper around the base environment."""
+        num_envs = base.num_envs
 
-    def _warm_rotors(self, mask: Array) -> None:
-        """Set rotor_vel to the seed value for the masked envs in the base env's sim state."""
-        data = self.env.unwrapped.data
-        states = data.sim_data.states
-        target = jnp.full_like(states.rotor_vel, self.rotor_vel)
-        states = leaf_replace(states, mask, rotor_vel=target)
-        self.env.unwrapped.data = data.replace(sim_data=data.sim_data.replace(states=states))
+        def warm_rotors(env: SpinUpRotors, mask: Array) -> SpinUpRotors:
+            """Seed rotor_vel to the hover value for the masked envs in the innermost env's data."""
+            data = env.unwrapped.data
+            states = data.sim_data.states
+            target = jnp.full_like(states.rotor_vel, rotor_vel)
+            states = leaf_replace(states, mask, rotor_vel=target)
+            new_data = data.replace(sim_data=data.sim_data.replace(states=states))
+            return Wrapper.recursive_replace(env, data=new_data)
 
-    def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[dict, dict]:
-        """Reset all envs and warm every drone's rotors."""
-        obs, info = self.env.reset(seed=seed, options=options)
-        self._warm_rotors(jnp.ones(self.num_envs, dtype=bool))
-        self._done_last_step = jnp.zeros(self.num_envs, dtype=bool)
-        return obs, info
+        def reset(
+            env: SpinUpRotors, *, seed: int | None = None, options: dict | None = None
+        ) -> tuple[SpinUpRotors, tuple[Any, Any]]:
+            base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
+            env = env.replace(base=base_env, done_last_step=jnp.zeros(num_envs, dtype=bool))
+            env = warm_rotors(env, jnp.ones(num_envs, dtype=bool))  # warm every drone
+            return env, (obs, info)
 
-    def step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:
-        """Step, then warm the rotors of any env that was autoreset during this step."""
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        # Envs done on the previous step have just been autoreset by this one -> warm them now,
-        # before their next action is applied.
-        if bool(self._done_last_step.any()):
-            self._warm_rotors(self._done_last_step)
-        self._done_last_step = terminated | truncated
-        return obs, reward, terminated, truncated, info
+        def step(env: SpinUpRotors, action: Array) -> tuple[SpinUpRotors, tuple[Any, ...]]:
+            base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
+            env = env.replace(base=base_env)
+            # Envs done on the previous step were just autoreset by this step -> warm them now,
+            # before their next action is applied. The mask makes "none done" a no-op.
+            env = warm_rotors(env, env.done_last_step)
+            env = env.replace(done_last_step=terminated | truncated)
+            return env, (obs, reward, terminated, truncated, info)
+
+        return cls(
+            base=base,
+            done_last_step=jnp.zeros(num_envs, dtype=bool),
+            step=step,
+            reset=reset,
+        )

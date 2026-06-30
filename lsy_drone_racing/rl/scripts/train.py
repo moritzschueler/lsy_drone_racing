@@ -6,7 +6,6 @@ Examples:
     python -m lsy_drone_racing.rl.scripts.train --task racing --num_envs 2048 --learning_rate 1e-3
 """
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +15,7 @@ import numpy as np
 import wandb
 from lsy_drone_racing.rl.ppo import evaluate_ppo, train_ppo
 from lsy_drone_racing.rl.tasks import get_task
+from lsy_drone_racing.utils import load_config
 
 CHECKPOINT_DIR = Path(__file__).parents[1] / "checkpoints"
 
@@ -28,44 +28,47 @@ def _latest_checkpoint(task: str) -> Path | None:
 
 def main(
     task: str = "single_agent_racing",
+    config: str = "level0.toml",
     wandb_enabled: bool = True,
     train: bool = True,
     num_eval_iterations: int = 1,
-    render_eval: bool = True,
     **kwargs: Any,
 ):
-    """Train and/or evaluate a PPO agent on the given task.
+    """Train and/or evaluate a single PPO agent on the given task.
 
     Args:
         task: Task name (one of the keys in ``lsy_drone_racing.rl.tasks.TASKS``).
+        config: Env config file name under ``config/`` (e.g. ``level0.toml``).
         wandb_enabled: Whether to log to Weights & Biases.
         train: Whether to run training. If False, only evaluation runs.
-        num_eval_iterations: Number of evaluation episodes to run after training.
-        render_eval: Whether to render evaluation episodes. Set False to run headless.
+        num_eval_iterations: Number of (headless) evaluation episodes to run after training.
+            Rendering is handled separately by ``rl/scripts/render.py``.
         **kwargs: Any ``Args`` field override (e.g. num_envs=2048).
     """
-    os.environ.pop("WAYLAND_DISPLAY", None)
     task_spec = get_task(task)
     args = task_spec.args_cls.create(**kwargs)
 
-    # Each task gets its own checkpoint subfolder; runs are saved with a timestamp + reward.
-    task_dir = CHECKPOINT_DIR / task
-    task_dir.mkdir(parents=True, exist_ok=True)
-    jax_device = args.jax_device
+    checkpoint_dir = CHECKPOINT_DIR / task
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     model_path = None
+
+    env_config = load_config(Path(__file__).parents[3] / "config" / config)
+
     if train:
-        model_path = train_ppo(args, task_spec.make_env, task_dir, task, jax_device, wandb_enabled)
+        model_path = train_ppo(
+            args, task_spec.make_env, env_config, checkpoint_dir, task, wandb_enabled
+        )
 
     if num_eval_iterations > 0:
         eval_path = model_path or _latest_checkpoint(task)
         if eval_path is None:
             raise FileNotFoundError(
-                f"Can't evaluate because there is no checkpoint for task {task} in {task_dir} "
-                "and training is disabled."
+                f"Can't evaluate because there is no checkpoint for task {task} in "
+                f"{checkpoint_dir} and training is disabled."
             )
         episode_rewards, episode_lengths = evaluate_ppo(
-            args, task_spec.make_env, num_eval_iterations, eval_path, render=render_eval
+            args, task_spec.make_env, env_config, num_eval_iterations, eval_path
         )
         if wandb_enabled and train:
             wandb.log(
@@ -75,7 +78,8 @@ def main(
                 }
             )
             wandb.finish()
-
+    if train and wandb_enabled and num_eval_iterations < 1:
+        wandb.finish()
 
 if __name__ == "__main__":
     fire.Fire(main)

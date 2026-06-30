@@ -739,7 +739,6 @@ def truncated(data: EnvData, max_episode_steps: int) -> Array:
     return jp.tile((data.steps >= max_episode_steps)[..., None], (1, n_drones))
 
 
-@jax.jit
 def _reset_env_data(data: EnvData, mask: Array | None = None) -> EnvData:
     """Reset auxiliary variables of the environment data."""
     drone_pos = data.sim_data.states.pos
