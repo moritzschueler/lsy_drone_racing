@@ -1,65 +1,60 @@
 """Generic PPO training and evaluation, shared across all drone RL tasks.
 
-The algorithm is task-agnostic: it is parameterized by a ``make_env`` factory (which builds
-the vectorized, fully-wrapped environment for a given task) and the shared ``Agent`` network.
-An implementation of PPO from cleanrl, see https://docs.cleanrl.dev/.
+The algorithm is task-agnostic: it is parameterized by a ``make_env`` factory (which builds the
+vectorized, fully-wrapped *functional* environment for a given task) and the shared ``Agent``
+network. An implementation of PPO from cleanrl, see https://docs.cleanrl.dev/.
+
+The whole training run is a single ``lax.scan`` over iterations: each iteration is a nested scan
+(rollout) feeding a nested scan (PPO update epochs), and every metric is a fixed-shape scan output.
+Nothing syncs to the host inside the scan -- all wandb metrics are flushed once, after the run, and
+the best checkpoint is tracked in the scan carry (no mid-run pickling). This trades live curves,
+per-iteration checkpoints and graceful Ctrl-C for a single compiled XLA program that keeps the GPU
+saturated. See the functional env in ``rl/wrappers/`` and ``make_functional_env``.
 """
 
+import dataclasses
 import pickle
-import random
-import signal
 import time
-import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import Any, Callable
 
-import glfw
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
-from gymnasium.vector import VectorEnv
 from jax import Array
 
 import wandb
 from lsy_drone_racing.rl.agents.ppo_agent import Agent, _entropy, _log_prob
 from lsy_drone_racing.rl.config import Args
 from lsy_drone_racing.rl.git_provenance import pin_run_to_branch
+from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
+from lsy_drone_racing.utils.utils import set_seeds
 
-if TYPE_CHECKING:
-    from types import FrameType
-
-MakeEnv = Callable[[Args, int, str], VectorEnv]
-
-
-def set_seeds(seed: int):
-    """Seed everything."""
-    random.seed(seed)
-    np.random.seed(seed)
+# Env factory: (args, config) -> fully-wrapped functional env (a ``Wrapper``/``struct.PyTreeNode``).
+MakeEnv = Callable[[Args, Any], Wrapper]
 
 
 def train_ppo(
     args: Args,
     make_env: MakeEnv,
+    config: Any,
     checkpoint_dir: Path | None,
     run_name: str,
-    jax_device: str,
     wandb_enabled: bool = False,
 ) -> Path | None:
-    """Train a PPO agent on the environment produced by ``make_env``.
+    """Train a PPO agent on the functional environment produced by ``make_env``.
 
-    The checkpoint is saved into ``checkpoint_dir`` under
-    ``{run_name}_{timestamp}_r{reward}.ckpt`` so multiple runs are distinguishable, and the
-    saved path is returned (None if ``checkpoint_dir`` is None). ``reward`` is the mean of the
-    most recent episode returns, or ``NA`` if no episodes finished/were tracked (wandb off).
+    The entire run is compiled as one ``lax.scan`` over ``args.num_iterations``; metrics are
+    accumulated as scan outputs and flushed to wandb after the scan returns.
+    The best checkpoint is tracked in the scan carry and written at the end.
     """
     if wandb_enabled and wandb.run is None:
         wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args))
         # Pin the exact code behind this run to a branch wandb-runs/<name>-<id> so the chart
-        # legend maps straight to reproducible code. Best-effort; never aborts training (see
-        # git_provenance).
+        # legend maps straight to reproducible code. Best-effort; never aborts training.
         prov = pin_run_to_branch(wandb.run.name, wandb.run.id)
         wandb.config.update(prov, allow_val_change=True)
         if prov.get("wandb_branch"):
@@ -70,43 +65,27 @@ def train_ppo(
             )
     train_start_time = time.time()
     set_seeds(args.seed)
-    print("Training on device:", jax_device)
-    # Log the full configuration so the exact values used are recoverable from the run logs
-    # (wandb.init also records these under the run's config).
+    print("Training on device:", args.jax_device)
     print("--- Hyperparameters ---")
     for k, v in vars(args).items():
         print(f"  {k}: {v}")
     print("-----------------------")
 
-    # env setup
-    envs = make_env(args, args.num_envs, jax_device)
+    # -- Functional env setup --
+    envs = make_env(args, config)
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
-
-    # Curriculum hook: any wrapper in the chain exposing ``set_progress`` is fed training progress
-    # (global_step / total_timesteps) each iteration. Check the class (not the instance) so the
-    # gymnasium attribute proxy doesn't report inner wrappers' methods on outer ones.
-    progress_sinks = []
-    _e = envs
-    while _e is not None:
-        if getattr(type(_e), "set_progress", None) is not None:
-            progress_sinks.append(_e)
-        _e = getattr(_e, "env", None)
-
-    def set_progress(step: int) -> None:
-        frac = min(step / args.total_timesteps, 1.0)
-        for sink in progress_sinks:
-            sink.set_progress(frac)
-
+    num_envs = args.num_envs
     obs_shape = envs.single_observation_space.shape
     act_shape = envs.single_action_space.shape
     action_dim = int(np.prod(act_shape))
-
-    print(f"Shape of observation shape: {obs_shape}")
+    obs_dim = int(np.prod(obs_shape))
+    print(f"Shape of observation space: {obs_shape}")
     print(f"Shape of action space: {act_shape}")
 
-    # Number of gates, for the racing completion metric (None for tasks without gates).
+    # Number of gates, for the racing completion metric (None for tasks without gates). The
+    # unwrapped functional env (RacingEnv) exposes the raw racing observation dict.
     base_space = envs.unwrapped.single_observation_space
     n_gates = (
         base_space["gates_pos"].shape[0]
@@ -114,14 +93,14 @@ def train_ppo(
         else None
     )
 
-    # Agent init. NNX owns the weights statefully (PyTorch-style); the model instance is
-    # passed directly into the jitted functions below.
-    obs_dim = int(np.prod(obs_shape))
+    # -- Agent + optimizer (functional) --
+    # NNX owns the weights statefully; split once into a static graphdef + a param ``State`` pytree,
+    # then thread ``params`` (and the optax state) through the scan carry. ``nnx.merge`` rebuilds
+    # the module for the forward pass and is differentiable w.r.t. ``params``.
     agent = Agent(obs_dim, action_dim, rngs=nnx.Rngs(args.seed))
+    graphdef, params = nnx.split(agent)
     rng = jax.random.PRNGKey(args.seed)
 
-    # Optimizer: clip grads then update. nnx.Optimizer wraps optax and manages the
-    # optimizer state for us, mutating the model in place on optimizer.update(...).
     if args.anneal_lr:
         schedule = optax.linear_schedule(
             args.learning_rate, 0.0, args.num_iterations * args.update_epochs * args.num_minibatches
@@ -129,31 +108,27 @@ def train_ppo(
     else:
         schedule = args.learning_rate
     tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(schedule, eps=1e-5))
-    optimizer = nnx.Optimizer(agent, tx, wrt=nnx.Param)
+    opt_state = tx.init(params)
 
-    # ------------------------------------------------------------------ #
-    # JIT-compiled inner functions (capture args, tx via closure)         #
-    # nnx.jit threads the model's state through the compiled program.      #
-    # ------------------------------------------------------------------ #
+    def forward(params: nnx.State, obs: Array) -> tuple[Array, Array, Array]:
+        """Param-pure forward pass: (action_mean, log_std, value)."""
+        return nnx.merge(graphdef, params)(obs)
 
-    @nnx.jit
-    def policy_step(agent: Agent, obs: Array, rng_key: Array) -> tuple[Array, Array, Array]:
-        mean, log_std, value = agent(obs)
+    def policy_step(params: nnx.State, obs: Array, key: Array) -> tuple[Array, Array, Array]:
+        mean, log_std, value = forward(params, obs)
         std = jnp.exp(log_std)
-        action = mean + std * jax.random.normal(rng_key, mean.shape)
+        action = mean + std * jax.random.normal(key, mean.shape)
         logprob = _log_prob(action, mean, log_std)
         return action, logprob, value.squeeze(-1)
 
-    @nnx.jit
-    def get_value(agent: Agent, obs: Array) -> Array:
-        _, _, value = agent(obs)
+    def get_value(params: nnx.State, obs: Array) -> Array:
+        _, _, value = forward(params, obs)
         return value.squeeze(-1)
 
-    @jax.jit
     def compute_gae(
         rewards: Array, values: Array, dones: Array, next_value: Array, next_done: Array
     ) -> tuple[Array, Array]:
-        """GAE via lax.scan over reversed time steps."""
+        """GAE via lax.scan over reversed time steps (cleanrl semantics)."""
 
         def scan_fn(lastgaelam: Array, inputs: tuple) -> tuple[Array, Array]:
             reward, value, next_val, next_d = inputs
@@ -162,10 +137,8 @@ def train_ppo(
             advantage = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             return advantage, advantage
 
-        # next_val and next_done for each step t: values[t+1] / dones[t+1], last step uses bootstrap
         next_values = jnp.concatenate([values[1:], next_value[None]], axis=0)
         next_dones = jnp.concatenate([dones[1:], next_done[None]], axis=0)
-
         _, advantages_rev = jax.lax.scan(
             scan_fn,
             jnp.zeros(rewards.shape[1:]),
@@ -175,7 +148,7 @@ def train_ppo(
         return advantages, advantages + values
 
     def ppo_loss_fn(
-        agent: Agent,
+        params: nnx.State,
         obs: Array,
         actions: Array,
         log_probs: Array,
@@ -184,7 +157,7 @@ def train_ppo(
         b_values: Array,
         ent_coef: Array,
     ) -> tuple[Array, tuple]:
-        mean, log_std, new_values = agent(obs)
+        mean, log_std, new_values = forward(params, obs)
         new_log_probs = _log_prob(actions, mean, log_std)
         entropy = _entropy(log_std, obs.shape[0])
 
@@ -198,22 +171,17 @@ def train_ppo(
                 jnp.std(mb_advantages) + 1e-8
             )
 
-        # Policy loss
         pg_loss1 = -mb_advantages * ratio
         pg_loss2 = -mb_advantages * jnp.clip(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
         pg_loss = jnp.mean(jnp.maximum(pg_loss1, pg_loss2))
 
-        # Value loss
         new_values_flat = new_values.reshape(-1)
         if args.clip_vloss:
             v_clipped = b_values + jnp.clip(
                 new_values_flat - b_values, -args.clip_coef, args.clip_coef
             )
             v_loss = 0.5 * jnp.mean(
-                jnp.maximum(
-                    (new_values_flat - returns) ** 2,
-                    (v_clipped - returns) ** 2,
-                )
+                jnp.maximum((new_values_flat - returns) ** 2, (v_clipped - returns) ** 2)
             )
         else:
             v_loss = 0.5 * jnp.mean((new_values_flat - returns) ** 2)
@@ -222,407 +190,294 @@ def train_ppo(
         total_loss = pg_loss - ent_coef * entropy_loss + args.vf_coef * v_loss
         return total_loss, (pg_loss, v_loss, entropy_loss, approx_kl, ratio)
 
-    @nnx.jit
-    def update_epoch(
-        agent: Agent,
-        optimizer: nnx.Optimizer,
-        flat_data: tuple,
-        rng_key: Array,
-        ent_coef: Array,
-    ) -> tuple:
-        """One full epoch of minibatch PPO updates compiled as a single XLA program.
+    # -- Discover the static per-step metric keys the wrapper stack surfaces in ``info`` --
+    # The functional wrappers stash per-env reward components ("rew/...") and behavioural
+    # diagnostics ("diagnostics/...") in info; the key set is static, so probe one (functional,
+    # non-mutating) step to capture it for the fixed-shape scan outputs.
+    _, (_, _, _, _, _probe_info) = envs.step(envs, jnp.zeros((num_envs, action_dim)))
+    metric_keys = sorted(
+        k
+        for k in _probe_info
+        if isinstance(k, str) and (k.startswith("rew/") or k.startswith("diagnostics/"))
+    )
+    denom = float(args.num_steps * num_envs)
 
-        nnx.Optimizer mutates ``agent`` in place each minibatch; the loop over
-        minibatches is a plain Python loop (it unrolls into the trace), so we collect
-        per-minibatch metrics in lists and stack them to mirror the old lax.scan output.
-        """
-        shuffled = jax.random.permutation(rng_key, args.batch_size)
-        mb_inds = shuffled.reshape(args.num_minibatches, args.minibatch_size)
+    def rollout(
+        params: nnx.State, env: Wrapper, obs: Array, rng: Array, ep_ret: Array, ep_len: Array
+    ) -> tuple[tuple, dict]:
+        """One rollout of ``num_steps`` as an inner scan; episode stats tracked inline in carry."""
 
-        losses, pgs, vs, ents, kls, ratios = [], [], [], [], [], []
-        for i in range(args.num_minibatches):
-            mb = tuple(x[mb_inds[i]] for x in flat_data)
-            (loss, aux), grads = nnx.value_and_grad(ppo_loss_fn, has_aux=True)(agent, *mb, ent_coef)
-            optimizer.update(agent, grads)
-            pg, v_loss, ent, kl, ratio = aux
-            losses.append(loss)
-            pgs.append(pg)
-            vs.append(v_loss)
-            ents.append(ent)
-            kls.append(kl)
-            ratios.append(ratio)
+        def step(carry: tuple, _: Any) -> tuple[tuple, dict]:
+            env, obs, rng, ep_ret, ep_len = carry
+            rng, akey = jax.random.split(rng)
+            action, logprob, value = policy_step(params, obs, akey)
+            env, (next_obs, reward, term, trunc, info) = env.step(env, action)
+            done = jnp.logical_or(term, trunc)
+            donef = done.astype(jnp.float32)
 
-        metrics = (
-            jnp.stack(losses),
-            (jnp.stack(pgs), jnp.stack(vs), jnp.stack(ents), jnp.stack(kls), jnp.stack(ratios)),
+            new_ret = ep_ret + reward
+            new_len = ep_len + 1.0
+            gates_passed = jnp.where(info["target_gate"] == -1, n_gates or 0, info["target_gate"])
+            gates_passed = gates_passed.astype(jnp.float32)
+            out = {
+                "obs": obs,
+                "action": action,
+                "logprob": logprob,
+                "value": value,
+                "reward": reward,
+                "done": donef,
+                # Episode-end masked quantities (0 except on the step an env finishes).
+                "ret_done": jnp.where(done, new_ret, 0.0),
+                "len_done": jnp.where(done, new_len, 0.0),
+                "gates_done": jnp.where(done, gates_passed, 0.0),
+                "completed_done": jnp.where(done, (gates_passed == (n_gates or -1)).astype(
+                    jnp.float32
+                ), 0.0),
+                # Per-step reward-component / diagnostic sums over envs (scalar each).
+                "metrics": {k: jnp.sum(info[k]) for k in metric_keys},
+            }
+            ep_ret = jnp.where(done, 0.0, new_ret)
+            ep_len = jnp.where(done, 0.0, new_len)
+            return (env, next_obs, rng, ep_ret, ep_len), out
+
+        carry0 = (env, obs, rng, ep_ret, ep_len)
+        (env, last_obs, rng, ep_ret, ep_len), outs = jax.lax.scan(
+            step, carry0, None, length=args.num_steps
         )
-        return metrics
+        return (env, last_obs, rng, ep_ret, ep_len), outs
 
-    # ------------------------------------------------------------------ #
-    # Training loop                                                      #
-    # ------------------------------------------------------------------ #
-    global_step = 0
-    set_progress(global_step)  # activate the curriculum before the initial reset
-    next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = jnp.asarray(next_obs)
-    next_done = jnp.zeros(args.num_envs)
-    sum_rewards = jnp.zeros(args.num_envs)
-    ep_lengths = jnp.zeros(args.num_envs)  # per-env step counter; reset on done (survival time)
-    sum_rewards_hist: list[float] = []
-    # Returns of true-start (deployment-like) episodes; with the curriculum, mid-track cone spawns
-    # are excluded so "best" reflects full-track performance. Falls back to all episodes when the
-    # episode_true_start flag is absent (other tasks / no curriculum).
-    true_start_hist: list[float] = []
-    # Per true-start episode racing *progress* = gates passed (n_gates if the track was completed).
-    # Skill measure on the fixed deployment distribution, unaffected by reward shaping
-    # (crash/timeout/smoothness penalties), so unlike return it rises with competence and peaks
-    # late rather than early. Drives best-checkpoint + early-stop; empty for non-racing tasks (then
-    # we fall back to return). See best_score selection below.
-    true_start_progress_hist: list[float] = []
-    # Best checkpoint tracking: snapshot the params whenever the recent mean true-start *score*
-    # (gates-passed for racing, else return) improves, then write that snapshot (not the final
-    # state) at the end.
-    best_score = -float("inf")
-    best_is_progress = False  # True once gates-passed history exists (racing); else return-based
-    best_state_bytes: bytes | None = None
-    best_window, best_min_episodes = 100, 20
+    def update_epochs(
+        params: nnx.State, opt_state: Any, flat_data: tuple, rng: Array, ent_coef: Array
+    ) -> tuple[nnx.State, Any, tuple]:
+        """All PPO update epochs as a nested scan; ``target_kl`` freezes updates via masking."""
 
-    # -- Graceful early stop --
-    # Ctrl-C requests a stop: the current iteration finishes, then we break to the best-checkpoint
-    # save (evaluation/render then runs on it). A second Ctrl-C forces an immediate abort.
-    stop_requested = {"flag": False}
+        def epoch(carry: tuple, _: Any) -> tuple[tuple, tuple]:
+            params, opt_state, frozen, rng = carry
+            rng, pkey = jax.random.split(rng)
+            mb_inds = jax.random.permutation(pkey, args.batch_size).reshape(
+                args.num_minibatches, args.minibatch_size
+            )
 
-    def _handle_sigint(signum: int, frame: "FrameType | None") -> None:
-        if stop_requested["flag"]:
-            raise KeyboardInterrupt  # second press -> hard abort
-        stop_requested["flag"] = True
-        print(
-            "\nStop requested (Ctrl-C): finishing current iteration, then saving the best "
-            "checkpoint. Press Ctrl-C again to force quit."
+            def minibatch(mb_carry: tuple, inds: Array) -> tuple[tuple, tuple]:
+                params, opt_state = mb_carry
+                batch = tuple(x[inds] for x in flat_data)
+                (_, aux), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(
+                    params, *batch, ent_coef
+                )
+                updates, new_opt_state = tx.update(grads, opt_state, params)
+                new_params = optax.apply_updates(params, updates)
+                # Freeze: once this epoch's predecessor crossed target_kl, keep params/opt_state
+                # unchanged (the grads above are computed but discarded). Mirrors the old per-epoch
+                # ``break`` -- the epoch that crosses still applies, later epochs are no-ops.
+                keep = lambda old, new: jnp.where(frozen, old, new)  # noqa: E731
+                params = jax.tree.map(keep, params, new_params)
+                opt_state = jax.tree.map(keep, opt_state, new_opt_state)
+                return (params, opt_state), aux
+
+            (params, opt_state), auxs = jax.lax.scan(minibatch, (params, opt_state), mb_inds)
+            mean_kl = jnp.mean(auxs[3])
+            if args.target_kl is not None:
+                frozen = frozen | (mean_kl > args.target_kl)
+            return (params, opt_state, frozen, rng), auxs
+
+        (params, opt_state, _, _), auxs = jax.lax.scan(
+            epoch, (params, opt_state, jnp.bool_(False), rng), None, length=args.update_epochs
         )
+        return params, opt_state, auxs
 
-    prev_sigint = signal.signal(signal.SIGINT, _handle_sigint)
+    # Which metric key holds the best-checkpoint score, and the chart it logs to.
+    best_key = "charts/best_true_start_gates" if n_gates is not None else "charts/best_reward"
 
-    for iteration in range(1, args.num_iterations + 1):
-        start_time = time.time()
-        set_progress(global_step)  # advance the curriculum schedules (kappa, p_start_position)
+    def train_iteration(carry: tuple, iter_idx: Array) -> tuple[tuple, dict]:
+        params, opt_state, env, obs, prev_done, rng, ep_ret, ep_len, best_params, best_score = carry
 
         # -- Rollout --
-        obs_list, act_list, logp_list, val_list, rew_list, done_list = [], [], [], [], [], []
-        # Cone-spawn gate-pass tally for this iteration: of curriculum (non-true-start) episodes
-        # that finish, how many advanced past the gate they were spawned in front of.
-        cone_passed, cone_total = 0, 0
-        # Start-mix tally for this iteration: how many finished episodes started from the true
-        # race start vs a cone spawn. The realized true-start fraction should track
-        # p_start_schedule(tau).
-        true_start_count = 0
-        # Per-step metric accumulators: each wrapper stashes a per-env value under a "rew/<name>"
-        # (reward component) or "diagnostics/<name>" (diagnostic, e.g. commanded thrust / velocity)
-        # info key; we sum them over the rollout (lazily, on-device) and log mean-per-step values so
-        # the reward composition and the policy's behavior over training are visible. A "max/<name>"
-        # key is instead reduced with a running max over the rollout and logged as the iteration
-        # peak under diagnostics/<name>_max (e.g. peak speed).
-        step_metric_sums: dict[str, Array] = {}
-        step_metric_max: dict[str, Array] = {}
+        rng, roll_rng = jax.random.split(rng)
+        (env, last_obs, _, ep_ret, ep_len), outs = rollout(
+            params, env, obs, roll_rng, ep_ret, ep_len
+        )
 
-        for _ in range(args.num_steps):
-            global_step += args.num_envs
-            obs_list.append(next_obs)
-            done_list.append(next_done)
-
-            rng, action_key = jax.random.split(rng)
-            action, logprob, value = policy_step(agent, next_obs, action_key)
-            act_list.append(action)
-            logp_list.append(logprob)
-            val_list.append(value)
-
-            next_obs, reward, terminations, truncations, info = envs.step(action)
-            next_obs = jnp.asarray(next_obs)
-            reward = jnp.asarray(reward)
-            rew_list.append(reward)
-
-            # Accumulate per-step metrics (reward components + diagnostics; kept on-device,
-            # summed across steps & envs, divided by step*env count at log time -> mean per step).
-            for key, val in info.items():
-                if isinstance(key, str) and (
-                    key.startswith("rew/") or key.startswith("diagnostics/")
-                ):
-                    step_metric_sums[key] = step_metric_sums.get(key, jnp.zeros(())) + jnp.sum(
-                        jnp.asarray(val)
-                    )
-                elif isinstance(key, str) and key.startswith("max/"):
-                    step_metric_max[key] = jnp.maximum(
-                        step_metric_max.get(key, -jnp.inf), jnp.max(jnp.asarray(val))
-                    )
-
-            # Track episode returns and lengths; reset done envs before accumulating
-            done_mask = next_done.astype(bool)
-            sum_rewards = jnp.where(done_mask, 0.0, sum_rewards)
-            ep_lengths = jnp.where(done_mask, 0.0, ep_lengths)
-            next_done = jnp.asarray(terminations | truncations).astype(jnp.float32)
-            sum_rewards = sum_rewards + reward
-            ep_lengths = ep_lengths + 1.0
-
-            if bool(jnp.any(next_done)):
-                done_indices = np.where(np.array(next_done, dtype=bool))[0]
-                # target_gate at the terminal step = next gate to pass, or -1 if the whole track
-                # was completed. Present only for the racing task.
-                target_gate = np.array(info["target_gate"]) if "target_gate" in info else None
-                # Curriculum spawns mid-track episodes that trivially "complete"; gate-progress
-                # metrics and the best-checkpoint criterion are only meaningful for episodes that
-                # started from the true race start. Absent (other tasks / no curriculum) -> treat
-                # every episode as a true start.
-                true_start = (
-                    np.array(info["episode_true_start"], dtype=bool)
-                    if "episode_true_start" in info
-                    else None
-                )
-                # Start gate of each finishing episode (cone spawns); paired with the terminal
-                # target_gate to detect whether the gate the drone was spawned in front of was
-                # passed.
-                start_gate = (
-                    np.array(info["episode_start_gate"]) if "episode_start_gate" in info else None
-                )
-                for idx in done_indices:
-                    r = float(sum_rewards[idx])
-                    sum_rewards_hist.append(r)
-                    full_track = true_start is None or bool(true_start[idx])
-                    # Gates passed this episode (n_gates if completed, g==-1); None when the task
-                    # exposes no gate index (non-racing).
-                    gates_passed = None
-                    if target_gate is not None and n_gates is not None:
-                        g = int(target_gate[idx])
-                        gates_passed = float(n_gates if g == -1 else g)
-                    if full_track:
-                        true_start_hist.append(r)
-                        if gates_passed is not None:
-                            true_start_progress_hist.append(gates_passed)
-                        # Count true-start episodes only when the curriculum is active (true_start
-                        # present), so the start-mix fraction is meaningful for the racing task.
-                        true_start_count += int(true_start is not None)
-                    elif target_gate is not None and start_gate is not None:
-                        # Cone-spawned episode: it passed its gate iff the target advanced past the
-                        # one it started on (forward-only; terminal -1 = finished also counts).
-                        cone_total += 1
-                        cone_passed += int(int(target_gate[idx]) != int(start_gate[idx]))
-                    if wandb_enabled:
-                        log = {"train/reward": r, "train/episode_length": float(ep_lengths[idx])}
-                        if full_track and gates_passed is not None:
-                            log["train/gates_passed"] = gates_passed
-                            log["train/completed"] = float(gates_passed == n_gates)
-                        wandb.log(log, step=global_step)
-
-        obs_buf = jnp.stack(obs_list)       # (T, E, obs_dim)
-        act_buf = jnp.stack(act_list)       # (T, E, act_dim)
-        logp_buf = jnp.stack(logp_list)     # (T, E)
-        val_buf = jnp.stack(val_list)       # (T, E)
-        rew_buf = jnp.stack(rew_list)       # (T, E)
-        done_buf = jnp.stack(done_list)     # (T, E)
-
-        # -- GAE --
-        next_value = get_value(agent, next_obs)
-        advantages, returns = compute_gae(rew_buf, val_buf, done_buf, next_value, next_done)
+        # -- GAE -- 
+        d = outs["done"]  # (T, E) post-step done
+        dones_buf = jnp.concatenate([prev_done[None], d[:-1]], axis=0)
+        next_done = d[-1]
+        next_value = get_value(params, last_obs)
+        advantages, returns = compute_gae(
+            outs["reward"], outs["value"], dones_buf, next_value, next_done
+        )
 
         # -- Flatten batch --
         flat_data = (
-            obs_buf.reshape((-1,) + obs_shape),
-            act_buf.reshape((-1,) + act_shape),
-            logp_buf.reshape(-1),
+            outs["obs"].reshape((-1,) + obs_shape),
+            outs["action"].reshape((-1,) + act_shape),
+            outs["logprob"].reshape(-1),
             advantages.reshape(-1),
             returns.reshape(-1),
-            val_buf.reshape(-1),
+            outs["value"].reshape(-1),
         )
 
-        # Anneal the entropy bonus linearly to 0 over training (mirrors anneal_lr) so the policy
-        # explores early and sharpens late; a constant bonus was inflating the action spread as
-        # advantages flattened on the hard cones, eroding precision. Passed as a traced scalar so
-        # update_epoch isn't recompiled each iteration.
-        ent_coef_now = (
-            args.ent_coef * (1.0 - (iteration - 1) / args.num_iterations)
-            if args.anneal_ent_coef
-            else args.ent_coef
+        # Anneal entropy bonus linearly to 0 over training when enabled.
+        if args.anneal_ent_coef:
+            ent_coef_now = args.ent_coef * (1.0 - iter_idx / args.num_iterations)
+        else:
+            ent_coef_now = jnp.asarray(args.ent_coef, dtype=jnp.float32)
+
+        # -- PPO update --
+        rng, upd_rng = jax.random.split(rng)
+        params, opt_state, auxs = update_epochs(params, opt_state, flat_data, upd_rng, ent_coef_now)
+
+        # -- Per-iteration metrics --
+        # Report the last epoch's per-minibatch losses (post-update state).
+        last = jax.tree.map(lambda x: x[-1], auxs)
+        pg_arr, v_arr, ent_arr, kl_arr, ratio_arr = last
+        y_pred = outs["value"].reshape(-1)
+        y_true = returns.reshape(-1)
+        var_y = jnp.var(y_true)
+        explained_var = jnp.where(var_y == 0, jnp.nan, 1.0 - jnp.var(y_true - y_pred) / var_y)
+
+        n_done = jnp.maximum(jnp.sum(outs["done"]), 1.0)
+        ep_return = jnp.sum(outs["ret_done"]) / n_done
+        ep_length = jnp.sum(outs["len_done"]) / n_done
+        gates_passed = jnp.sum(outs["gates_done"]) / n_done
+        completed = jnp.sum(outs["completed_done"]) / n_done
+        score = gates_passed if n_gates is not None else ep_return
+
+        # -- Best-checkpoint snapshot (tracked in carry; no host pickling mid-scan) --
+        improved = score > best_score
+        best_params = jax.tree.map(lambda b, p: jnp.where(improved, p, b), best_params, params)
+        best_score = jnp.where(improved, score, best_score)
+
+        metrics = {
+            "losses/value_loss": jnp.mean(v_arr),
+            "losses/policy_loss": jnp.mean(pg_arr),
+            "losses/entropy": jnp.mean(ent_arr),
+            "losses/approx_kl": jnp.mean(kl_arr),
+            "losses/clipfrac": jnp.mean(
+                (jnp.abs(ratio_arr - 1.0) > args.clip_coef).astype(jnp.float32)
+            ),
+            "losses/explained_variance": explained_var,
+            "charts/ent_coef": ent_coef_now,
+            "train/reward": ep_return,
+            "train/episode_length": ep_length,
+            "train/gates_passed": gates_passed,
+            "train/completed": completed,
+            best_key: best_score,
+        }
+        # Reward components -> reward/<name>; diagnostics keep their prefix. Mean per step.
+        for k in metric_keys:
+            name = f"reward/{k[len('rew/'):]}" if k.startswith("rew/") else k
+            metrics[name] = jnp.sum(outs["metrics"][k]) / denom
+
+        new_carry = (
+            params, opt_state, env, last_obs, next_done, rng, ep_ret, ep_len,
+            best_params, best_score,
         )
-        ent_coef_arr = jnp.asarray(ent_coef_now, dtype=jnp.float32)
+        return new_carry, metrics
 
-        # -- PPO update epochs --
-        last_metrics = None
-        for _ in range(args.update_epochs):
-            rng, epoch_key = jax.random.split(rng)
-            metrics = update_epoch(agent, optimizer, flat_data, epoch_key, ent_coef_arr)
-            last_metrics = metrics
-            if args.target_kl is not None:
-                approx_kl = float(jnp.mean(metrics[1][3]))
-                if approx_kl > args.target_kl:
-                    break
-
-        # -- Logging --
-        y_pred = np.array(val_buf.reshape(-1))
-        y_true = np.array(returns.reshape(-1))
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        end_time = time.time()
-        if wandb_enabled and last_metrics is not None:
-            _, (pg_arr, v_arr, ent_arr, kl_arr, ratio_arr) = last_metrics
-            log_metrics = {
-                "losses/value_loss": float(jnp.mean(v_arr)),
-                "losses/policy_loss": float(jnp.mean(pg_arr)),
-                "losses/entropy": float(jnp.mean(ent_arr)),
-                "losses/approx_kl": float(jnp.mean(kl_arr)),
-                "losses/clipfrac": float(jnp.mean(jnp.abs(ratio_arr - 1.0) > args.clip_coef)),
-                "losses/explained_variance": explained_var,
-                # Instantaneous throughput: env steps processed *this iteration* (one rollout =
-                # batch_size steps) per wall-clock second. Flat line at steady state; reads straight
-                # off the y-axis. (Was global_step/iter_time, which ramped up with the step count.)
-                "charts/SPS": int(args.batch_size / (end_time - start_time)),
-                "charts/ent_coef": float(ent_coef_now),
-            }
-            # Fraction (0-1) of cone-spawned episodes this iteration that passed their spawn gate.
-            # Isolates curriculum progress from full-track skill; only logged when any cone episode
-            # finished (i.e. the curriculum is active and producing cone spawns).
-            if cone_total > 0:
-                log_metrics["train/cone_gate_pass_rate"] = cone_passed / cone_total
-            # Realized true-start fraction among finished episodes this iteration (cone fraction is
-            # 1 - this); should track p_start_schedule(tau). n_starts > 0 only when the
-            # curriculum is active (both counters increment solely when episode_true_start is
-            # present).
-            n_starts = true_start_count + cone_total
-            if n_starts > 0:
-                log_metrics["train/true_start_frac"] = true_start_count / n_starts
-            # Mean per-step value of each accumulated metric this iteration: reward components go
-            # under reward/<name>, behavioral diagnostics keep their diagnostics/<name> prefix.
-            denom = args.num_steps * args.num_envs
-            for key, total in step_metric_sums.items():
-                name = f"reward/{key[len('rew/'):]}" if key.startswith("rew/") else key
-                log_metrics[name] = float(total) / denom
-            # Max-reduced metrics: log the rollout peak under diagnostics/<name>_max.
-            for key, peak in step_metric_max.items():
-                log_metrics[f"diagnostics/{key[len('max/'):]}_max"] = float(peak)
-            wandb.log(log_metrics, step=global_step)
-
-        # -- Best-checkpoint snapshot --
-        # Snapshot params when the recent mean true-start *score* improves. The score is
-        # gates-passed (skill on the fixed deployment distribution, unshaped) for racing, falling
-        # back to return when no gate progress is available (other tasks). pickle.dumps takes an
-        # immutable snapshot now (the optimizer mutates `agent` in place each update, so a live
-        # reference would not preserve this iteration's weights).
-        best_hist = true_start_progress_hist if true_start_progress_hist else true_start_hist
-        best_is_progress = bool(true_start_progress_hist)
-        if checkpoint_dir is not None and len(best_hist) >= best_min_episodes:
-            mean_score = float(np.mean(best_hist[-best_window:]))
-            if mean_score > best_score:
-                best_score = mean_score
-                best_state_bytes = pickle.dumps(nnx.state(agent, nnx.Param))
-                if wandb_enabled:
-                    key = (
-                        "charts/best_true_start_gates" if best_is_progress else "charts/best_reward"
-                    )
-                    wandb.log({key: best_score}, step=global_step)
-
-        print(f"Iter {iteration}/{args.num_iterations} took {end_time - start_time:.2f} seconds")
-
-        # Graceful manual stop: Ctrl-C finishes the current iteration (best snapshot already taken
-        # above, so the saved checkpoint is current), then breaks to write it out. There is no
-        # rule-based early stopping; the run otherwise trains for the full horizon.
-        if stop_requested["flag"]:
-            print("Stopping on user request (Ctrl-C); saving best checkpoint.")
-            break
-
-    signal.signal(signal.SIGINT, prev_sigint)  # restore so evaluation/render handles Ctrl-C itself
-    train_end_time = time.time()
-    print(
-        f"Training for {global_step} steps took {train_end_time - train_start_time:.2f} seconds."
+    # ------------------------------------------------------------------ #
+    # Whole-run scan                                                     #
+    # ------------------------------------------------------------------ #
+    env0, (next_obs, _) = envs.reset(envs, seed=args.seed)
+    init_carry = (
+        params,
+        opt_state,
+        env0,
+        next_obs,
+        jnp.zeros(num_envs),  # prev_done
+        rng,
+        jnp.zeros(num_envs),  # ep_ret
+        jnp.zeros(num_envs),  # ep_len
+        params,  # best_params (init to current; replaced on first improvement)
+        jnp.asarray(-jnp.inf, dtype=jnp.float32),  # best_score
     )
+    print(f"Compiling and running {args.num_iterations} iterations as one scan...")
+    final_carry, metrics_stack = jax.lax.scan(
+        train_iteration, init_carry, jnp.arange(args.num_iterations)
+    )
+    jax.block_until_ready(metrics_stack)
+    best_params = final_carry[8]
+    best_score = float(final_carry[9])
+    global_step = args.num_iterations * args.batch_size
+    train_end_time = time.time()
+    sps = int(global_step / (train_end_time - train_start_time)) if global_step else 0
+    print(
+        f"Training for {global_step} steps took {train_end_time - train_start_time:.2f}s "
+        f"({sps} steps/s)."
+    )
+
+    # -- Flush all per-iteration metrics to wandb in one batch (after training) --
+    if wandb_enabled:
+        metrics_host = jax.device_get(metrics_stack)
+        for it in range(args.num_iterations):
+            log = {k: float(v[it]) for k, v in metrics_host.items()}
+            wandb.log(log, step=(it + 1) * args.batch_size)
+
+    # -- Save the best checkpoint --
     model_path = None
     if checkpoint_dir is not None:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        if best_state_bytes is not None:
-            # Save the best snapshot (highest recent mean true-start score), not the final state.
-            tag = "g" if best_is_progress else "r"  # gates-passed vs return
-            metric = "gates-passed" if best_is_progress else "return"
-            model_path = checkpoint_dir / f"{run_name}_{timestamp}_{tag}{best_score:.2f}_best.ckpt"
-            with open(model_path, "wb") as f:
-                f.write(best_state_bytes)
-            print(f"Best model (mean true-start {metric} {best_score:.2f}) saved to {model_path}")
-        else:
-            # No best was recorded (too few completed episodes) -> fall back to the final state.
-            recent = sum_rewards_hist[-100:]
-            reward_tag = f"r{np.mean(recent):.2f}" if recent else "rNA"
-            model_path = checkpoint_dir / f"{run_name}_{timestamp}_{reward_tag}.ckpt"
-            with open(model_path, "wb") as f:
-                pickle.dump(nnx.state(agent, nnx.Param), f)
-            print(f"Final model saved to {model_path} (no best snapshot recorded)")
+        tag = "g" if n_gates is not None else "r"
+        metric = "gates-passed" if n_gates is not None else "return"
+        model_path = checkpoint_dir / f"{run_name}_{timestamp}_{tag}{best_score:.2f}_best.ckpt"
+        nnx.update(agent, best_params)
+        with open(model_path, "wb") as f:
+            pickle.dump(nnx.state(agent, nnx.Param), f)
+        print(f"Best model (mean {metric} {best_score:.2f}) saved to {model_path}")
     envs.close()
     return model_path
 
 
 def evaluate_ppo(
-    args: Args, make_env: MakeEnv, n_eval: int, model_path: Path, render: bool = True
-) -> tuple[list, list]:
-    """Evaluate a trained PPO agent.
+    args: Args, make_env: MakeEnv, config: Any, n_eval: int, model_path: Path
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate a trained PPO agent headless: ``n_eval`` parallel envs, one episode each.
 
-    Set ``render=False`` to run evaluation headless (no viewer window).
+    Rendering lives in ``rl/scripts/render.py`` and is intentionally not handled here. Each env
+    runs the deterministic (mean) policy for one episode; the env autoresets internally, so reward
+    and length are masked after each env's first ``done`` to isolate a single episode.
     """
     set_seeds(args.seed)
-    eval_env = make_env(args, 1, args.jax_device)
+    eval_env = make_env(dataclasses.replace(args, num_envs=n_eval), config)
     action_dim = int(np.prod(eval_env.single_action_space.shape))
-    obs_dim = int(np.prod(eval_env.single_observation_space.shape))
 
-    # Build a fresh model and load the saved parameters into it (like load_state_dict).
+    obs_dim = int(np.prod(eval_env.single_observation_space.shape))
     agent = Agent(obs_dim, action_dim, rngs=nnx.Rngs(0))
     with open(model_path, "rb") as f:
         nnx.update(agent, pickle.load(f))
+    graphdef, params = nnx.split(agent)
 
-    @nnx.jit
-    def deterministic_action(agent: Agent, obs: Array) -> Array:
-        mean, _, _ = agent(obs)
-        return mean
+    max_steps = int(getattr(args, "max_episode_length", 2000))
 
-    episode_rewards: list[float] = []
-    episode_lengths: list[int] = []
-    ep_seed = args.seed
+    def eval_scan(carry: tuple, _: Any) -> tuple[tuple, None]:
+        env, obs, done_so_far, ret, length = carry
+        mean, _, _ = nnx.merge(graphdef, params)(obs)
+        env, (next_obs, reward, term, trunc, _) = env.step(env, mean)
+        alive = 1.0 - done_so_far.astype(jnp.float32)
+        ret = ret + reward * alive
+        length = length + alive
+        done_so_far = done_so_far | jnp.logical_or(term, trunc)
+        return (env, next_obs, done_so_far, ret, length), None
 
-    for episode in range(n_eval):
-        obs, _ = eval_env.reset(seed=(ep_seed := ep_seed + 1))
-        done = False
-        episode_reward = 0.0
-        steps = 0
-        while not done:
-            obs_jax = jnp.asarray(obs)
-            act = deterministic_action(agent, obs_jax)
-            obs, reward, terminated, truncated, _ = eval_env.step(act)
-            if render:
-                eval_env.render()
-            done = bool(jnp.any(jnp.asarray(terminated) | jnp.asarray(truncated)))
-            episode_reward += float(jnp.asarray(reward)[0])
-            steps += 1
-        sim = eval_env.unwrapped.sim
-        while (
-            render
-            and sim.viewer is not None
-            and sim.viewer.viewer is not None
-            and sim.viewer.viewer.window is not None
-        ):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("error", category=glfw.GLFWError)
-                try:
-                    eval_env.render()
-                except glfw.GLFWError:
-                    # ESC called glfw.terminate() without setting window=None; null it out so
-                    # WindowViewer.__del__ -> free() skips GLFW calls on garbage collection.
-                    if sim.viewer is not None and sim.viewer.viewer is not None:
-                        sim.viewer.viewer.window = None
-                    sim.viewer = None
-                    break
-            time.sleep(1 / 60)
+    env0, (obs0, _) = eval_env.reset(eval_env, seed=args.seed)
+    carry0 = (
+        env0,
+        obs0,
+        jnp.zeros(n_eval, dtype=bool),
+        jnp.zeros(n_eval),
+        jnp.zeros(n_eval),
+    )
+    (_, _, _, ret, length), _ = jax.lax.scan(eval_scan, carry0, None, length=max_steps)
+    episode_rewards = np.array(ret)
+    episode_lengths = np.array(length)
 
-        episode_rewards.append(episode_reward)
-        episode_lengths.append(steps)
-        print(f"Episode {episode + 1}: Reward = {episode_reward:.2f}, Length = {steps}")
-
+    for i in range(n_eval):
+        print(
+            f"Episode {i + 1}: Reward = {episode_rewards[i]:.2f}, "
+            f"Length = {int(episode_lengths[i])}"
+        )
     print(
-        f"Average Reward = {np.mean(episode_rewards):.2f},"
-        f" Length = {np.mean(episode_lengths)}"
+        f"Average Episode Reward = {np.mean(episode_rewards):.2f}, "
+        f"Average Episode Length = {np.mean(episode_lengths):.1f}"
     )
     eval_env.close()
     return episode_rewards, episode_lengths

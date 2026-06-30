@@ -1,7 +1,9 @@
 """Reward / action-shaping wrappers for the vectorized JAX drone environments."""
+from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
+import flax.struct as struct
 from gymnasium import spaces
 from gymnasium.vector import (
     VectorActionWrapper,
@@ -9,26 +11,12 @@ from gymnasium.vector import (
     VectorObservationWrapper,
     VectorRewardWrapper,
 )
+from typing import Any, Callable
 from gymnasium.vector.utils import batch_space
 from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
 
-
-def action_smoothness_penalty(action: Array, last_action: Array, coef: float) -> Array:
-    """Champion-style action-smoothness penalty: ``-coef * ||clip(a) - clip(a_prev)||**2``.
-
-    Penalizes the squared change between consecutive *bounded* commands (clipped to the [-1, 1]
-    normalized action range -- i.e. what ``NormalizeActions`` actually applies). Computing it on
-    the bounded action rather than the raw, unbounded policy output keeps the coefficient tied to a
-    fixed command range, so a high-variance policy cannot inflate the penalty and it does not double
-    as a second entropy penalty (the failure mode of the old raw-output version). Summed over all
-    action dims with a single coefficient -- the champion reward (Kaufmann et al. 2023) uses one
-    smoothness weight, not the per-channel split (thrust vs roll/pitch) this replaces.
-    """
-    a = jnp.clip(action, -1.0, 1.0)
-    a_prev = jnp.clip(last_action, -1.0, 1.0)
-    return -coef * jnp.sum((a - a_prev) ** 2, axis=-1)
-
+from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 
 class AngleReward(VectorRewardWrapper):
     """Wrapper to penalize orientation in the reward."""
@@ -54,119 +42,73 @@ class AngleReward(VectorRewardWrapper):
         rewards -= self.rpy_coef * rpy_norm
         return rewards
 
+@struct.dataclass
+class ActionPenalty(Wrapper):
+    """Energy + thrust/attitude-smoothness action penalty, with ``last_action`` in the observation."""
 
-class ActionPenalty(VectorObservationWrapper):
-    """Wrapper to apply action penalty."""
+    base: struct.PyTreeNode = struct.field(pytree_node=True)
+    last_action: Array = struct.field(pytree_node=True)
 
-    def __init__(
-        self,
-        env: VectorEnv,
-        act_coef: float = 0.01,
-        d_act_th_coef: float = 0.2,
-        d_act_xy_coef: float = 0.4,
-    ):
-        """Init."""
-        super().__init__(env)
-        # Update observation space
-        spec = {k: v for k, v in self.single_observation_space.items()}
+    step: Callable = struct.field(pytree_node=False)
+    reset: Callable = struct.field(pytree_node=False)
+
+    @property
+    def single_observation_space(self) -> spaces.Space:
+        spec = {**self.base.single_observation_space.spaces}
         spec["last_action"] = spaces.Box(-np.inf, np.inf, shape=(4,))
-        self.single_observation_space = spaces.Dict(spec)
-        self.observation_space = batch_space(self.single_observation_space, self.num_envs)
-        self._last_action = jnp.zeros((self.num_envs, 4))
-        self.act_coef = act_coef
-        self.d_act_th_coef = d_act_th_coef
-        self.d_act_xy_coef = d_act_xy_coef
+        return spaces.Dict(spec)
 
     @property
-    def device(self):
-        """Forward the base env's compute device. gymnasium's VectorWrapper does not forward
-        unknown attributes, so NormalizeActions (which wraps this) can't reach ``env.device``
-        without this passthrough."""
-        return self.unwrapped.device
+    def observation_space(self) -> spaces.Space:
+        return batch_space(self.single_observation_space, self.num_envs)
 
-    def step(self, action: Array) -> tuple[Array, Array, Array, Array, dict]:
-        """Override step."""
-        obs, reward, terminated, truncated, info = super().step(action)
-        action_diff = action - self._last_action
-        act_term = -self.act_coef * action[..., -1] ** 2  # energy
-        d_act_th_term = -self.d_act_th_coef * action_diff[..., -1] ** 2  # thrust smoothness
-        # rp smoothness
-        d_act_xy_term = -self.d_act_xy_coef * jnp.sum(action_diff[..., :3] ** 2, axis=-1)
-        reward = reward + act_term + d_act_th_term + d_act_xy_term
-        self._last_action = action
-        # Surface the terms for per-component reward logging (summed per iteration in PPO).
-        info = {
-            **info,
-            "rew/act": act_term,
-            "rew/d_act_th": d_act_th_term,
-            "rew/d_act_xy": d_act_xy_term,
-        }
-        # Diagnostics (normalized action: thrust 0 == hover, +1 == max): mean commanded thrust and
-        # lean magnitude. Distinguishes "climbs because it over-thrusts and never tilts"
-        # (act_thrust>0, act_tilt~0) from a thrust deficit. Logged as diagnostics/* (mean-per-step)
-        # by PPO.
-        act_tilt = jnp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
-        info = {**info, "diagnostics/act_thrust": action[..., -1], "diagnostics/act_tilt": act_tilt}
-        return self.observations(obs), reward, terminated, truncated, info
+    @classmethod
+    def create(
+        cls,
+        base: struct.PyTreeNode,
+        act_coef: float,
+        d_act_th_coef: float,
+        d_act_xy_coef: float,
+    ) -> ActionPenalty:
+        """Create an ActionPenalty wrapper around the base environment."""
+        last_action = jnp.zeros((base.num_envs, 4))
 
-    def observations(self, observations: dict) -> dict:
-        """Override observation."""
-        observations["last_action"] = self._last_action
-        return observations
+        def reset(
+            env: ActionPenalty, *, seed: int | None = None, options: dict | None = None
+        ) -> tuple[ActionPenalty, tuple[Any, Any]]:
+            base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
+            env = env.replace(base=base_env, last_action=jnp.zeros_like(env.last_action))
+            obs = {**obs, "last_action": env.last_action}
+            return env, (obs, info)
 
+        def step(
+            env: ActionPenalty, action: Array
+        ) -> tuple[ActionPenalty, tuple[Any, ...]]:
+            base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
+            action_diff = action - env.last_action
+            act_term = -act_coef * action[..., -1] ** 2  # energy
+            d_act_th_term = -d_act_th_coef * action_diff[..., -1] ** 2  # thrust smoothness
+            # roll/pitch smoothness
+            d_act_xy_term = -d_act_xy_coef * jnp.sum(action_diff[..., :3] ** 2, axis=-1)
+            reward = reward + act_term + d_act_th_term + d_act_xy_term
+            env = env.replace(base=base_env, last_action=action)
+            obs = {**obs, "last_action": action}
+            act_tilt = jnp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
+            info = {
+                **info,
+                "rew/act": act_term,
+                "rew/d_act_th": d_act_th_term,
+                "rew/d_act_xy": d_act_xy_term,
+                "diagnostics/act_thrust": action[..., -1],
+                "diagnostics/act_tilt": act_tilt,
+            }
+            return env, (obs, reward, terminated, truncated, info)
 
-class ActionSmoothnessPenalty(VectorObservationWrapper):
-    """Single champion-style action-smoothness penalty + ``last_action`` in the observation.
-
-    Replaces the racing task's stack of ``AngleReward`` (attitude-magnitude penalty) +
-    ``ActionPenalty`` (absolute-thrust energy + split per-channel smoothness) with one term:
-    ``action_smoothness_penalty`` on the bounded action. One coefficient, and no attitude/energy
-    bias -- matching the champion reward, which penalizes only the *change* in command. Also
-    exposes the previous (bounded) action in the obs dict for ``RelativeRacingObs`` and logs the
-    commanded thrust / lean diagnostics.
-    """
-
-    def __init__(self, env: VectorEnv, d_act_coef: float = 0.01):
-        """Add ``last_action`` (bounded) to the observation space and stash the coefficient."""
-        super().__init__(env)
-        spec = {k: v for k, v in self.single_observation_space.items()}
-        spec["last_action"] = spaces.Box(-1.0, 1.0, shape=(4,))
-        self.single_observation_space = spaces.Dict(spec)
-        self.observation_space = batch_space(self.single_observation_space, self.num_envs)
-        self._last_action = jnp.zeros((self.num_envs, 4))
-        self.d_act_coef = d_act_coef
-
-    @property
-    def device(self):
-        """Forward the base env's compute device (see ActionPenalty.device) so NormalizeActions,
-        which wraps this, can reach ``env.device`` through gymnasium's VectorWrapper."""
-        return self.unwrapped.device
-
-    def step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:
-        """Step, add the smoothness penalty, and refresh the observed last (bounded) action."""
-        obs, reward, terminated, truncated, info = super().step(action)
-        bounded = jnp.clip(action, -1.0, 1.0)
-        d_act_term = action_smoothness_penalty(action, self._last_action, self.d_act_coef)
-        reward = reward + d_act_term
-        self._last_action = bounded
-        # Surface the single smoothness term for per-component reward logging (summed in PPO).
-        info = {**info, "rew/d_act": d_act_term}
-        # Diagnostics on the bounded command (thrust 0 == hover, +1 == max; lean = roll/pitch mag).
-        act_tilt = jnp.sqrt(bounded[..., 0] ** 2 + bounded[..., 1] ** 2)
-        info = {
-            **info,
-            "diagnostics/act_thrust": bounded[..., -1],
-            "diagnostics/act_tilt": act_tilt,
-        }
-        return self.observations(obs), reward, terminated, truncated, info
-
-    def observations(self, observations: dict) -> dict:
-        """Expose the previous (bounded) action in the observation dict."""
-        observations["last_action"] = self._last_action
-        return observations
+        return cls(base=base, last_action=last_action, step=step, reset=reset)
 
 
-class ZeroYaw(VectorActionWrapper):
+@struct.dataclass
+class ZeroYaw(Wrapper):
     """Force the yaw command to zero before it reaches the environment.
 
     A quadrotor reaches every gate regardless of heading, and the drone/physics used here are
@@ -176,6 +118,66 @@ class ZeroYaw(VectorActionWrapper):
     report and penalize a yaw command that is never actually applied.
     """
 
-    def actions(self, actions: Array) -> Array:
-        """Zero the yaw channel of the (normalized) action."""
-        return actions.at[..., 2].set(0.0)
+    base: struct.PyTreeNode = struct.field(pytree_node=True)
+    reset: Callable = struct.field(pytree_node=False)
+    step: Callable = struct.field(pytree_node=False)
+
+
+    @classmethod
+    def create(cls, base: struct.PyTreeNode) -> ZeroYaw:
+        """ Create a ZeroYaw wrapper around the base environment. """
+
+        def reset(env: ZeroYaw, *, seed: int | None = None, options: dict | None = None) -> tuple[ZeroYaw, tuple[Any, Any]]:
+            base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
+            env = env.replace(base=base_env)
+            return env, (obs, info)
+        
+        def step(env: ZeroYaw, actions: Array) -> tuple[ZeroYaw, tuple[Any, ...]]:
+            """Zero the yaw channel of the (normalized) action."""
+            actions = actions.at[..., 2].set(0.0)
+            base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, actions)
+            env = env.replace(base=base_env)
+            return env, (obs, reward, terminated, truncated, info)
+
+        return cls(base=base, step=step, reset=reset)
+
+
+@struct.dataclass
+class NormalizeActions(Wrapper):
+    """Expose actions in ``[-1, 1]`` and rescale them to the simulator's action range.
+    """
+
+    base: struct.PyTreeNode = struct.field(pytree_node=True)
+    step: Callable = struct.field(pytree_node=False)
+    reset: Callable = struct.field(pytree_node=False)
+
+    @property
+    def single_action_space(self) -> spaces.Space:
+        base_space = self.base.single_action_space
+        return spaces.Box(-1.0, 1.0, shape=base_space.shape, dtype=base_space.dtype)
+
+    @property
+    def action_space(self) -> spaces.Space:
+        return batch_space(self.single_action_space, self.num_envs)
+
+    @classmethod
+    def create(cls, base: struct.PyTreeNode) -> NormalizeActions:
+        """Create a NormalizeActions wrapper around the base environment."""
+        low = jnp.asarray(base.single_action_space.low)
+        high = jnp.asarray(base.single_action_space.high)
+        scale = (high - low) / 2.0
+        mean = (high + low) / 2.0
+
+        def reset(
+            env: NormalizeActions, *, seed: int | None = None, options: dict | None = None
+        ) -> tuple[NormalizeActions, tuple[Any, Any]]:
+            base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
+            return env.replace(base=base_env), (obs, info)
+
+        def step(env: NormalizeActions, action: Array) -> tuple[NormalizeActions, tuple[Any, ...]]:
+            action = jnp.clip(action, -1.0, 1.0) * scale + mean
+            base_env, payload = env.base.step(env.base, action)
+            return env.replace(base=base_env), payload
+
+        return cls(base=base, step=step, reset=reset)
+
