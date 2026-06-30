@@ -1,5 +1,10 @@
 """Observation wrappers for the vectorized JAX drone environments."""
 
+from __future__ import annotations
+
+from typing import Any, Callable
+
+import flax.struct as struct
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,6 +13,8 @@ from gymnasium.vector import VectorEnv, VectorObservationWrapper
 from gymnasium.vector.utils import batch_space
 from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
+
+from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 
 # Number of upcoming gates (current target + the following one) exposed to the policy.
 N_NEXT_GATES = 2
@@ -68,41 +75,61 @@ class StackObs(VectorObservationWrapper):
         return prev_obs
 
 
-class FlattenJaxObservation(VectorObservationWrapper):
-    """Wrapper to flatten the dict observations into a single float32 vector.
+def _flat_size(space: spaces.Space) -> int:
+    """Number of scalar features a sub-space contributes to the flat vector."""
+    if isinstance(space, spaces.Discrete):
+        return 1
+    return int(np.prod(space.shape))
 
-    gym's ``flatten_space`` one-hot-encodes ``Discrete`` spaces (e.g. ``target_gate``),
-    which would not match a plain concatenation of the raw observation values. To keep the
-    declared space consistent with what ``observations`` actually produces, we build the
-    flattened space ourselves: each entry contributes ``prod(shape)`` features (a
-    ``Discrete`` contributes 1), and ``observations`` concatenates the same keys, cast to
-    float32, in the same fixed order.
+
+@struct.dataclass
+class FlattenJaxObservation(Wrapper):
+    """Flatten the dict observation into a single float32 vector per environment.
+
+    gym's ``flatten_space`` one-hot-encodes ``Discrete`` spaces (e.g. ``target_gate``), which would
+    not match a plain concatenation of the raw observation values. We build the flattened space
+    ourselves: each entry contributes ``prod(shape)`` features (a ``Discrete`` contributes 1), and
+    ``step``/``reset`` concatenate the same keys, cast to float32, in the same fixed order.
     """
 
-    def __init__(self, env: VectorEnv):
-        """Init."""
-        super().__init__(env)
-        self._keys = list(env.single_observation_space.keys())
-        flat_dim = sum(self._flat_size(env.single_observation_space[k]) for k in self._keys)
-        self.single_observation_space = spaces.Box(-np.inf, np.inf, shape=(flat_dim,))
-        self.observation_space = batch_space(self.single_observation_space, self.num_envs)
+    base: struct.PyTreeNode = struct.field(pytree_node=True)
+    step: Callable = struct.field(pytree_node=False)
+    reset: Callable = struct.field(pytree_node=False)
 
-    @staticmethod
-    def _flat_size(space: spaces.Space) -> int:
-        """Number of scalar features a sub-space contributes to the flat vector."""
-        if isinstance(space, spaces.Discrete):
-            return 1
-        return int(np.prod(space.shape))
+    @property
+    def single_observation_space(self) -> spaces.Space:
+        space = self.base.single_observation_space
+        flat_dim = sum(_flat_size(space[k]) for k in space.keys())
+        return spaces.Box(-np.inf, np.inf, shape=(flat_dim,))
 
-    def observations(self, observations: dict) -> Array:
-        """Flatten observations into one float32 vector per environment."""
-        return jnp.concatenate(
-            [
-                jnp.reshape(observations[k], (observations[k].shape[0], -1)).astype(jnp.float32)
-                for k in self._keys
-            ],
-            axis=-1,
-        )
+    @property
+    def observation_space(self) -> spaces.Space:
+        return batch_space(self.single_observation_space, self.num_envs)
+
+    @classmethod
+    def create(cls, base: struct.PyTreeNode) -> FlattenJaxObservation:
+        """Create a FlattenJaxObservation wrapper around the base environment."""
+        keys = list(base.single_observation_space.keys())
+
+        def flatten(obs: dict) -> Array:
+            return jnp.concatenate(
+                [jnp.reshape(obs[k], (obs[k].shape[0], -1)).astype(jnp.float32) for k in keys],
+                axis=-1,
+            )
+
+        def reset(
+            env: FlattenJaxObservation, *, seed: int | None = None, options: dict | None = None
+        ) -> tuple[FlattenJaxObservation, tuple[Any, Any]]:
+            base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
+            return env.replace(base=base_env), (flatten(obs), info)
+
+        def step(
+            env: FlattenJaxObservation, action: Array
+        ) -> tuple[FlattenJaxObservation, tuple[Any, ...]]:
+            base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
+            return env.replace(base=base_env), (flatten(obs), reward, terminated, truncated, info)
+
+        return cls(base=base, step=step, reset=reset)
 
 
 @jax.jit
@@ -151,7 +178,8 @@ def _relative_racing_obs(obs: dict) -> dict:
     }
 
 
-class RelativeRacingObs(VectorObservationWrapper):
+@struct.dataclass
+class RelativeRacingObs(Wrapper):
     """Recast the observation into a relative, track-length-invariant racing representation.
 
     The observation is fully expressed in the drone's body frame. Compared to the raw observation
@@ -177,10 +205,13 @@ class RelativeRacingObs(VectorObservationWrapper):
     ``ActionSmoothnessPenalty`` for racing, ``ActionPenalty`` for hover / trajectory).
     """
 
-    def __init__(self, env: VectorEnv):
-        """Init."""
-        super().__init__(env)
-        base = self.single_observation_space
+    base: struct.PyTreeNode = struct.field(pytree_node=True)
+    step: Callable = struct.field(pytree_node=False)
+    reset: Callable = struct.field(pytree_node=False)
+
+    @property
+    def single_observation_space(self) -> spaces.Space:
+        base = self.base.single_observation_space
         n_obstacles = base["obstacles_pos"].shape[0]
         spec = {
             "grav_body": spaces.Box(-1.0, 1.0, shape=(3,)),
@@ -191,9 +222,36 @@ class RelativeRacingObs(VectorObservationWrapper):
             "obstacles_visited": base["obstacles_visited"],
             "vel": base["vel"],
         }
-        self.single_observation_space = spaces.Dict(spec)
-        self.observation_space = batch_space(self.single_observation_space, self.num_envs)
+        return spaces.Dict(spec)
 
-    def observations(self, observations: dict) -> dict:
-        """Transform the raw observation dict into the relative racing representation."""
-        return _relative_racing_obs(observations)
+    @property
+    def observation_space(self) -> spaces.Space:
+        return batch_space(self.single_observation_space, self.num_envs)
+
+    @classmethod
+    def create(cls, base: struct.PyTreeNode) -> RelativeRacingObs:
+        """Create a RelativeRacingObs wrapper around the base environment.
+
+        Requires ``last_action`` to already be present in the observation, i.e. wrap *after*
+        ``ActionPenalty``.
+        """
+
+        def reset(
+            env: RelativeRacingObs, *, seed: int | None = None, options: dict | None = None
+        ) -> tuple[RelativeRacingObs, tuple[Any, Any]]:
+            base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
+            return env.replace(base=base_env), (_relative_racing_obs(obs), info)
+
+        def step(
+            env: RelativeRacingObs, action: Array
+        ) -> tuple[RelativeRacingObs, tuple[Any, ...]]:
+            base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
+            return env.replace(base=base_env), (
+                _relative_racing_obs(obs),
+                reward,
+                terminated,
+                truncated,
+                info,
+            )
+
+        return cls(base=base, step=step, reset=reset)

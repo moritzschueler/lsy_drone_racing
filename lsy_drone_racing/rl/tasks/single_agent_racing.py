@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
-from crazyflow.envs.norm_actions_wrapper import NormalizeActions
+#from crazyflow.envs.norm_actions_wrapper import NormalizeActions
 from gymnasium.vector import VectorEnv, VectorWrapper
 from jax import Array
 
@@ -21,13 +21,11 @@ from lsy_drone_racing.rl.tasks.progress_variants import (
     gate_opening_distance,
 )
 from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, RelativeRacingObs
-from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, ActionSmoothnessPenalty, ZeroYaw
+from lsy_drone_racing.rl.wrappers.racing_env import RacingEnv
+from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, ZeroYaw, NormalizeActions
 from lsy_drone_racing.rl.wrappers.segment_spawn import SegmentSpawn
 from lsy_drone_racing.rl.wrappers.takeoff import SpinUpRotors
-from lsy_drone_racing.utils import load_config
-
-# Re-exported from progress_variants for back-compat (tests / notebook import these from here).
-__all__ = ["GATE_HALF_EXTENT", "gate_opening_distance", "_target_gate_frame"]
+from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 
 @dataclass
 class RacingArgs(Args):
@@ -45,19 +43,10 @@ class RacingArgs(Args):
     clip_coef: float = 0.2
     ent_coef: float = 0.008
     anneal_ent_coef: bool = False  # decay entropy if True
-    # Swappable dense progress reward: (variant_name, coef). The variant selects the per-gate
-    # potential Phi (see progress_variants.PROGRESS_VARIANTS); the per-step reward is
-    # coef * (Phi(curr) - Phi(prev)). Per-variant shape params live in progress_params (inherited
-    # from Args), which always carries every variant's knobs so switching never drops a param.
-    progress: tuple[str, float] = ("fancy", 5.0)
-    # Per-variant progress shape params, keyed by variant name. Always carries every variant's knobs
-    # (see default_progress_params) so switching the active variant never requires dropping a param.
+    progress: tuple[str, float] = ("fancy", 5.0) # Tuple of variant and coefficent
     progress_params: dict = field(default_factory=default_progress_params)
     speed_coef: float = 0.05  # quadratic speed-hinge weight (0 disables); starting guess, tune
     speed_threshold: float = 4.0  # speed (m/s) above which the hinge penalizes; free below it
-    # Single action-smoothness penalty (champion-style) on the bounded action; replaces the old
-    # rpy / act / d_act_xy / d_act_th stack. Whisper-level relative to progress; tune up only once
-    # gate-passing is solid (a too-large smoothness penalty rewards "fly calm" over "pass gates").
     d_act_coef: float = 0.000 
     d_act_th_coef: float = 0.0005 # Coefficient for thrust change penalty (thrust smoothness)
     d_act_xy_coef: float = 0.001 # Coefficient for xy action change penalty (attitude smoothness)
@@ -330,13 +319,8 @@ class LogRewardComponents(VectorWrapper):
         return obs, reward, terminated, truncated, info
 
 
-def make_env(
-    args: Args, num_envs: int, jax_device: str = "cpu", config: str = "level0.toml"
-) -> VectorEnv:
+def make_env(args: Args, config: dict = None) -> VectorEnv:
     """Build the vectorized, fully-wrapped racing environment."""
-    config = load_config(Path(__file__).parents[3] / "config" / config)
-    # Resolve the swappable progress potential once and share it between the env reward and the
-    # logging monitor so the logged components can never drift from what is optimized.
     progress_variant, progress_coef = args.progress
     progress_potential = build_progress_potential(progress_variant, args.progress_params)
     reward_fn = build_racing_reward(
@@ -351,7 +335,7 @@ def make_env(
         speed_threshold=args.speed_threshold,
     )
     env = VecDroneRaceEnv(
-        num_envs=num_envs,
+        num_envs=args.num_envs,
         freq=config.env.freq,
         sim_config=config.sim,
         sensor_range=config.env.sensor_range,
@@ -360,12 +344,10 @@ def make_env(
         disturbances=config.env.get("disturbances"),
         randomizations=config.env.get("randomizations"),
         seed=config.env.seed,
-        device=jax_device,
+        device=args.jax_device,
         reward_fn=reward_fn,
         max_episode_steps=args.max_episode_length
     )
-    # Transparent monitor (innermost): surface each env-side reward term in info for per-component
-    # wandb charts. Recomputes the same terms reward_fn used; does not alter obs/reward/done.
     env = LogRewardComponents(
         env,
         progress_potential=progress_potential,
@@ -379,20 +361,60 @@ def make_env(
         speed_coef=args.speed_coef,
         speed_threshold=args.speed_threshold,
     )
-    # Curriculum: respawn drones in per-gate approach cones on (auto)reset. Manages the base data
-    # and returns base-format obs (the monitor below it is transparent); inactive until training
-    # pushes progress.
+    # Curriculum: spawn drones in per-gate approach cones on (auto)reset.
     env = SegmentSpawn(env, seed=args.seed)
     # Seed warm rotors on every (auto)reset so the drone starts in hover equilibrium instead of
-    # falling with cold rotors. Sits *outside* SegmentSpawn: the cone respawn overrides the pose
-    # first (leaving rotor_vel untouched), then this warms rotor_vel for the same just-reset envs
-    # (true-start and cone-spawned alike), so no spawn begins with dead rotors.
+    # falling with cold rotors.
     env = SpinUpRotors(env)
     env = ActionPenalty(env, act_coef=args.act_coef, d_act_th_coef = args.d_act_th_coef, d_act_xy_coef = args.d_act_xy_coef)
     env = NormalizeActions(env)
     env = ZeroYaw(env)
-    # Relative geometry + next-2-gates + rotation matrices (must come after
-    # ActionSmoothnessPenalty so last_action is present in the dict it transforms).
+    # Relative geometry + next-2-gates + rotation matrices
     env = RelativeRacingObs(env)
     env = FlattenJaxObservation(env)
+    return env
+
+def make_functional_env(args: Args, config: dict = None) -> Wrapper:
+    """Build the fully-wrapped functional (scannable) racing environment.
+
+    Mirrors :func:`make_env` but composes the functional ``.create()`` wrapper chain over a
+    :class:`RacingEnv` adapter instead of the gym wrapper stack, so the whole env step is a pure
+    pytree-threading function that can be rolled through ``lax.scan``.
+    """
+    progress_variant, progress_coef = args.progress
+    progress_potential = build_progress_potential(progress_variant, args.progress_params)
+    reward_fn = build_racing_reward(
+        progress_potential=progress_potential,
+        progress_coef=progress_coef,
+        gate_bonus=args.gate_bonus,
+        finish_bonus=args.finish_bonus,
+        crash_penalty=args.crash_penalty,
+        timeout_penalty=args.timeout_penalty,
+        time_penalty=args.time_alive_penalty,
+        speed_coef=args.speed_coef,
+        speed_threshold=args.speed_threshold,
+    )
+
+    env = VecDroneRaceEnv(
+    num_envs=args.num_envs,
+    freq=config.env.freq,
+    sim_config=config.sim,
+    sensor_range=config.env.sensor_range,
+    control_mode=config.env.control_mode,
+    track=config.env.track,
+    disturbances=config.env.get("disturbances"),
+    randomizations=config.env.get("randomizations"),
+    seed=config.env.seed,
+    device=args.jax_device,
+    reward_fn=reward_fn,
+    max_episode_steps=args.max_episode_length
+    )
+
+    env = RacingEnv.create(env)
+    env = SpinUpRotors.create(env)
+    env = ActionPenalty.create(env, act_coef=args.act_coef, d_act_th_coef = args.d_act_th_coef, d_act_xy_coef = args.d_act_xy_coef)
+    env = NormalizeActions.create(env)
+    env = ZeroYaw.create(env)
+    env = RelativeRacingObs.create(env)
+    env = FlattenJaxObservation.create(env)
     return env

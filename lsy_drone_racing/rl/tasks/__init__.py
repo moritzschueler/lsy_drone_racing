@@ -6,12 +6,11 @@ reward, the observation/wrapper stack, and default ``Args`` overrides. The PPO a
 """
 
 from dataclasses import dataclass
-from typing import Callable
-
-from gymnasium.vector import VectorEnv
+from typing import Any, Callable
 
 from lsy_drone_racing.rl.config import Args
 from lsy_drone_racing.rl.tasks import hover, single_agent_racing, trajectory
+from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 
 
 @dataclass
@@ -21,14 +20,19 @@ class Task:
     ``args_cls`` is an ``Args`` (sub)class whose field defaults are this task's hyperparameters;
     the CLI builds the run config with ``args_cls.create(**cli_overrides)``. Tasks without
     task-specific defaults point at the base ``Args`` directly.
+
+    ``make_env`` is the functional env factory ``(args, config) -> Wrapper`` (a scannable
+    ``struct.PyTreeNode``); see ``single_agent_racing.make_functional_env``.
     """
 
-    make_env: Callable[[Args, int, str], VectorEnv]
+    make_env: Callable[[Args, Any], Wrapper]
     args_cls: type[Args]
 
 
 TASKS: dict[str, Task] = {
-    "single_agent_racing": Task(single_agent_racing.make_env, single_agent_racing.RacingArgs),
+    "single_agent_racing": Task(
+        single_agent_racing.make_functional_env, single_agent_racing.RacingArgs
+    ),
     "hover": Task(hover.make_env, Args),
     "random_trajectory_following": Task(trajectory.make_env, Args),
 }
@@ -37,5 +41,5 @@ TASKS: dict[str, Task] = {
 def get_task(name: str) -> Task:
     """Look up a task by name, raising a helpful error if unknown."""
     if name not in TASKS:
-        raise ValueError(f"Unknown task '{name}'. Available tasks: {sorted(TASKS)}")
+        raise ValueError(f"Unknown task '{name}'. Available tasks are {sorted(TASKS)}")
     return TASKS[name]
