@@ -288,6 +288,21 @@ def train_ppo(
     # Which metric key holds the best-checkpoint score, and the chart it logs to.
     best_key = "charts/best_true_start_gates" if n_gates is not None else "charts/best_reward"
 
+    # Periodic in-scan console logging (see the gated jax.debug.callback in train_iteration).
+    log_every = 10  # print every Nth iteration (plus the final one)
+    print(f"Logging debug information every {log_every} iterations")
+
+    def _log_iter(
+        iter_idx: Array, reward: Array, gates: Array, value_loss: Array, approx_kl: Array
+    ) -> None:
+        """Host-side progress line; called by jax.debug.callback with materialized arrays."""
+        elapsed = time.time() - train_start_time
+        print(
+            f"  iter {int(iter_idx) + 1}/{args.num_iterations} | "
+            f"reward {float(reward):+.2f} | gates {float(gates):.2f} | "
+            f"v_loss {float(value_loss):.3f} | kl {float(approx_kl):.4f} | {elapsed:.1f}s"
+        )
+
     def train_iteration(carry: tuple, iter_idx: Array) -> tuple[tuple, dict]:
         params, opt_state, env, obs, prev_done, rng, ep_ret, ep_len, best_params, best_score = carry
 
@@ -347,11 +362,13 @@ def train_ppo(
         best_params = jax.tree.map(lambda b, p: jnp.where(improved, p, b), best_params, params)
         best_score = jnp.where(improved, score, best_score)
 
+        value_loss = jnp.mean(v_arr)
+        approx_kl = jnp.mean(kl_arr)
         metrics = {
-            "losses/value_loss": jnp.mean(v_arr),
+            "losses/value_loss": value_loss,
             "losses/policy_loss": jnp.mean(pg_arr),
             "losses/entropy": jnp.mean(ent_arr),
-            "losses/approx_kl": jnp.mean(kl_arr),
+            "losses/approx_kl": approx_kl,
             "losses/clipfrac": jnp.mean(
                 (jnp.abs(ratio_arr - 1.0) > args.clip_coef).astype(jnp.float32)
             ),
@@ -367,6 +384,18 @@ def train_ppo(
         for k in metric_keys:
             name = f"reward/{k[len('rew/'):]}" if k.startswith("rew/") else k
             metrics[name] = jnp.sum(outs["metrics"][k]) / denom
+
+        # Periodic console progress, printed from inside the scan via an external callback. Gated by
+        # lax.cond so the host round-trip happens only every `log_every`-th iteration (plus the
+        # last), not every iteration -- the rest stays a host-sync-free single XLA program.
+        should_log = ((iter_idx + 1) % log_every == 0) | (iter_idx == args.num_iterations - 1)
+        jax.lax.cond(
+            should_log,
+            lambda: jax.debug.callback(
+                _log_iter, iter_idx, ep_return, gates_passed, value_loss, approx_kl, ordered=True
+            ),
+            lambda: None,
+        )
 
         new_carry = (
             params, opt_state, env, last_obs, next_done, rng, ep_ret, ep_len,
