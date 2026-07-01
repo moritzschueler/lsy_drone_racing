@@ -14,7 +14,7 @@ class Args:
     """environment and training device"""
     wandb_project_name: str = "maadr"
     """the wandb's project name"""
-    wandb_entity: str = "maad-flies"
+    wandb_entity: str = None
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments
