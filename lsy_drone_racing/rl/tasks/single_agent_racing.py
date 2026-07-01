@@ -21,7 +21,6 @@ from lsy_drone_racing.rl.tasks.progress_variants import (
 from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, RelativeRacingObs
 from lsy_drone_racing.rl.wrappers.racing_env import RacingEnv
 from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, NormalizeActions, ZeroYaw
-from lsy_drone_racing.rl.wrappers.segment_spawn import SegmentSpawn
 from lsy_drone_racing.rl.wrappers.takeoff import SpinUpRotors
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 
@@ -370,8 +369,6 @@ def make_env(args: Args, config: dict = None) -> Any:
         speed_coef=args.speed_coef,
         speed_threshold=args.speed_threshold,
     )
-    # Curriculum: spawn drones in per-gate approach cones on (auto)reset.
-    env = SegmentSpawn(env, seed=args.seed)
     # Seed warm rotors on every (auto)reset so the drone starts in hover equilibrium instead of
     # falling with cold rotors.
     env = SpinUpRotors(env)
@@ -436,9 +433,6 @@ def make_functional_env(args: Args, config: dict = None) -> Wrapper:
         speed_coef=args.speed_coef,
         speed_threshold=args.speed_threshold,
     )
-    # Curriculum: cone-spawn drones in per-gate approach corridors on (auto)reset (inactive until
-    # train_ppo calls set_progress; eval keeps the true race start).
-    env = SegmentSpawn.create(env, track=config.env.track, seed=args.seed)
     env = SpinUpRotors.create(env)
     env = ActionPenalty.create(env, act_coef=args.act_coef, d_act_th_coef = args.d_act_th_coef, d_act_xy_coef = args.d_act_xy_coef)
     env = NormalizeActions.create(env)
