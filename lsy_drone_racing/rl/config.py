@@ -10,11 +10,11 @@ class Args:
 
     seed: int = 42
     """seed of the experiment"""
-    jax_device: str = "cpu"
+    jax_device: str = "gpu"
     """environment and training device"""
     wandb_project_name: str = "maadr"
     """the wandb's project name"""
-    wandb_entity: str = "maad-flies"
+    wandb_entity: str = None
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments

@@ -22,7 +22,7 @@ classifiers = [
 ########################
 # Pip Dependencies
 ########################
-dependencies = ["fire >= 0.6.0", "numpy", "toml >= 0.10.2", "numpy"]
+dependencies = ["fire >= 0.6.0", "numpy", "toml >= 0.10.2"]
 
 [project.optional-dependencies]
 # option[sim]: basic simulation
@@ -40,11 +40,11 @@ sim = [
 gpu = ["jax[cuda12]"]
 # option[deploy]: deploy to real drones
 deploy = [
-    "cfclient",
+    "cflib2 @ git+https://github.com/ratheron/crazyflie-lib-python-v2.git@bccd34092c22392b941bbef9bc5a3718b9d27da0",
     "drone-estimators",
 ]
 # option[rl]: train rl policy
-rl = ["flax >= 0.10", "optax >= 0.2", "orbax-checkpoint >= 0.10", "wandb"]
+rl = ["torch == 2.8.0", "wandb"]
 # option[gamepad]: use a gamepad as input for your drone
 gamepad = ["pygame"]
 
@@ -73,7 +73,7 @@ compilers = ">=1.9.0, <1.11.0"
 cmake = "==3.26.0"  # Pinned for motion_capture_tracking
 make = "==4.4.1"  # Pinned for motion_capture_tracking
 openblas = ">=0.3.30,<0.4"
-nbformat = ">=5.10.4,<6"
+wandb = ">=0.28.0,<0.29"
 
 [tool.pixi.pypi-dependencies]
 lsy_drone_racing = { path = ".", editable = true }
@@ -111,6 +111,12 @@ ros2-distro-mutex = "0.12.*"  # Pinned for motion_capture_tracking
 
 [tool.pixi.feature.kilted.activation]
 scripts = ["tools/setup_mocap.sh"]
+
+## feature [deploy]
+[tool.pixi.feature.deploy.dependencies]
+packaging = ">=24,<26"  # Necessary for cflib2
+maturin = ">=1.13.3,<2"
+rust = ">=1.95.0,<1.96"
 
 ## feature [tests]
 [tool.pixi.feature.tests.tasks]
@@ -178,3 +184,6 @@ skip-magic-trailing-comma = true
 line-ending = "auto"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
+
+[dependency-groups]
+gpu = ["torch>=2.8.0,<3"]
