@@ -1,1 +1,1 @@
-"""Gymnasium vector-env wrappers for observations, rewards, and curriculum spawning."""
+"""Gymnasium vector-env wrappers for observations and rewards."""

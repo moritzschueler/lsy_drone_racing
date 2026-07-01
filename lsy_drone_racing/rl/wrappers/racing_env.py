@@ -83,10 +83,6 @@ class RacingEnv(struct.PyTreeNode):
     def close(self) -> None:
         """No-op: the underlying sim is released when this env is garbage-collected."""
 
-    def set_progress(self, tau: Array) -> RacingEnv:
-        """Leaf no-op: ends the ``set_progress`` recursion (the base env has no curriculum)."""
-        return self
-
     @classmethod
     def create(cls, base_env: VecDroneRaceEnv) -> RacingEnv:
         """Adapt a constructed gym ``VecDroneRaceEnv`` into a functional pytree env.

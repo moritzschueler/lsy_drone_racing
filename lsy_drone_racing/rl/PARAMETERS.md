@@ -9,7 +9,6 @@ are the current task defaults; treat them as a starting point, not gospel.
 | --- | --- |
 | [`config.py`](config.py) (`Args`) | All PPO / optimization hyperparameters + the reward-coefficient *defaults* (shared across tasks). |
 | [`tasks/single_agent_racing.py`](tasks/single_agent_racing.py) (`RacingArgs`, `GATE_HALF_EXTENT`) | The `RacingArgs(Args)` subclass whose field defaults override `Args` for racing, plus the gate-opening half-extent used by the progress term. **This is what the racing runs actually use** (CLI `--flag`s still layer on top). |
-| [`../envs/segment_spawn.py`](../envs/segment_spawn.py) (`SegmentSpawnConfig`) | The curriculum (cone-spawn geometry + annealing schedules). |
 
 **Environment constants** (not in the config, but you need them to reason about the rest):
 `freq = 50 Hz`, `max_episode_steps = 1500` (= 30 s), `control_mode = "attitude"`,
@@ -77,7 +76,7 @@ not just *near*" incentive that the telescoping progress term can't.
   further. Lower threshold ⇒ the policy attempts crossings even when it's only moderately likely to
   make it.
 - **↓** Crossing has to "pay for itself" via progress alone; with imprecise control the policy backs
-  off and the cone-pass rate collapses as exploration anneals.
+  off and the gate-pass rate collapses as exploration anneals.
 - **No floor any more.** With the champion distance-reduction progress there is no full-range crossing
   drop to shadow, so the old `gate_bonus ≥ progress_coef` assertion was removed. Size `gate_bonus`
   purely by the crash/cross risk trade-off above.
@@ -136,7 +135,7 @@ which penalizes only the *change* in command, not attitude or thrust level.
 - **Computed on the bounded action** (clipped to [-1, 1], what `NormalizeActions` applies), so a
   high-variance policy can't inflate it and it no longer doubles as an entropy penalty (the old raw-
   output version shrank as exploration annealed, rewarding "fly calm" over "pass gates" — a driver of
-  the cone-pass collapse).
+  the gate-pass collapse).
 - **↑** Smoother commands (good for sim-to-real), but too high and the policy optimizes "stop
   thrashing" instead of "pass gates". Keep it a **whisper** vs `progress` until passing is solid.
 - **↓ / 0** Removes the smoothness pressure entirely; safe while you're still chasing gate-passing.
@@ -218,39 +217,7 @@ inside the opening clamp to 0, so any crossing point counts equally).
 
 ---
 
-## 3. Curriculum — `SegmentSpawnConfig` ([`segment_spawn.py`](../envs/segment_spawn.py))
-
-On (auto)reset, a fraction of drones are respawned in a chosen gate's approach cone so every gate is
-practiced from varied, recoverable poses. Two cosine schedules anneal it over training progress
-`τ = global_step / total_timesteps`.
-
-| Param | Current | Meaning | ↑ effect / ↓ effect |
-| --- | --- | --- | --- |
-| `gate_offset` | 0.1 | **Segment length** def: predecessor gate's exit offset (⚠ *not* the reward `GATE_OFFSET`). | ↑ longer segments / ↓ shorter. |
-| `d_min` | 0.25 | Min standoff from the gate (always leave runway), m. | ↑ farther minimum spawn / ↓ closer (harder, may spawn in the frame). |
-| `d_max_cap` | 1.0 | Global cap on segment length, m. | ↑ allows farther spawns / ↓ keeps spawns near gates. |
-| `theta_max` | 0.2 (~11°) | Cone half-angle at `kappa=1`. | ↑ more off-axis (harder) / ↓ more on-axis (easier). |
-| `margin` | 0.30 | Required horizontal clearance to obstacles, m. | ↑ safer spawns / ↓ riskier, may spawn near obstacles. |
-| `z_min`,`z_max` | 0.20, 2.0 | Spawn altitude floor/ceiling, m. | widen ↔ narrow the vertical spawn band. |
-| `n_candidates` | 12 | Rejection-sampling budget per env for clearance. | ↑ better-cleared spawns, slower / ↓ faster, more rejects. |
-| **`a0`, `a1`** | 0.05, 0.85 | τ-window over which **cone size `kappa`** ramps `kappa_min → 1`. | Earlier/wider window ⇒ difficulty ramps sooner. |
-| `kappa_min` | 0.10 | Cone-size floor before `a0`. | ↑ starts harder / ↓ starts trivially easy (spawns hug the gate axis). |
-| **`b0`, `b1`** | 0.25, 0.85 | τ-window over which **true-start probability `p_start`** ramps `p_start_min → p_start_max`. | Earlier window ⇒ converge to the real start distribution sooner. |
-| `p_start_min` | 0.20 | Floor fraction of episodes starting from the *true race start*. | ↑ more full-track practice early (but harder) / ↓ almost all cone spawns early. |
-| `p_start_max` | 0.90 | Final true-start fraction. | ↑ ends closer to deployment distribution. |
-| **`c0`, `c1`** | 0.0, 0.70 | τ-window over which **cone-spawn initial speed `v0`** anneals `v0_max → v0_min` (momentum crutch through the gate; cone spawns only). | Later/wider window ⇒ crutch withdrawn more slowly, longer to learn self-propulsion. |
-| `v0_max` | 0.35 | Through-gate spawn speed at `τ=0`, m/s. | ↑ stronger early momentum crutch (masks propulsion learning) / ↓ less. |
-| `v0_min` | 0.1 | Through-gate spawn speed after the (c) window (floor; the crutch is **not** fully withdrawn). | ↑ keeps a permanent momentum crutch / 0 ⇒ drone must self-propel from rest late in training. |
-
-> **Diagnostic tie-in:** `kappa` is *flat at `kappa_min`* until `τ = a0` (= 2.5M steps at 50M total),
-> so during the first ~2.5M steps spawns are point-blank (just past `d_min` = 0.25 m, ≈1° off-axis at
-> `kappa_min·theta_max`) and nearly on-axis, with a small through-gate momentum (`v0 ≈ v0_max` = 0.35
-> m/s). If `cone_gate_pass_rate` collapses in that window, it's genuine policy degradation, **not** the
-> curriculum getting harder.
-
----
-
-## 4. PPO / optimization
+## 3. PPO / optimization
 
 | Param | Current | Meaning | ↑ effect | ↓ effect |
 | --- | --- | --- | --- | --- |
@@ -269,33 +236,31 @@ practiced from varied, recoverable poses. Two cosine schedules anneal it over tr
 | `update_epochs` | 4 | PPO passes over each rollout. | More reuse per batch (faster, risk of overfit/large KL). | Less reuse, more on-policy. |
 | `num_minibatches` | 8 | Minibatches per epoch ⇒ `minibatch_size = num_envs·num_steps / 8`. | More, smaller updates. | Fewer, larger updates. |
 
-## 5. Scale / rollout
+## 4. Scale / rollout
 
 | Param | Current | Meaning | Notes |
 | --- | --- | --- | --- |
-| `total_timesteps` | 50M | Training budget. Also sets `τ` ⇒ **drives the curriculum schedules.** Changing it rescales when `kappa`/`p_start` ramp. | Halving it makes the curriculum ramp twice as fast in wall-clock. |
+| `total_timesteps` | 150M | Training budget (also sets the LR/entropy anneal horizon). | ↑ more training, later anneal / ↓ shorter run, faster anneal. |
 | `num_envs` | 1024 | Parallel envs. | ↑ throughput + batch size, more memory. |
 | `num_steps` | 128 | Rollout length per env per update ⇒ `batch_size = num_envs·num_steps`. | ↑ longer horizon per update, more on-policy, more memory. |
 
-## 6. Stopping
+## 5. Stopping
 
 There is no rule-based early stopping — the run trains for the full `total_timesteps`. The best
-checkpoint (highest recent mean true-start **gates-passed**) is snapshotted throughout, and **Ctrl-C**
-stops gracefully at the end of the current iteration, writing out that best checkpoint.
+checkpoint (highest mean **gates-passed**, logged as `charts/gates_passed`) is tracked in the scan
+carry and written out at the end of the run.
 
 ---
 
-## 7. Diagnostics to watch (logged in [`ppo.py`](ppo.py))
+## 6. Diagnostics to watch (logged in [`ppo.py`](ppo.py))
 
 - **`reward/<term>`** — per-component reward (§1). The single best view of *what the policy is
   actually optimizing*. If reward climbs while `gate_bonus`/`finish` fall, a dense term is being
   chased instead of crossing — read off which one.
-- **`train/cone_gate_pass_rate`** — fraction of cone-spawned episodes that pass their spawn gate.
-  Isolates curriculum skill from full-track skill. **Peak-then-collapse = a reward exploit or
-  risk-averse convergence, not slow learning.**
-- **`train/gates_passed` / `train/completed`** — true-start (deployment-like) episodes only; the real
-  scoreboard. Often ~0 long after cone-passing works, because full-track is much harder.
-- **`losses/entropy`** — proxy for action noise. The cone-pass collapse tends to track entropy
+- **`train/gates_passed` / `train/completed`** — mean gates passed and full-track completion rate over
+  finished episodes; the real scoreboard. **Peak-then-collapse = a reward exploit or risk-averse
+  convergence, not slow learning.**
+- **`loss/entropy`** — proxy for action noise. A gate-pass collapse tends to track entropy
   annealing: exploration luck being smoothed away.
 
 ## Quick rules of thumb
@@ -307,4 +272,4 @@ stops gracefully at the end of the current iteration, writing out that best chec
   terminal `timeout_penalty` is discounted to nothing at decision time and won't. If the drone creeps,
   raise `time_penalty`, don't raise `timeout_penalty`.
 - **Action-smoothness penalties stay tiny** (~1e-3) until passing is solid; they're for polish, not discovery.
-- **A peak-then-collapse in `cone_gate_pass_rate` is a red flag** — instrument the `reward/*` components before touching coefficients.
+- **A peak-then-collapse in `train/gates_passed` is a red flag** — instrument the `reward/*` components before touching coefficients.
