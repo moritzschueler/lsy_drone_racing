@@ -79,7 +79,7 @@ class Agent(nn.Module):
 class AttitudeRL(Controller):
     """Example of a controller using the collective thrust and attitude interface."""
 
-    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict, trajectory_time: float = 15.0):
         """Initialize the attitude controller.
 
         Args:
@@ -102,7 +102,7 @@ class AttitudeRL(Controller):
         # Set trajectory parameters
         self.n_samples = 10
         self.samples_dt = 0.1
-        self.trajectory_time = 15.0
+        self.trajectory_time = trajectory_time
         self.sample_offsets = np.array(
             np.arange(self.n_samples) * self.freq * self.samples_dt, dtype=int
         )
