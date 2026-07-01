@@ -16,6 +16,13 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = "maad-flies"
     """the entity (team) of wandb's project"""
+    log_interval: int = 10
+    """print a console progress line every N training iterations (plus the final one); <=0 disables
+    the console progress logging entirely"""
+    wandb_log_interval: int = 0
+    """publish metrics to wandb every N iterations *live* during training (1 = every iteration);
+    <=0 disables live publishing, in which case metrics are instead flushed once at the end of the
+    run. Disabled adds zero in-scan overhead (no callback is emitted into the compiled graph)"""
 
     # Algorithm specific arguments
     total_timesteps: int = 1_500_000

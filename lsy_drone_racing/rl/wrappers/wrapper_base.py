@@ -45,6 +45,16 @@ class Wrapper(struct.PyTreeNode):
             return env.replace(base=new_base)
         return env.replace(**kwargs)
 
+    def set_progress(self, tau: Array) -> struct.PyTreeNode:
+        """Propagate training progress ``tau in [0, 1]`` down the wrapper chain.
+
+        Default: pure pass-through that rebuilds the chain with ``base`` advanced. Curriculum
+        wrappers (e.g. ``SegmentSpawn``) override this to update their own schedule state. The leaf
+        env terminates the recursion with a no-op. Called once per training iteration (eval never
+        calls it, so eval keeps the true race start).
+        """
+        return self.replace(base=self.base.set_progress(tau))
+
     def render(self, **kwargs: dict) -> None:
         return self.base.render(**kwargs)
 
