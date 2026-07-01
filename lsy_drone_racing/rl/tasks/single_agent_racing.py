@@ -1,13 +1,12 @@
 """Single-agent drone racing task: env factory + dense in-step reward."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
-import jax
+import flax.struct as struct
 import jax.numpy as jnp
-#from crazyflow.envs.norm_actions_wrapper import NormalizeActions
-from gymnasium.vector import VectorEnv, VectorWrapper
 from jax import Array
 
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
@@ -18,14 +17,14 @@ from lsy_drone_racing.rl.tasks.progress_variants import (
     _target_gate_frame,
     build_progress_potential,
     default_progress_params,
-    gate_opening_distance,
 )
 from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, RelativeRacingObs
 from lsy_drone_racing.rl.wrappers.racing_env import RacingEnv
-from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, ZeroYaw, NormalizeActions
+from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, NormalizeActions, ZeroYaw
 from lsy_drone_racing.rl.wrappers.segment_spawn import SegmentSpawn
 from lsy_drone_racing.rl.wrappers.takeoff import SpinUpRotors
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
+
 
 @dataclass
 class RacingArgs(Args):
@@ -235,20 +234,28 @@ def build_racing_reward(
     return reward
 
 
-class LogRewardComponents(VectorWrapper):
-    """Innermost monitor that surfaces each env-side reward term in ``info`` for logging.
+@struct.dataclass
+class LogRewardComponents(Wrapper):
+    """Innermost functional monitor that surfaces each env-side reward term in ``info`` for logging.
 
-    Recomputes :func:`racing_reward_components` from the base env data straddling the step -- the
-    exact ``(data, prev_data)`` the env's compiled ``reward_fn`` used -- so the logged terms equal
-    what is optimized (no drift). It adds one ``rew/<term>`` entry per component; the
-    ``ActionSmoothnessPenalty`` wrapper adds its ``rew/d_act`` entry higher up, and
-    PPO sums all of them per iteration into ``reward/<term>`` charts. Pure monitor: obs, reward, and
-    done flags pass through untouched, so it is transparent to ``SegmentSpawn`` above it.
+    Recomputes :func:`racing_reward_components` from the base ``EnvData`` straddling the step -- the
+    exact ``(data, prev_data)`` the env's compiled ``reward_fn`` used (``prev_data`` is the wrapped
+    env's pre-step ``data``, ``data`` its post-step ``data``) -- so the logged terms equal what is
+    optimized (no drift). It adds one ``rew/<term>`` entry per component (``ActionPenalty`` adds its
+    own ``rew/act``/``rew/d_act_*`` higher up), plus velocity diagnostics; PPO sums/peaks them per
+    iteration into ``reward/<term>`` and ``diagnostics/<name>`` charts. Pure monitor: obs, reward
+    and done flags pass through untouched. Wrap *directly* over ``RacingEnv`` so ``env.base.data``
+    is the raw ``EnvData``.
     """
 
-    def __init__(
-        self,
-        env: VectorEnv,
+    base: struct.PyTreeNode = struct.field(pytree_node=True)
+    step: Callable = struct.field(pytree_node=False)
+    reset: Callable = struct.field(pytree_node=False)
+
+    @classmethod
+    def create(
+        cls,
+        base: struct.PyTreeNode,
         *,
         progress_potential: PotentialFn,
         progress_coef: float,
@@ -260,11 +267,9 @@ class LogRewardComponents(VectorWrapper):
         gate_half_extent: float = GATE_HALF_EXTENT,
         speed_coef: float = 0.0,
         speed_threshold: float = 4.0,
-    ):
-        """Init; jit a closure over the (static) progress potential + reward coefficients."""
-        super().__init__(env)
+    ) -> LogRewardComponents:
+        """Create a LogRewardComponents monitor around the (RacingEnv) base environment."""
 
-        @jax.jit
         def components(data: Any, prev_data: Any) -> dict[str, Array]:
             return racing_reward_components(
                 data,
@@ -281,9 +286,6 @@ class LogRewardComponents(VectorWrapper):
                 speed_threshold=speed_threshold,
             )
 
-        self._components = components
-
-        @jax.jit
         def vel_diag(data: Any) -> tuple[Array, Array, Array]:
             """Velocity along the target gate normal (forward), world-up, and its magnitude."""
             _, rot, _ = _target_gate_frame(
@@ -295,31 +297,38 @@ class LogRewardComponents(VectorWrapper):
             speed = jnp.linalg.norm(vel, axis=-1)  # (E, D) speed magnitude
             return along, vel[..., 2], speed
 
-        self._vel_diag = vel_diag
+        def reset(
+            env: LogRewardComponents, *, seed: int | None = None, options: dict | None = None
+        ) -> tuple[LogRewardComponents, tuple[Any, Any]]:
+            base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
+            return env.replace(base=base_env), (obs, info)
 
-    def step(self, action: Array) -> tuple[Any, Array, Array, Array, dict]:
-        """Step, then stash the per-component env-side reward terms (one drone) into ``info``."""
-        prev_data = self.env.unwrapped.data  # pre-step base data == the env reward_fn's prev_data
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        data = self.env.unwrapped.data
-        terms = self._components(data, prev_data)
-        info = {**info, **{f"rew/{name}": v[:, 0] for name, v in terms.items()}}
-        # Velocity diagnostics: forward speed toward the target gate vs. vertical speed. "Climbs
-        # instead of advancing" shows up as vel_up >> vel_along. Plus speed magnitude, logged both
-        # mean-per-step (diagnostics/vel_mean) and as the iteration peak (max/vel -> diagnostics/
-        # vel_max). Logged as diagnostics/* by PPO.
-        vel_along, vel_up, speed = self._vel_diag(data)
-        info = {
-            **info,
-            "diagnostics/vel_along": vel_along[:, 0],
-            "diagnostics/vel_up": vel_up[:, 0],
-            "diagnostics/vel_mean": speed[:, 0],
-            "max/vel": speed[:, 0],
-        }
-        return obs, reward, terminated, truncated, info
+        def step(
+            env: LogRewardComponents, action: Array
+        ) -> tuple[LogRewardComponents, tuple[Any, ...]]:
+            prev_data = env.base.data  # pre-step EnvData == the env reward_fn's prev_data
+            base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
+            data = base_env.data  # post-step EnvData
+            terms = components(data, prev_data)
+            info = {**info, **{f"rew/{name}": v[:, 0] for name, v in terms.items()}}
+            # Velocity diagnostics: forward speed toward the target gate vs. vertical speed. "Climbs
+            # instead of advancing" shows up as vel_up >> vel_along. Speed magnitude is logged both
+            # mean-per-step (diagnostics/vel_mean) and as the iteration peak (max/vel ->
+            # diagnostics/vel_max). Logged as diagnostics/* by PPO.
+            vel_along, vel_up, speed = vel_diag(data)
+            info = {
+                **info,
+                "diagnostics/vel_along": vel_along[:, 0],
+                "diagnostics/vel_up": vel_up[:, 0],
+                "diagnostics/vel_mean": speed[:, 0],
+                "max/vel": speed[:, 0],
+            }
+            return env.replace(base=base_env), (obs, reward, terminated, truncated, info)
+
+        return cls(base=base, step=step, reset=reset)
 
 
-def make_env(args: Args, config: dict = None) -> VectorEnv:
+def make_env(args: Args, config: dict = None) -> Any:
     """Build the vectorized, fully-wrapped racing environment."""
     progress_variant, progress_coef = args.progress
     progress_potential = build_progress_potential(progress_variant, args.progress_params)
@@ -411,6 +420,25 @@ def make_functional_env(args: Args, config: dict = None) -> Wrapper:
     )
 
     env = RacingEnv.create(env)
+    # Innermost monitor: surface per-component env-side reward terms + velocity diagnostics in info
+    # (recomputed from the raw EnvData straddling the step). Wraps RacingEnv directly so
+    # env.base.data is the raw EnvData. Pure pass-through for obs/reward/done.
+    env = LogRewardComponents.create(
+        env,
+        progress_potential=progress_potential,
+        progress_coef=progress_coef,
+        gate_bonus=args.gate_bonus,
+        finish_bonus=args.finish_bonus,
+        crash_penalty=args.crash_penalty,
+        timeout_penalty=args.timeout_penalty,
+        time_penalty=args.time_alive_penalty,
+        gate_half_extent=GATE_HALF_EXTENT,
+        speed_coef=args.speed_coef,
+        speed_threshold=args.speed_threshold,
+    )
+    # Curriculum: cone-spawn drones in per-gate approach corridors on (auto)reset (inactive until
+    # train_ppo calls set_progress; eval keeps the true race start).
+    env = SegmentSpawn.create(env, track=config.env.track, seed=args.seed)
     env = SpinUpRotors.create(env)
     env = ActionPenalty.create(env, act_coef=args.act_coef, d_act_th_coef = args.d_act_th_coef, d_act_xy_coef = args.d_act_xy_coef)
     env = NormalizeActions.create(env)

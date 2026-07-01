@@ -192,15 +192,21 @@ def train_ppo(
 
     # -- Discover the static per-step metric keys the wrapper stack surfaces in ``info`` --
     # The functional wrappers stash per-env reward components ("rew/...") and behavioural
-    # diagnostics ("diagnostics/...") in info; the key set is static, so probe one (functional,
-    # non-mutating) step to capture it for the fixed-shape scan outputs.
+    # diagnostics ("diagnostics/...") in info, mean-reduced over the rollout, plus "max/..." keys
+    # reduced with a running max (logged as the iteration peak). The key set is static, so probe one
+    # (functional, non-mutating) step to capture it for the fixed-shape scan outputs.
     _, (_, _, _, _, _probe_info) = envs.step(envs, jnp.zeros((num_envs, action_dim)))
     metric_keys = sorted(
         k
         for k in _probe_info
         if isinstance(k, str) and (k.startswith("rew/") or k.startswith("diagnostics/"))
     )
+    max_keys = sorted(k for k in _probe_info if isinstance(k, str) and k.startswith("max/"))
     denom = float(args.num_steps * num_envs)
+    # Curriculum present iff a SegmentSpawn-style wrapper surfaces per-episode start metadata. When
+    # present, gate/completion/best-score metrics filter to true-start (full-track) episodes so
+    # the curriculum's mid-track cone spawns don't inflate them, and cone-spawn stats are logged.
+    has_curriculum = "episode_true_start" in _probe_info
 
     def rollout(
         params: nnx.State, env: Wrapper, obs: Array, rng: Array, ep_ret: Array, ep_len: Array
@@ -219,6 +225,19 @@ def train_ppo(
             new_len = ep_len + 1.0
             gates_passed = jnp.where(info["target_gate"] == -1, n_gates or 0, info["target_gate"])
             gates_passed = gates_passed.astype(jnp.float32)
+            # Curriculum metadata for the ending episode (default: every episode is a true start,
+            # so with no curriculum the true-start-filtered metrics equal the all-episode ones).
+            true_start = info["episode_true_start"] if has_curriculum else jnp.ones_like(done)
+            start_gate = (
+                info["episode_start_gate"]
+                if has_curriculum
+                else jnp.full_like(info["target_gate"], -1)
+            )
+            ts_done = done & true_start  # true-start (full-track) episode finished this step
+            cone_done = done & ~true_start  # cone-spawned (mid-track) episode finished this step
+            # A cone episode "passed its gate" iff the target advanced past the one it started on
+            # (forward-only; terminal -1 = finished also counts).
+            cone_pass = cone_done & (info["target_gate"] != start_gate)
             out = {
                 "obs": obs,
                 "action": action,
@@ -229,12 +248,18 @@ def train_ppo(
                 # Episode-end masked quantities (0 except on the step an env finishes).
                 "ret_done": jnp.where(done, new_ret, 0.0),
                 "len_done": jnp.where(done, new_len, 0.0),
-                "gates_done": jnp.where(done, gates_passed, 0.0),
-                "completed_done": jnp.where(done, (gates_passed == (n_gates or -1)).astype(
-                    jnp.float32
-                ), 0.0),
+                # Gate/completion tallies are counted on true-start episodes only.
+                "ts_done": ts_done.astype(jnp.float32),
+                "cone_done": cone_done.astype(jnp.float32),
+                "cone_pass": cone_pass.astype(jnp.float32),
+                "gates_done": jnp.where(ts_done, gates_passed, 0.0),
+                "completed_done": jnp.where(
+                    ts_done, (gates_passed == (n_gates or -1)).astype(jnp.float32), 0.0
+                ),
                 # Per-step reward-component / diagnostic sums over envs (scalar each).
                 "metrics": {k: jnp.sum(info[k]) for k in metric_keys},
+                # Per-step env-max of each "max/..." key (peak-reduced over the rollout later).
+                "metrics_max": {k: jnp.max(info[k]) for k in max_keys},
             }
             ep_ret = jnp.where(done, 0.0, new_ret)
             ep_len = jnp.where(done, 0.0, new_len)
@@ -288,8 +313,37 @@ def train_ppo(
     # Which metric key holds the best-checkpoint score, and the chart it logs to.
     best_key = "charts/best_true_start_gates" if n_gates is not None else "charts/best_reward"
 
+    # Periodic in-scan logging. Both are Python (compile-time) flags: when disabled (<=0) the
+    # corresponding callback is never emitted into the traced graph, so it adds zero overhead.
+    console_live = args.log_interval > 0  # console progress line
+    wandb_live = wandb_enabled and args.wandb_log_interval > 0  # live wandb publishing mid-run
+    if console_live:
+        print(f"Console progress every {args.log_interval} iterations")
+    if wandb_live:
+        print(f"Publishing metrics to wandb every {args.wandb_log_interval} iterations (live)")
+
+    def _log_iter(
+        iter_idx: Array, reward: Array, gates: Array, value_loss: Array, approx_kl: Array
+    ) -> None:
+        """Host-side progress line; called by jax.debug.callback with materialized arrays."""
+        elapsed = time.time() - train_start_time
+        print(
+            f"Iteration {int(iter_idx) + 1}/{args.num_iterations} | "
+            f"reward {float(reward):+.2f} | gates {float(gates):.2f} | "
+            f"v_loss {float(value_loss):.3f} | kl {float(approx_kl):.4f} | {elapsed:.1f}s"
+        )
+
+    def _wandb_log(step: Array, metrics: dict) -> None:
+        """Host-side wandb.log of one iteration's metrics; called via an ordered callback."""
+        wandb.log({k: float(v) for k, v in metrics.items()}, step=int(step))
+
     def train_iteration(carry: tuple, iter_idx: Array) -> tuple[tuple, dict]:
         params, opt_state, env, obs, prev_done, rng, ep_ret, ep_len, best_params, best_score = carry
+
+        # Advance the curriculum schedules for this iteration (no-op for envs without a curriculum
+        # wrapper). tau = fraction of total training elapsed, matching the gym set_progress(step).
+        tau = jnp.minimum((iter_idx * args.batch_size) / args.total_timesteps, 1.0)
+        env = env.set_progress(tau)
 
         # -- Rollout --
         rng, roll_rng = jax.random.split(rng)
@@ -336,10 +390,19 @@ def train_ppo(
         explained_var = jnp.where(var_y == 0, jnp.nan, 1.0 - jnp.var(y_true - y_pred) / var_y)
 
         n_done = jnp.maximum(jnp.sum(outs["done"]), 1.0)
+        # Gate/completion metrics count true-start (full-track) episodes only, so the curriculum's
+        # mid-track cone spawns -- which trivially "complete" -- don't inflate them.
+        n_ts = jnp.maximum(jnp.sum(outs["ts_done"]), 1.0)
+        n_cone = jnp.maximum(jnp.sum(outs["cone_done"]), 1.0)
         ep_return = jnp.sum(outs["ret_done"]) / n_done
         ep_length = jnp.sum(outs["len_done"]) / n_done
-        gates_passed = jnp.sum(outs["gates_done"]) / n_done
-        completed = jnp.sum(outs["completed_done"]) / n_done
+        gates_passed = jnp.sum(outs["gates_done"]) / n_ts
+        completed = jnp.sum(outs["completed_done"]) / n_ts
+        # Fraction of finished episodes that started from the true race start (1 - cone fraction);
+        # tracks p_start_schedule(tau). Fraction of finished cone episodes that passed their spawn
+        # gate; isolates curriculum progress from full-track skill.
+        true_start_frac = jnp.sum(outs["ts_done"]) / n_done
+        cone_gate_pass_rate = jnp.sum(outs["cone_pass"]) / n_cone
         score = gates_passed if n_gates is not None else ep_return
 
         # -- Best-checkpoint snapshot (tracked in carry; no host pickling mid-scan) --
@@ -347,11 +410,13 @@ def train_ppo(
         best_params = jax.tree.map(lambda b, p: jnp.where(improved, p, b), best_params, params)
         best_score = jnp.where(improved, score, best_score)
 
+        value_loss = jnp.mean(v_arr)
+        approx_kl = jnp.mean(kl_arr)
         metrics = {
-            "losses/value_loss": jnp.mean(v_arr),
+            "losses/value_loss": value_loss,
             "losses/policy_loss": jnp.mean(pg_arr),
             "losses/entropy": jnp.mean(ent_arr),
-            "losses/approx_kl": jnp.mean(kl_arr),
+            "losses/approx_kl": approx_kl,
             "losses/clipfrac": jnp.mean(
                 (jnp.abs(ratio_arr - 1.0) > args.clip_coef).astype(jnp.float32)
             ),
@@ -363,10 +428,41 @@ def train_ppo(
             "train/completed": completed,
             best_key: best_score,
         }
+        if has_curriculum:
+            metrics["train/true_start_frac"] = true_start_frac
+            metrics["train/cone_gate_pass_rate"] = cone_gate_pass_rate
         # Reward components -> reward/<name>; diagnostics keep their prefix. Mean per step.
         for k in metric_keys:
             name = f"reward/{k[len('rew/'):]}" if k.startswith("rew/") else k
             metrics[name] = jnp.sum(outs["metrics"][k]) / denom
+        # Max-reduced metrics -> diagnostics/<name>_max: the rollout peak (e.g. max/vel).
+        for k in max_keys:
+            metrics[f"diagnostics/{k[len('max/'):]}_max"] = jnp.max(outs["metrics_max"][k])
+
+        # Periodic in-scan side effects via ordered external callbacks. Each is gated by lax.cond so
+        # the host round-trip happens only on the logged iterations (plus the last) -- the rest of
+        # the run stays host-sync-free. The enclosing `if` flags are compile-time, so a disabled
+        # channel emits no callback at all (zero overhead). ordered=True keeps them ordered.
+        last_iter = iter_idx == args.num_iterations - 1
+        if console_live:
+            should_log = ((iter_idx + 1) % args.log_interval == 0) | last_iter
+            jax.lax.cond(
+                should_log,
+                lambda: jax.debug.callback(
+                    _log_iter, iter_idx, ep_return, gates_passed, value_loss, approx_kl,
+                    ordered=True,
+                ),
+                lambda: None,
+            )
+        if wandb_live:
+            should_pub = ((iter_idx + 1) % args.wandb_log_interval == 0) | last_iter
+            jax.lax.cond(
+                should_pub,
+                lambda: jax.debug.callback(
+                    _wandb_log, (iter_idx + 1) * args.batch_size, metrics, ordered=True
+                ),
+                lambda: None,
+            )
 
         new_carry = (
             params, opt_state, env, last_obs, next_done, rng, ep_ret, ep_len,
@@ -377,6 +473,10 @@ def train_ppo(
     # ------------------------------------------------------------------ #
     # Whole-run scan                                                     #
     # ------------------------------------------------------------------ #
+    # Activate the curriculum (tau=0) before the initial reset so the first episodes already spawn
+    # from the early-curriculum distribution (no-op for envs without a curriculum wrapper). Each
+    # iteration then advances tau via env.set_progress inside train_iteration.
+    envs = envs.set_progress(jnp.asarray(0.0, dtype=jnp.float32))
     env0, (next_obs, _) = envs.reset(envs, seed=args.seed)
     init_carry = (
         params,
@@ -406,7 +506,9 @@ def train_ppo(
     )
 
     # -- Flush all per-iteration metrics to wandb in one batch (after training) --
-    if wandb_enabled:
+    # Skipped when live publishing is on: the in-scan callback already logged the (down)sampled
+    # points, and re-flushing 1..N here would violate wandb's monotonically-increasing step order.
+    if wandb_enabled and not wandb_live:
         metrics_host = jax.device_get(metrics_stack)
         for it in range(args.num_iterations):
             log = {k: float(v[it]) for k, v in metrics_host.items()}
