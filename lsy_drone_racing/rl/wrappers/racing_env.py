@@ -44,6 +44,9 @@ class RacingEnv(struct.PyTreeNode):
     single_action_space: spaces.Space = struct.field(pytree_node=False)
     num_envs: int = struct.field(pytree_node=False)
 
+    # The host-side gym env, kept only for its viewer/sim so the functional env can render.
+    base_env: VecDroneRaceEnv | None = struct.field(pytree_node=False, default=None)
+
     @property
     def observation_space(self) -> spaces.Space:
         return batch_space(self.single_observation_space, self.num_envs)
@@ -59,6 +62,23 @@ class RacingEnv(struct.PyTreeNode):
     @property
     def steps(self) -> Array:
         return self.data.steps
+
+    def render(self) -> None:
+        """Render the current functional state via the captured gym env's viewer.
+
+        The pure rollout keeps its state in ``self.data``; the gym env renders from *its own*
+        ``self.data`` (and owns the MuJoCo sim/viewer the functional step drops). Push the current
+        functional ``data`` into the gym env, then delegate to its ``render()`` (which lazily syncs
+        the drone/gate poses into MuJoCo). Requires an env built with a live ``base_env`` (the
+        render factory keeps one; headless training envs pass ``base_env=None``).
+        """
+        if self.base_env is None:
+            raise RuntimeError(
+                "RacingEnv.render() needs a live gym base_env, but none was captured. Build the "
+                "env with a rendering-capable factory (base_env kept) rather than a headless one."
+            )
+        self.base_env.data = self.data
+        self.base_env.render()
 
     def close(self) -> None:
         """No-op: the underlying sim is released when this env is garbage-collected."""
@@ -102,4 +122,5 @@ class RacingEnv(struct.PyTreeNode):
             single_observation_space=base_env.single_observation_space,
             single_action_space=base_env.single_action_space,
             num_envs=base_env.num_envs,
+            base_env=base_env,
         )
