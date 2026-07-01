@@ -290,10 +290,10 @@ def train_ppo(
 
     # Periodic in-scan logging. Both are Python (compile-time) flags: when disabled (<=0) the
     # corresponding callback is never emitted into the traced graph, so it adds zero overhead.
-    console_live = args.log_interval > 0  # console progress line
+    console_live = args.console_log_interval > 0  # console progress line
     wandb_live = wandb_enabled and args.wandb_log_interval > 0  # live wandb publishing mid-run
     if console_live:
-        print(f"Console progress every {args.log_interval} iterations")
+        print(f"Console progress every {args.console_log_interval} iterations")
     if wandb_live:
         print(f"Publishing metrics to wandb every {args.wandb_log_interval} iterations (live)")
 
@@ -403,7 +403,7 @@ def train_ppo(
         # channel emits no callback at all (zero overhead). ordered=True keeps them ordered.
         last_iter = iter_idx == args.num_iterations - 1
         if console_live:
-            should_log = ((iter_idx + 1) % args.log_interval == 0) | last_iter
+            should_log = ((iter_idx + 1) % args.console_log_interval == 0) | last_iter
             jax.lax.cond(
                 should_log,
                 lambda: jax.debug.callback(
