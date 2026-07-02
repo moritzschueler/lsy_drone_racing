@@ -76,6 +76,7 @@ def main(
         return env, obs, terminated, truncated
 
     eval_env, (obs, _) = eval_env.reset(eval_env, seed=args.seed)
+    
     eval_env.render()
     done = False
 
