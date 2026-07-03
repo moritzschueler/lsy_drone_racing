@@ -9,7 +9,7 @@ class Args:
     """Class to store configurations."""
 
     seed: int = 42
-    jax_device: str = "cpu"
+    jax_device: str = "gpu"
     wandb_project_name: str = "maadr"
     wandb_entity: str = "maad-flies"
     console_log_interval: int = 10
