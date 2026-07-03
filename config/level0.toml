@@ -4,7 +4,7 @@
 # | :-----------------: | :----------------------------: | :-------------------------: | :---------------: | :---------------: |
 # | `level0.toml`       | *No*                           | *No*                        | *No*              | Perfect knowledge |
 [controller]
-file = "rl_controller_gates.py" # Put your controller file name here. Specifying a controller as argument to scripts will override this setting. Controllers are located in `lsy_drone_racing/control/`
+file = "rl_single_agent_racing_controller.py" # Put your controller file name here. Specifying a controller as argument to scripts will override this setting. Controllers are located in `lsy_drone_racing/control/`
 
 [deploy]
 ### Settings only relevant for deployment
