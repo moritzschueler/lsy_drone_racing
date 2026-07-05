@@ -25,7 +25,7 @@ from __future__ import annotations
 import pickle
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING    
 
 import jax.numpy as jnp
 import numpy as np
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------------------------
 # Set this to a specific checkpoint to force it (absolute, or relative to the single_agent_racing
 # checkpoints folder). Leave it empty ("") to auto-load the most recent checkpoint in that folder.
-CHECKPOINT_OVERRIDE: str = ""
+CHECKPOINT_OVERRIDE: str = "single_agent_racing_20260703-155601_g0.94_best.ckpt"
 # ---------------------------------------------------------------------------------------------
 
 _ACTION_DIM = 4
@@ -83,7 +83,7 @@ def _resolve_checkpoint() -> Path:
             f"No checkpoint in {_CHECKPOINT_DIR} has a YYYYMMDD-HHMMSS timestamp in its name; "
             "set CHECKPOINT_OVERRIDE to pick one explicitly."
         )
-    # Fixed-width timestamps sort lexicographically the same as chronologically.
+    # Return most recent checkpoint from the checkpoints folder
     return max(stamped, key=lambda item: item[0])[1]
 
 

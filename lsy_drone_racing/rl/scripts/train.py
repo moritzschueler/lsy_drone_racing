@@ -28,10 +28,9 @@ def _latest_checkpoint(task: str) -> Path | None:
 
 def main(
     task: str = "single_agent_racing",
-    config: str = "level0.toml",
+    config: str = "level2.toml",
     wandb_enabled: bool = True,
-    train: bool = True,
-    num_eval_iterations: int = 1,
+    num_eval_iterations: int = 30,
     **kwargs: Any,
 ):
     """Train and/or evaluate a single PPO agent on the given task.
@@ -51,14 +50,10 @@ def main(
     checkpoint_dir = CHECKPOINT_DIR / task
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = None
-
     env_config = load_config(Path(__file__).parents[3] / "config" / config)
 
-    if train:
-        model_path = train_ppo(
-            args, task_spec.make_env, env_config, checkpoint_dir, task, wandb_enabled
-        )
+    model_path = train_ppo(args, task_spec.make_env, env_config, checkpoint_dir, task,
+                           wandb_enabled)
 
     if num_eval_iterations > 0:
         eval_path = model_path or _latest_checkpoint(task)
@@ -70,15 +65,14 @@ def main(
         episode_rewards, episode_lengths = evaluate_ppo(
             args, task_spec.make_env, env_config, num_eval_iterations, eval_path
         )
-        if wandb_enabled and train:
+        if wandb_enabled:
             wandb.log(
                 {
                     "eval/mean_rewards": np.mean(episode_rewards),
                     "eval/mean_steps": np.mean(episode_lengths),
                 }
             )
-            wandb.finish()
-    if train and wandb_enabled and num_eval_iterations < 1:
+    if wandb_enabled:
         wandb.finish()
 
 if __name__ == "__main__":
