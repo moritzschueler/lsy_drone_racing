@@ -44,7 +44,7 @@ class RacingArgs(Args):
     progress: tuple[str, float] = ("fancy", 5.0) # Tuple of variant and coefficent
     progress_params: dict = field(default_factory=default_progress_params)
     speed_coef: float = 0.05  # quadratic speed-hinge weight (0 disables); starting guess, tune
-    speed_threshold: float = 4.0  # speed (m/s) above which the hinge penalizes; free below it
+    speed_threshold: float = 1.5  # speed (m/s) above which the hinge penalizes; free below it
     d_act_coef: float = 0.000 
     d_act_th_coef: float = 0.0005 # Coefficient for thrust change penalty (thrust smoothness)
     d_act_xy_coef: float = 0.001 # Coefficient for xy action change penalty (attitude smoothness)
