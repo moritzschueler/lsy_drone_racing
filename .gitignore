@@ -22,3 +22,6 @@ site/
 !.pixi/config.toml
 ros_ws/
 acados/
+
+*wandb/
+*.ckpt
