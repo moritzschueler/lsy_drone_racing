@@ -526,14 +526,5 @@ def evaluate_ppo(
     episode_rewards = np.array(ret)
     episode_lengths = np.array(length)
 
-    for i in range(n_eval):
-        print(
-            f"Episode {i + 1}: Reward = {episode_rewards[i]:.2f}, "
-            f"Length = {int(episode_lengths[i])}"
-        )
-    print(
-        f"Average Episode Reward = {np.mean(episode_rewards):.2f}, "
-        f"Average Episode Length = {np.mean(episode_lengths):.1f}"
-    )
     eval_env.close()
     return episode_rewards, episode_lengths

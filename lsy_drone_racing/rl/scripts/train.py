@@ -65,11 +65,24 @@ def main(
         episode_rewards, episode_lengths = evaluate_ppo(
             args, task_spec.make_env, env_config, num_eval_iterations, eval_path
         )
+
+        for i in range(num_eval_iterations):
+            print(
+                f"Episode {i + 1}: Reward: {episode_rewards[i]:.2f}, "
+                f"Length: {int(episode_lengths[i])}"
+            )
+        print(
+            f"Average Episode Reward: {np.mean(episode_rewards):.2f}, "
+            f"Average Episode Length: {np.mean(episode_lengths):.1f}"
+        )
+        print(f"Episode Reward Std: {np.std(episode_rewards):.2f}, Episode Length Std: {np.std(episode_lengths):.1f}")
         if wandb_enabled:
             wandb.log(
                 {
-                    "eval/mean_rewards": np.mean(episode_rewards),
-                    "eval/mean_steps": np.mean(episode_lengths),
+                    "eval/rewards_mean": np.mean(episode_rewards),
+                    "eval/steps_mean": np.mean(episode_lengths),
+                    "eval/rewards_std": np.std(episode_rewards),
+                    "eval/steps_std": np.std(episode_lengths)
                 }
             )
     if wandb_enabled:
