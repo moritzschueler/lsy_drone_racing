@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------------------------
 # Set this to a specific checkpoint to force it (absolute, or relative to the single_agent_racing
 # checkpoints folder). Leave it empty ("") to auto-load the most recent checkpoint in that folder.
-CHECKPOINT_OVERRIDE: str = "single_agent_racing_20260703-155601_g0.94_best.ckpt"
+CHECKPOINT_OVERRIDE: str = ""
 # ---------------------------------------------------------------------------------------------
 
 _ACTION_DIM = 4
