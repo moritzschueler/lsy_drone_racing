@@ -51,7 +51,7 @@ class RacingArgs(Args):
     act_coef: float = 0.00 # Coefficient for action penalty (energy smoothness)
     gate_bonus: float = 20.0
     finish_bonus: float = 30.0
-    crash_penalty: float = 3.0
+    crash_penalty: float = 2.0
     timeout_penalty: float = 0.0  # Terminal penalty if sim truncates without drone finished
     time_alive_penalty: float = 0.03 # Continous penalty for each step alive and not finished
     num_steps: int = 128
