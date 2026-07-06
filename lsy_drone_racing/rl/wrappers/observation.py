@@ -107,13 +107,24 @@ class FlattenJaxObservation(Wrapper):
         return batch_space(self.single_observation_space, self.num_envs)
 
     @classmethod
-    def create(cls, base: struct.PyTreeNode) -> FlattenJaxObservation:
-        """Create a FlattenJaxObservation wrapper around the base environment."""
+    def create(cls, base: struct.PyTreeNode, n_drones: int = 1) -> FlattenJaxObservation:
+        """Create a FlattenJaxObservation wrapper around the base environment.
+
+        ``n_drones > 1`` (multi-agent racing) preserves the per-drone axis: each field is flattened
+        to ``(n_envs, n_drones, features)`` and concatenated on the last axis, yielding a
+        ``(n_envs, n_drones, obs_dim)`` observation. The per-drone flat space is unchanged.
+        """
         keys = list(base.single_observation_space.keys())
+        # Number of leading axes to preserve before flattening the per-field features: (n_envs,) for
+        # single-agent, (n_envs, n_drones) for multi-agent.
+        lead = 2 if n_drones > 1 else 1
 
         def flatten(obs: dict) -> Array:
             return jnp.concatenate(
-                [jnp.reshape(obs[k], (obs[k].shape[0], -1)).astype(jnp.float32) for k in keys],
+                [
+                    jnp.reshape(obs[k], obs[k].shape[:lead] + (-1,)).astype(jnp.float32)
+                    for k in keys
+                ],
                 axis=-1,
             )
 
@@ -229,25 +240,36 @@ class RelativeRacingObs(Wrapper):
         return batch_space(self.single_observation_space, self.num_envs)
 
     @classmethod
-    def create(cls, base: struct.PyTreeNode) -> RelativeRacingObs:
+    def create(cls, base: struct.PyTreeNode, n_drones: int = 1) -> RelativeRacingObs:
         """Create a RelativeRacingObs wrapper around the base environment.
 
         Requires ``last_action`` to already be present in the observation, i.e. wrap *after*
         ``ActionPenalty``.
+
+        ``n_drones > 1`` (multi-agent racing) applies the single-drone body-frame transform to each
+        drone by mapping :func:`_relative_racing_obs` over the ``n_drones`` axis (axis 1) of every
+        observation field, so the transform code is reused unchanged and the output keeps its
+        ``(n_envs, n_drones, ...)`` shape. The per-drone observation *space* is identical to the
+        single-agent case.
         """
+        transform = (
+            jax.vmap(_relative_racing_obs, in_axes=1, out_axes=1)
+            if n_drones > 1
+            else _relative_racing_obs
+        )
 
         def reset(
             env: RelativeRacingObs, *, seed: int | None = None, options: dict | None = None
         ) -> tuple[RelativeRacingObs, tuple[Any, Any]]:
             base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
-            return env.replace(base=base_env), (_relative_racing_obs(obs), info)
+            return env.replace(base=base_env), (transform(obs), info)
 
         def step(
             env: RelativeRacingObs, action: Array
         ) -> tuple[RelativeRacingObs, tuple[Any, ...]]:
             base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
             return env.replace(base=base_env), (
-                _relative_racing_obs(obs),
+                transform(obs),
                 reward,
                 terminated,
                 truncated,

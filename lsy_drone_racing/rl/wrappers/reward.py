@@ -69,9 +69,19 @@ class ActionPenalty(Wrapper):
         act_coef: float,
         d_act_th_coef: float,
         d_act_xy_coef: float,
+        n_drones: int = 1,
     ) -> ActionPenalty:
-        """Create an ActionPenalty wrapper around the base environment."""
-        last_action = jnp.zeros((base.num_envs, 4))
+        """Create an ActionPenalty wrapper around the base environment.
+
+        ``n_drones > 1`` (multi-agent racing) keeps the per-drone action axis: ``last_action`` is
+        shaped ``(num_envs, n_drones, 4)`` and the surfaced diagnostic/reward-component ``info``
+        entries are sliced to the ego drone (index 0), matching the single-agent ``(num_envs,)``
+        shape PPO logs. The reward penalty itself stays per-drone (``(num_envs, n_drones)``); only
+        the ego drone's reward is trained on downstream.
+        """
+        multi = n_drones > 1
+        act_shape = (base.num_envs, n_drones, 4) if multi else (base.num_envs, 4)
+        last_action = jnp.zeros(act_shape)
 
         def reset(
             env: ActionPenalty, *, seed: int | None = None, options: dict | None = None
@@ -94,13 +104,15 @@ class ActionPenalty(Wrapper):
             env = env.replace(base=base_env, last_action=action)
             obs = {**obs, "last_action": action}
             act_tilt = jnp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
+            # Slice info terms to the ego drone (0) in multi-agent, so logged shapes stay (num_envs,).
+            ego = (lambda x: x[:, 0]) if multi else (lambda x: x)
             info = {
                 **info,
-                "rew/act": act_term,
-                "rew/d_act_th": d_act_th_term,
-                "rew/d_act_xy": d_act_xy_term,
-                "diagnostics/act_thrust": action[..., -1],
-                "diagnostics/act_tilt": act_tilt,
+                "rew/act": ego(act_term),
+                "rew/d_act_th": ego(d_act_th_term),
+                "rew/d_act_xy": ego(d_act_xy_term),
+                "diagnostics/act_thrust": ego(action[..., -1]),
+                "diagnostics/act_tilt": ego(act_tilt),
             }
             return env, (obs, reward, terminated, truncated, info)
 
