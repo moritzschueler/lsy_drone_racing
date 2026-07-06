@@ -390,5 +390,7 @@ class AstarController(Controller):
         # Visualize waypoint milestones
         if len(self._pre_gate_waypoints) > 0:
             draw_points(sim, self._pre_gate_waypoints, rgba=(0.0, 0.0, 1.0, 1.0), size=0.04)  # Blue
-            draw_points(sim, self._gate_center_waypoints, rgba=(0.0, 1.0, 1.0, 1.0), size=0.05)  # Cyan
-            draw_points(sim, self._post_gate_waypoints, rgba=(1.0, 1.0, 0.0, 1.0), size=0.04)  # Yellow
+            # Cyan
+            draw_points(sim, self._gate_center_waypoints, rgba=(0.0, 1.0, 1.0, 1.0), size=0.05)
+            # Yellow
+            draw_points(sim, self._post_gate_waypoints, rgba=(1.0, 1.0, 0.0, 1.0), size=0.04)

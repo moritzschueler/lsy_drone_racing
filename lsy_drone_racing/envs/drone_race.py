@@ -1,8 +1,8 @@
-"""Single drone racing environments."""
+#"""Single drone racing environments."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import gymnasium
 from gymnasium import Env
@@ -36,6 +36,7 @@ class DroneRaceEnv(RaceCoreEnv, Env):
         seed: int | None = None,
         max_episode_steps: int = 1500,
         device: Literal["cpu", "gpu"] = "cpu",
+        reward_fn: Callable[[Any, Any], Array] | None = None,
     ):
         """Initialize the single-agent drone racing environment.
 
@@ -50,6 +51,7 @@ class DroneRaceEnv(RaceCoreEnv, Env):
             seed: None / -1 for a generated seed or the random seed directly.
             max_episode_steps: Maximum number of steps per episode.
             device: Device used for the environment and the simulation.
+            reward_fn: Optional custom reward function compiled into the step. See `RaceCoreEnv`.
         """
         super().__init__(
             n_envs=1,
@@ -64,6 +66,7 @@ class DroneRaceEnv(RaceCoreEnv, Env):
             seed=seed,
             max_episode_steps=max_episode_steps,
             device=device,
+            reward_fn=reward_fn,
         )
         self.action_space = build_action_space(control_mode, sim_config.drone_model)
         n_gates, n_obstacles = len(track.gates), len(track.obstacles)
@@ -120,6 +123,7 @@ class VecDroneRaceEnv(RaceCoreEnv, VectorEnv):
         seed: int = 1337,
         max_episode_steps: int = 1500,
         device: Literal["cpu", "gpu"] = "cpu",
+        reward_fn: Callable[[Any, Any], Array] | None = None,
     ):
         """Initialize the vectorized single-agent drone racing environment.
 
@@ -135,6 +139,7 @@ class VecDroneRaceEnv(RaceCoreEnv, VectorEnv):
             seed: Random seed.
             max_episode_steps: Maximum number of steps per episode.
             device: Device used for the environment and the simulation.
+            reward_fn: Optional custom reward function compiled into the step. See `RaceCoreEnv`.
         """
         super().__init__(
             n_envs=num_envs,
@@ -149,6 +154,7 @@ class VecDroneRaceEnv(RaceCoreEnv, VectorEnv):
             seed=seed,
             max_episode_steps=max_episode_steps,
             device=device,
+            reward_fn=reward_fn,
         )
         self.num_envs = num_envs
         self.single_action_space = build_action_space(control_mode, sim_config.drone_model)
@@ -185,4 +191,7 @@ class VecDroneRaceEnv(RaceCoreEnv, VectorEnv):
         self.data, (obs, reward, terminated, truncated, info) = self._step(self.data, action)
         obs = {k: v[:, 0] for k, v in obs.items()}
         info = {k: v[:, 0] for k, v in info.items()}
+        # Expose the current target gate (next gate to pass, or -1 once the track is completed)
+        # so training can log gate-progress / completion metrics.
+        info["target_gate"] = self.data.target_gate[:, 0]
         return obs, reward[:, 0], terminated[:, 0], truncated[:, 0], info

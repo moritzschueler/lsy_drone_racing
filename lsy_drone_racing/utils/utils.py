@@ -7,6 +7,8 @@ import inspect
 import logging
 import sys
 from typing import TYPE_CHECKING, Type
+import random
+import numpy as np
 
 import toml
 from ml_collections import ConfigDict
@@ -69,3 +71,9 @@ def load_config(path: Path) -> ConfigDict:
 
     with open(path, "r") as f:
         return ConfigDict(toml.load(f))
+
+
+def set_seeds(seed: int):
+    """Seed everything."""
+    random.seed(seed)
+    np.random.seed(seed)

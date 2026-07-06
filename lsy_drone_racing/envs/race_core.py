@@ -318,6 +318,7 @@ class RaceCoreEnv:
         seed: int | None = None,
         max_episode_steps: int = 1500,
         device: Literal["cpu", "gpu"] = "cpu",
+        reward_fn: Callable[[EnvData, EnvData], Array] | None = None,
     ):
         """Initialize the DroneRacingEnv.
 
@@ -335,6 +336,9 @@ class RaceCoreEnv:
             max_episode_steps: Maximum number of steps per episode. Needs to be tracked manually for
                 vectorized environments.
             device: Device used for the environment and the simulation.
+            reward_fn: Optional custom reward function ``f(data, prev_data) -> Array`` compiled into
+                the step. ``data`` is the post-step state, ``prev_data`` the pre-step state (for
+                progress/event terms). Defaults to the module-level sparse ``reward``.
         """
         super().__init__()
         # 1) Sanitize args
@@ -405,6 +409,10 @@ class RaceCoreEnv:
         )
 
         # 5) Generate functions
+        # Default reward ignores prev_data and uses the module-level sparse reward.
+        self._reward_fn = (
+            reward_fn if reward_fn is not None else (lambda data, prev_data: reward(data))
+        )
         self._setup_sim(randomizations, drones)
         self._reset = self.build_reset_fn()
         self._step = self.build_step_fn()
@@ -456,6 +464,11 @@ class RaceCoreEnv:
     def close(self):
         """Close the environment by stopping the drone and landing back at the starting position."""
         self.sim.close()
+
+    @property
+    def device(self) -> Device:
+        """The device the environment and simulation run on."""
+        return self.sim.device
 
     @property
     def drone_mass(self) -> NDArray[np.floating]:
@@ -511,11 +524,15 @@ class RaceCoreEnv:
         autoreset = self.settings.autoreset
         max_episode_steps = self.settings.max_episode_steps
 
+        reward_fn = self._reward_fn
+
         @jax.jit
         def step(data: EnvData, action: Array) -> EnvData:
             # 1) Save marked_for_reset before it is updated. Autoresets need to be based on the
-            # previous flags, not the ones from the current step
+            # previous flags, not the ones from the current step. prev_data is the full pre-step
+            # state, used by reward functions for progress / gate-pass / crash event terms.
             marked_for_reset = data.marked_for_reset
+            prev_data = data
             # 2) Register the commanded action in the sim controllers
             data = apply_action_fn(action, data)
             # 3) Step the simulation for the number of sim steps per env step
@@ -541,7 +558,7 @@ class RaceCoreEnv:
                     marked_for_reset,
                 )
             _truncated = truncated(data, max_episode_steps)
-            return data, (obs(data), reward(data), terminated(data), _truncated, {})
+            return data, (obs(data), reward_fn(data, prev_data), terminated(data), _truncated, {})
 
         return step
 
@@ -722,7 +739,6 @@ def truncated(data: EnvData, max_episode_steps: int) -> Array:
     return jp.tile((data.steps >= max_episode_steps)[..., None], (1, n_drones))
 
 
-@jax.jit
 def _reset_env_data(data: EnvData, mask: Array | None = None) -> EnvData:
     """Reset auxiliary variables of the environment data."""
     drone_pos = data.sim_data.states.pos

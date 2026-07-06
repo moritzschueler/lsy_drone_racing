@@ -22,7 +22,7 @@ classifiers = [
 ########################
 # Pip Dependencies
 ########################
-dependencies = ["fire >= 0.6.0", "numpy", "toml >= 0.10.2", "numpy"]
+dependencies = ["fire >= 0.6.0", "numpy", "toml >= 0.10.2", "numpy", "wandb"]
 
 [project.optional-dependencies]
 # option[sim]: basic simulation
@@ -44,7 +44,7 @@ deploy = [
     "drone-estimators",
 ]
 # option[rl]: train rl policy
-rl = ["torch == 2.8.0", "wandb"]
+rl = ["flax >= 0.10", "optax >= 0.2", "orbax-checkpoint >= 0.10", "wandb"]
 # option[gamepad]: use a gamepad as input for your drone
 gamepad = ["pygame"]
 
@@ -73,6 +73,7 @@ compilers = ">=1.9.0, <1.11.0"
 cmake = "==3.26.0"  # Pinned for motion_capture_tracking
 make = "==4.4.1"  # Pinned for motion_capture_tracking
 openblas = ">=0.3.30,<0.4"
+nbformat = ">=5.10.4,<6"
 
 [tool.pixi.pypi-dependencies]
 lsy_drone_racing = { path = ".", editable = true }
