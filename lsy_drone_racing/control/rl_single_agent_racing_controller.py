@@ -126,6 +126,8 @@ class RLSingleAgentRacingController(Controller):
             nnx.update(self._agent, pickle.load(f))
         self._checkpoint_path = checkpoint_path
 
+        print(f"RL Single Agent Racing controller uses checkpoint: {checkpoint_path.name}")
+
         # JIT-compile deterministic inference once so the first control call has no compile latency.
         self._infer = nnx.jit(self._deterministic_action)
         self._infer(self._agent, jnp.zeros((1, obs_dim), dtype=jnp.float32))
