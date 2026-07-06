@@ -50,10 +50,10 @@ class RacingArgs(Args):
     d_act_xy_coef: float = 0.001 # Coefficient for xy action change penalty (attitude smoothness)
     act_coef: float = 0.00 # Coefficient for action penalty (energy smoothness)
     gate_bonus: float = 20.0
-    finish_bonus: float = 30.0
-    crash_penalty: float = 3.0
+    finish_bonus: float = 50.0
+    crash_penalty: float = 2.0
     timeout_penalty: float = 0.0  # Terminal penalty if sim truncates without drone finished
-    time_alive_penalty: float = 0.03 # Continous penalty for each step alive and not finished
+    time_alive_penalty: float = 0.00 # Continous penalty for each step alive and not finished
     num_steps: int = 128
     max_episode_length: int = 1500
 
@@ -68,8 +68,8 @@ def quadratic_speed_penalty(speed: Array, threshold: float) -> Array:
     the knee (both value and gradient are zero at ``threshold``), so it introduces no gradient
     discontinuity. The caller scales it by ``speed_coef`` and negates it into a penalty.
     """
-    return jnp.square(jnp.maximum(speed - threshold, 0.0))
-
+    #return jnp.square(jnp.maximum(speed - threshold, 0.0))
+    return jnp.square(speed - threshold)
 
 def racing_reward_components(
     data: Any,
