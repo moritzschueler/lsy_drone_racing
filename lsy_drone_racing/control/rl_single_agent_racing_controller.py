@@ -174,17 +174,18 @@ class RLSingleAgentRacingController(Controller):
         raw = {k: jnp.asarray(obs[k])[None] for k in _RAW_OBS_KEYS}
         raw["target_gate"] = jnp.atleast_1d(jnp.asarray(obs["target_gate"]))
         raw["last_action"] = self._last_action[None]
-        rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays, keys in the flatten order
-        vec = jnp.concatenate(
-            [v.reshape(1, -1).astype(jnp.float32) for v in rel.values()], axis=-1
-        )
+        rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays
         if self._include_opponent_obs:
-            # Single drone: no opponent to observe, so the appended slots are zeros (matching the
-            # zero-padded opponent obs the policy saw during single-agent pre-training).
-            vec = jnp.concatenate(
-                [vec, jnp.zeros((1, _OPPONENT_OBS_DIM), dtype=jnp.float32)], axis=-1
-            )
-        return vec
+            # Single drone: no opponent to observe, so the slots are zeros (matching the zero-padded
+            # opponent obs the policy saw during flag-on single-agent pre-training).
+            zeros = jnp.zeros((1, 3), dtype=jnp.float32)
+            rel = {**rel, "opponent_rel_pos": zeros, "opponent_rel_vel": zeros}
+        # gymnasium's spaces.Dict sorts its keys, and FlattenJaxObservation flattens in that sorted
+        # order at train time -- so concatenate by SORTED key here (not dict insertion order) to feed
+        # the network the identical layout. A mismatch permutes the obs and destroys the policy.
+        return jnp.concatenate(
+            [rel[k].reshape(1, -1).astype(jnp.float32) for k in sorted(rel)], axis=-1
+        )
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None

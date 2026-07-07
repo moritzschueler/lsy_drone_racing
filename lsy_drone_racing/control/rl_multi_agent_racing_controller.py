@@ -177,10 +177,7 @@ class RLMultiAgentRacingController(Controller):
         raw = {k: jnp.asarray(obs[k])[self.rank][None] for k in _RAW_OBS_KEYS}
         raw["target_gate"] = jnp.atleast_1d(jnp.asarray(obs["target_gate"])[self.rank])
         raw["last_action"] = self._last_action[None]
-        rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays, keys in the flatten order
-        vec = jnp.concatenate(
-            [v.reshape(1, -1).astype(jnp.float32) for v in rel.values()], axis=-1
-        )
+        rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays
         if self._include_opponent_obs:
             # Reuse the training-time helper: build the full multi-drone pos/vel/quat with a singleton
             # env axis (E=1), then take this drone's row. This drone sees the nearest opponent's
@@ -188,9 +185,17 @@ class RLMultiAgentRacingController(Controller):
             batched = {k: jnp.asarray(obs[k])[None] for k in ("pos", "vel", "quat")}
             n_drones = batched["pos"].shape[1]
             opp_pos, opp_vel = _opponent_body_frame(batched, n_drones)  # each (1, n_drones, 3)
-            opp = jnp.concatenate([opp_pos[0, self.rank], opp_vel[0, self.rank]])
-            vec = jnp.concatenate([vec, opp.reshape(1, -1).astype(jnp.float32)], axis=-1)
-        return vec
+            rel = {
+                **rel,
+                "opponent_rel_pos": opp_pos[:, self.rank],
+                "opponent_rel_vel": opp_vel[:, self.rank],
+            }
+        # gymnasium's spaces.Dict sorts its keys, and FlattenJaxObservation flattens in that sorted
+        # order at train time -- so concatenate by SORTED key here (not dict insertion order) to feed
+        # the network the identical layout. A mismatch permutes the obs and destroys the policy.
+        return jnp.concatenate(
+            [rel[k].reshape(1, -1).astype(jnp.float32) for k in sorted(rel)], axis=-1
+        )
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
