@@ -82,7 +82,7 @@ def train_ippo(
     drones ``1..`` are opponents sampled from an on-device ring buffer of past ego snapshots.
     """
     if wandb_enabled and wandb.run is None:
-        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args), group="test")
+        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args), group="multi_agent_racing")
         prov = pin_run_to_branch(wandb.run.name, wandb.run.id)
         wandb.config.update(prov, allow_val_change=True)
         if prov.get("wandb_branch"):

@@ -52,7 +52,7 @@ def train_ppo(
     The best checkpoint is tracked in the scan carry and written at the end.
     """
     if wandb_enabled and wandb.run is None:
-        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args), group="test")
+        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args), group="single_agent_racing")
         # Pin the exact code behind this run to a branch wandb-runs/<name>-<id> so the chart
         # legend maps straight to reproducible code. Best-effort; never aborts training.
         prov = pin_run_to_branch(wandb.run.name, wandb.run.id)
