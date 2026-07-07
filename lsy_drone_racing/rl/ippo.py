@@ -277,6 +277,8 @@ def train_ippo(
         ep_ret: Array,
         ep_len: Array,
         opp_idx: Array,
+        ep_step: Array,
+        finish_step: Array,
     ) -> tuple[tuple, dict]:
         """One rollout of ``num_steps``; only ego (drone 0) transitions are stored for the update.
 
@@ -287,7 +289,7 @@ def train_ippo(
         """
 
         def step(carry: tuple, _: Any) -> tuple[tuple, dict]:
-            env, obs, rng, ep_ret, ep_len, opp_idx = carry
+            env, obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step = carry
             ego_obs = obs[:, 0]  # (E, obs_dim)
             opp_obs = obs[:, 1:]  # (E, k, obs_dim)
 
@@ -306,6 +308,28 @@ def train_ippo(
             ego_target_gate = info["target_gate"][:, 0]
             gates_passed = jnp.where(ego_target_gate == -1, n_gates or 0, ego_target_gate)
             gates_passed = gates_passed.astype(jnp.float32)
+
+            # -- Ego win rate (decided at the env-episode boundary: all drones settled) --
+            # The multi-drone env only resets once every drone has finished/crashed/timed out, so the
+            # winner is decided when ``all(term | trunc)`` fires (true only on that terminal step).
+            # Drones are ranked lexicographically: more gates passed wins; if tied on gates and both
+            # finished the whole track (target_gate == -1), the earlier finish step wins. The ego
+            # (drone 0) wins the episode only if it strictly beats every opponent (ties are not wins).
+            all_target_gate = info["target_gate"]  # (E, D)
+            finished = all_target_gate == -1  # completed the whole track (crashes keep target >= 0)
+            new_ep_step = ep_step + 1  # within-episode step counter (per env)
+            newly_finished = finished & (finish_step < 0)  # first step a drone reaches the finish
+            finish_step = jnp.where(newly_finished, new_ep_step[:, None], finish_step)  # (E, D)
+            gates_all = jnp.where(finished, n_gates or 0, all_target_gate)  # (E, D)
+            env_done = jnp.all(term | trunc, axis=1)  # (E,) true only on the terminal step
+            ego_gates = gates_all[:, :1]  # (E, 1)
+            ego_finished = finished[:, :1]  # (E, 1)
+            ego_fstep = finish_step[:, :1]  # (E, 1)
+            ego_ahead = (ego_gates > gates_all[:, 1:]) | (
+                (ego_gates == gates_all[:, 1:]) & ego_finished & (ego_fstep < finish_step[:, 1:])
+            )  # (E, k): ego beats each opponent
+            win = jnp.all(ego_ahead, axis=1)  # (E,) ego strictly beats every opponent
+
             out = {
                 "obs": ego_obs,
                 "action": ego_action,
@@ -319,22 +343,28 @@ def train_ippo(
                 "completed_done": jnp.where(
                     done, (gates_passed == (n_gates or -1)).astype(jnp.float32), 0.0
                 ),
+                "win_done": jnp.where(env_done, win.astype(jnp.float32), 0.0),
+                "ep_done": jnp.where(env_done, 1.0, 0.0),
                 "metrics": {k: jnp.sum(info[k]) for k in metric_keys},
                 "metrics_max": {k: jnp.max(info[k]) for k in max_keys},
             }
             ep_ret = jnp.where(done, 0.0, new_ret)
             ep_len = jnp.where(done, 0.0, new_len)
+            # Advance the win-tracking state; a finished env-episode restarts the step counter and
+            # clears recorded finish steps so the next episode starts fresh.
+            ep_step = jnp.where(env_done, 0, new_ep_step)
+            finish_step = jnp.where(env_done[:, None], -1, finish_step)
             # Resample opponents for envs whose ego episode just ended (uniform over filled slots).
             rng, skey = jax.random.split(rng)
             resampled = jax.random.randint(skey, opp_idx.shape, 0, filled)
             opp_idx = jnp.where(done[:, None], resampled, opp_idx)
-            return (env, next_obs, rng, ep_ret, ep_len, opp_idx), out
+            return (env, next_obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step), out
 
-        carry0 = (env, obs, rng, ep_ret, ep_len, opp_idx)
-        (env, last_obs, rng, ep_ret, ep_len, opp_idx), outs = jax.lax.scan(
+        carry0 = (env, obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step)
+        (env, last_obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step), outs = jax.lax.scan(
             step, carry0, None, length=args.num_steps
         )
-        return (env, last_obs, rng, ep_ret, ep_len, opp_idx), outs
+        return (env, last_obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step), outs
 
     def update_epochs(
         params: nnx.State, opt_state: Any, flat_data: tuple, rng: Array, ent_coef: Array
@@ -405,12 +435,12 @@ def train_ippo(
 
     def train_iteration(carry: tuple, iter_idx: Array) -> tuple[tuple, dict]:
         (params, opt_state, env, obs, prev_done, rng, ep_ret, ep_len,
-         pool, write_ptr, filled, opp_idx, best_params, best_score) = carry
+         pool, write_ptr, filled, opp_idx, best_params, best_score, ep_step, finish_step) = carry
 
         # -- Rollout (ego trained, opponents frozen from the pool) --
         rng, roll_rng = jax.random.split(rng)
-        (env, last_obs, _, ep_ret, ep_len, opp_idx), outs = rollout(
-            params, pool, filled, env, obs, roll_rng, ep_ret, ep_len, opp_idx
+        (env, last_obs, _, ep_ret, ep_len, opp_idx, ep_step, finish_step), outs = rollout(
+            params, pool, filled, env, obs, roll_rng, ep_ret, ep_len, opp_idx, ep_step, finish_step
         )
 
         # -- GAE (ego only) --
@@ -461,6 +491,9 @@ def train_ippo(
         ep_length = jnp.sum(outs["len_done"]) / n_done
         gates_passed = jnp.sum(outs["gates_done"]) / n_done
         completed = jnp.sum(outs["completed_done"]) / n_done
+        # Win rate is per env-episode (all drones settled), so it uses its own episode count.
+        n_ep = jnp.maximum(jnp.sum(outs["ep_done"]), 1.0)
+        win_rate = jnp.sum(outs["win_done"]) / n_ep
         score = gates_passed if n_gates is not None else ep_return
 
         improved = score > best_score
@@ -484,6 +517,7 @@ def train_ippo(
             "train/episode_length": ep_length,
             "train/gates_passed": gates_passed,
             "train/completed": completed,
+            "train/win_rate": win_rate,
             best_key: best_score,
         }
         for k in metric_keys:
@@ -515,7 +549,7 @@ def train_ippo(
 
         new_carry = (
             params, opt_state, env, last_obs, next_done, rng, ep_ret, ep_len,
-            pool, write_ptr, filled, opp_idx, best_params, best_score,
+            pool, write_ptr, filled, opp_idx, best_params, best_score, ep_step, finish_step,
         )
         return new_carry, metrics
 
@@ -544,6 +578,8 @@ def train_ippo(
         opp_idx0,
         params,  # best_params
         jnp.asarray(-jnp.inf, dtype=jnp.float32),  # best_score
+        jnp.zeros(num_envs, dtype=jnp.int32),  # ep_step (within-episode step counter)
+        -jnp.ones((num_envs, n_drones), dtype=jnp.int32),  # finish_step (per drone; -1 = unfinished)
     )
     print(f"Compiling and running {args.num_iterations} iterations as one scan...")
     final_carry, metrics_stack = jax.lax.scan(
