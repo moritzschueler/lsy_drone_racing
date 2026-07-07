@@ -25,18 +25,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def main(config: str = "level2.toml", controller: str | None = None):
+def main(
+    config: str = "level2.toml",
+    controller: str | None = None,
+    include_opponent_obs: bool | None = None,
+):
     """Deployment script to run the controller on the real drone.
 
     Args:
         config: Path to the competition configuration. Assumes the file is in `config/`.
         controller: The name of the controller file in `lsy_drone_racing/control/` or None. If None,
          the controller specified in the config file is used.
+        include_opponent_obs: Override the `[controller] include_opponent_obs` config flag (whether
+         the RL racing policy expects the opponent observation slots). Must match the flag the
+         checkpoint was trained with. None leaves the config value (or the controller default) as is.
     """
     rclpy.init()
     config = load_config(Path(__file__).parents[1] / "config" / config)
     if controller is not None:
         config.controller.file = controller
+    if include_opponent_obs is not None:
+        config.controller.include_opponent_obs = include_opponent_obs
 
     env: RealDroneRaceEnv = gymnasium.make(
         "RealDroneRacing-v0",

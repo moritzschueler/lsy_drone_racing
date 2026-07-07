@@ -46,10 +46,12 @@ CHECKPOINT_OVERRIDE: str = ""
 # ---------------------------------------------------------------------------------------------
 
 _ACTION_DIM = 4
-# Must match the ``include_opponent_obs`` flag the checkpoint was trained with. Single-agent racing
-# defaults it OFF; set to True only when loading a checkpoint pre-trained with the opponent slots on
-# (e.g. to later warm-start a multi-agent policy). A single drone has no opponent, so the slots are
-# fed zeros (see _obs_vector). A mismatch here vs. the checkpoint fails loudly at network load.
+# Default for whether the policy expects the opponent obs slots; overridable per run via the config
+# (``[controller] include_opponent_obs``) or the deploy/sim CLI. Must match the
+# ``include_opponent_obs`` flag the checkpoint was trained with. Single-agent racing defaults it OFF;
+# enable it only when loading a checkpoint pre-trained with the opponent slots on (e.g. to later
+# warm-start a multi-agent policy). A single drone has no opponent, so the slots are fed zeros (see
+# _obs_vector). A mismatch vs. the checkpoint fails loudly at network load.
 _INCLUDE_OPPONENT_OBS = False
 # opponent_rel_pos(3) + opponent_rel_vel(3) appended when _INCLUDE_OPPONENT_OBS is set.
 _OPPONENT_OBS_DIM = 6
@@ -120,6 +122,13 @@ class RLSingleAgentRacingController(Controller):
         # (ActionPenalty initializes it to zeros before any step).
         self._last_action = jnp.zeros(_ACTION_DIM, dtype=jnp.float32)
 
+        # Whether the policy was trained with the opponent obs slots. Read from the run config
+        # (``[controller] include_opponent_obs``, settable via the deploy/sim CLI), defaulting to
+        # _INCLUDE_OPPONENT_OBS. Must match the checkpoint or the network load below fails loudly.
+        self._include_opponent_obs = bool(
+            config.get("controller", {}).get("include_opponent_obs", _INCLUDE_OPPONENT_OBS)
+        )
+
         # Observation size: grav_body(3) + gates_corners(N*4*3) + gates_visited(N) + last_action(4)
         # + obstacles_rel_pos(O*3) + obstacles_visited(O) + vel(3). O read from the obs (works
         # regardless of any leading drone/env dim).
@@ -132,7 +141,7 @@ class RLSingleAgentRacingController(Controller):
             + n_obstacles * 3
             + n_obstacles
             + 3
-            + (_OPPONENT_OBS_DIM if _INCLUDE_OPPONENT_OBS else 0)
+            + (_OPPONENT_OBS_DIM if self._include_opponent_obs else 0)
         )
 
         # Build the network and load the trained parameters (nnx owns its weights; update in place).
@@ -169,7 +178,7 @@ class RLSingleAgentRacingController(Controller):
         vec = jnp.concatenate(
             [v.reshape(1, -1).astype(jnp.float32) for v in rel.values()], axis=-1
         )
-        if _INCLUDE_OPPONENT_OBS:
+        if self._include_opponent_obs:
             # Single drone: no opponent to observe, so the appended slots are zeros (matching the
             # zero-padded opponent obs the policy saw during single-agent pre-training).
             vec = jnp.concatenate(

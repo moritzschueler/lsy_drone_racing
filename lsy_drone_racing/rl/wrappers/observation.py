@@ -244,7 +244,7 @@ class RelativeRacingObs(Wrapper):
       the body frame -- the only world reference a body-frame observation still needs (which way
       is "down" for thrust/attitude). Yaw-about-vertical is intentionally not observable.
 
-    When ``include_opponent`` is set, two trailing keys are appended -- ``opponent_rel_pos`` and
+    When ``include_opponent_obs`` is set, two trailing keys are appended -- ``opponent_rel_pos`` and
     ``opponent_rel_vel`` (each ``(3,)``) -- carrying the nearest opponent drone's position and
     velocity, ego-relative and in the drone's body frame (see :func:`_opponent_body_frame`). They
     are appended *last* so the layout is a superset of the plain obs: a single-agent run with the
@@ -258,7 +258,7 @@ class RelativeRacingObs(Wrapper):
     base: struct.PyTreeNode = struct.field(pytree_node=True)
     step: Callable = struct.field(pytree_node=False)
     reset: Callable = struct.field(pytree_node=False)
-    include_opponent: bool = struct.field(pytree_node=False, default=False)
+    include_opponent_obs: bool = struct.field(pytree_node=False, default=False)
 
     @property
     def single_observation_space(self) -> spaces.Space:
@@ -273,7 +273,7 @@ class RelativeRacingObs(Wrapper):
             "obstacles_visited": base["obstacles_visited"],
             "vel": base["vel"],
         }
-        if self.include_opponent:
+        if self.include_opponent_obs:
             spec["opponent_rel_pos"] = spaces.Box(-np.inf, np.inf, shape=(3,))
             spec["opponent_rel_vel"] = spaces.Box(-np.inf, np.inf, shape=(3,))
         return spaces.Dict(spec)
@@ -284,7 +284,7 @@ class RelativeRacingObs(Wrapper):
 
     @classmethod
     def create(
-        cls, base: struct.PyTreeNode, n_drones: int = 1, include_opponent: bool = False
+        cls, base: struct.PyTreeNode, n_drones: int = 1, include_opponent_obs: bool = False
     ) -> RelativeRacingObs:
         """Create a RelativeRacingObs wrapper around the base environment.
 
@@ -297,7 +297,7 @@ class RelativeRacingObs(Wrapper):
         ``(n_envs, n_drones, ...)`` shape. The per-drone observation *space* is identical to the
         single-agent case.
 
-        ``include_opponent`` appends the ego-relative nearest-opponent position and velocity
+        ``include_opponent_obs`` appends the ego-relative nearest-opponent position and velocity
         (:func:`_opponent_body_frame`) as two trailing keys. The opponent features are computed
         *outside* the per-drone vmap (each vmapped slice only sees its own drone), from the full
         ``(n_envs, n_drones, ...)`` raw arrays. With ``n_drones == 1`` they are zeros.
@@ -310,7 +310,7 @@ class RelativeRacingObs(Wrapper):
 
         def transform(obs: dict) -> dict:
             out = per_drone_transform(obs)
-            if include_opponent:
+            if include_opponent_obs:
                 opp_pos, opp_vel = _opponent_body_frame(obs, n_drones)
                 out = {**out, "opponent_rel_pos": opp_pos, "opponent_rel_vel": opp_vel}
             return out
@@ -327,4 +327,4 @@ class RelativeRacingObs(Wrapper):
             base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
             return env.replace(base=base_env), (transform(obs), reward, terminated, truncated, info)
 
-        return cls(base=base, step=step, reset=reset, include_opponent=include_opponent)
+        return cls(base=base, step=step, reset=reset, include_opponent_obs=include_opponent_obs)

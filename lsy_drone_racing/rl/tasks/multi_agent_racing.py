@@ -165,7 +165,7 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
     env = NormalizeActions.create(env)
     env = ZeroYaw.create(env)
     env = RelativeRacingObs.create(
-        env, n_drones=n_drones, include_opponent=args.include_opponent_obs
+        env, n_drones=n_drones, include_opponent_obs=args.include_opponent_obs
     )
     env = FlattenJaxObservation.create(env, n_drones=n_drones)
     return env
