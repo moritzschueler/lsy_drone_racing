@@ -8,11 +8,13 @@ buffer threaded through the rollout scan carry (no host round-trips): every
 ``opponent_snapshot_interval`` steps the current ego params are written into a rotating slot, and
 each episode samples a slot as that env's opponent. See the ``[[multi-agent-integration-plan]]``.
 
-Scope note: this first cut is **self-play only**. Heterogeneous opponents (PID / fixed
-trajectory-followers via ``lax.switch`` dispatch), the competition/downwash reward shaping, and
-relative-opponent observations are deliberately deferred to later phases and are NOT wired here --
-they would be dead config today. The ``MultiAgentRacingArgs`` below carries only knobs that are
-actually consumed by the self-play pipeline.
+Scope note: this cut is **self-play only**. The ego observes the nearest opponent's ego-relative,
+body-frame position and velocity (``include_opponent_obs``, on by default; see
+``RelativeRacingObs``/``_opponent_body_frame``). Heterogeneous opponents (PID / fixed
+trajectory-followers via ``lax.switch`` dispatch) and the competition/downwash reward shaping are
+deliberately deferred to later phases and are NOT wired here -- they would be dead config today. The
+``MultiAgentRacingArgs`` below carries only knobs that are actually consumed by the self-play
+pipeline.
 """
 
 from __future__ import annotations
@@ -52,6 +54,10 @@ class MultiAgentRacingArgs(RacingArgs):
     # Number of frozen opponent drones sharing the track with the ego. The underlying functional
     # env is built with ``n_drones = 1 + n_opponents``
     n_opponents: int = 1
+
+    # Observe the opponent: multi-agent racing needs the ego to see the other drone, so default the
+    # nearest-opponent obs slots on (single-agent leaves this off). See Args.include_opponent_obs.
+    include_opponent_obs: bool = True
 
     # -- On-device self-play opponent pool (ring buffer) --
     # Number of past-ego snapshots kept on device
@@ -158,6 +164,8 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
     )
     env = NormalizeActions.create(env)
     env = ZeroYaw.create(env)
-    env = RelativeRacingObs.create(env, n_drones=n_drones)
+    env = RelativeRacingObs.create(
+        env, n_drones=n_drones, include_opponent=args.include_opponent_obs
+    )
     env = FlattenJaxObservation.create(env, n_drones=n_drones)
     return env

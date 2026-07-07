@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "multi_level0.toml",
+    config: str = "multi_level2.toml",
     controllers: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,

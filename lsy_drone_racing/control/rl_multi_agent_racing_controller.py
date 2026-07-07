@@ -34,7 +34,11 @@ from flax import nnx
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.envs.race_core import build_action_space
 from lsy_drone_racing.rl.agents.ppo_agent import Agent
-from lsy_drone_racing.rl.wrappers.observation import N_NEXT_GATES, _relative_racing_obs
+from lsy_drone_racing.rl.wrappers.observation import (
+    N_NEXT_GATES,
+    _opponent_body_frame,
+    _relative_racing_obs,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -47,6 +51,13 @@ CHECKPOINT_OVERRIDES: list[str] = []
 # ---------------------------------------------------------------------------------------------
 
 _ACTION_DIM = 4
+# Must match the ``include_opponent_obs`` flag the checkpoint was trained with. Multi-agent racing
+# defaults it ON, so the ego observes the nearest opponent's ego-relative, body-frame position and
+# velocity (see _obs_vector / _opponent_body_frame). Set False only for a checkpoint trained without
+# it. A mismatch here vs. the checkpoint fails loudly at network load.
+_INCLUDE_OPPONENT_OBS = True
+# opponent_rel_pos(3) + opponent_rel_vel(3) appended when _INCLUDE_OPPONENT_OBS is set.
+_OPPONENT_OBS_DIM = 6
 _CHECKPOINT_DIR = Path(__file__).parents[1] / "rl" / "checkpoints" / "multi_agent_racing"
 _TIMESTAMP_RE = re.compile(r"\d{8}-\d{6}")
 
@@ -127,6 +138,7 @@ class RLMultiAgentRacingController(Controller):
             + n_obstacles * 3
             + n_obstacles
             + 3
+            + (_OPPONENT_OBS_DIM if _INCLUDE_OPPONENT_OBS else 0)
         )
 
         self._agent = Agent(obs_dim, _ACTION_DIM, rngs=nnx.Rngs(0))
@@ -157,9 +169,19 @@ class RLMultiAgentRacingController(Controller):
         raw["target_gate"] = jnp.atleast_1d(jnp.asarray(obs["target_gate"])[self.rank])
         raw["last_action"] = self._last_action[None]
         rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays, keys in the flatten order
-        return jnp.concatenate(
+        vec = jnp.concatenate(
             [v.reshape(1, -1).astype(jnp.float32) for v in rel.values()], axis=-1
         )
+        if _INCLUDE_OPPONENT_OBS:
+            # Reuse the training-time helper: build the full multi-drone pos/vel/quat with a singleton
+            # env axis (E=1), then take this drone's row. This drone sees the nearest opponent's
+            # ego-relative, body-frame position and velocity.
+            batched = {k: jnp.asarray(obs[k])[None] for k in ("pos", "vel", "quat")}
+            n_drones = batched["pos"].shape[1]
+            opp_pos, opp_vel = _opponent_body_frame(batched, n_drones)  # each (1, n_drones, 3)
+            opp = jnp.concatenate([opp_pos[0, self.rank], opp_vel[0, self.rank]])
+            vec = jnp.concatenate([vec, opp.reshape(1, -1).astype(jnp.float32)], axis=-1)
+        return vec
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None

@@ -62,6 +62,11 @@ class Args:
 
     # Wrapper settings (observation history + action/angle reward shaping)
     n_obs: int = 2
+    include_opponent_obs: bool = False
+    """append the nearest opponent's ego-relative, body-frame position + velocity (2x3) to the
+    racing observation. Multi-agent racing defaults this on; single-agent leaves it off but can
+    enable it to pre-train with zero-padded opponent slots so a single-agent checkpoint shares the
+    multi-agent obs layout and warm-starts a multi-agent policy 1:1."""
     rpy_coef: float = 0.06
     d_act_th_coef: float = 0.4  # Coefficient for thrust change penalty (thrust smoothness)
     d_act_xy_coef: float = 1.0  # Coefficient for xy action change penalty (attitude smoothness)

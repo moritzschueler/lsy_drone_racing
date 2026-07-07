@@ -46,6 +46,13 @@ CHECKPOINT_OVERRIDE: str = ""
 # ---------------------------------------------------------------------------------------------
 
 _ACTION_DIM = 4
+# Must match the ``include_opponent_obs`` flag the checkpoint was trained with. Single-agent racing
+# defaults it OFF; set to True only when loading a checkpoint pre-trained with the opponent slots on
+# (e.g. to later warm-start a multi-agent policy). A single drone has no opponent, so the slots are
+# fed zeros (see _obs_vector). A mismatch here vs. the checkpoint fails loudly at network load.
+_INCLUDE_OPPONENT_OBS = False
+# opponent_rel_pos(3) + opponent_rel_vel(3) appended when _INCLUDE_OPPONENT_OBS is set.
+_OPPONENT_OBS_DIM = 6
 _CHECKPOINT_DIR = Path(__file__).parents[1] / "rl" / "checkpoints" / "single_agent_racing"
 # The YYYYMMDD-HHMMSS stamp training embeds in each checkpoint filename (see rl/ppo.py).
 _TIMESTAMP_RE = re.compile(r"\d{8}-\d{6}")
@@ -125,6 +132,7 @@ class RLSingleAgentRacingController(Controller):
             + n_obstacles * 3
             + n_obstacles
             + 3
+            + (_OPPONENT_OBS_DIM if _INCLUDE_OPPONENT_OBS else 0)
         )
 
         # Build the network and load the trained parameters (nnx owns its weights; update in place).
@@ -158,9 +166,16 @@ class RLSingleAgentRacingController(Controller):
         raw["target_gate"] = jnp.atleast_1d(jnp.asarray(obs["target_gate"]))
         raw["last_action"] = self._last_action[None]
         rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays, keys in the flatten order
-        return jnp.concatenate(
+        vec = jnp.concatenate(
             [v.reshape(1, -1).astype(jnp.float32) for v in rel.values()], axis=-1
         )
+        if _INCLUDE_OPPONENT_OBS:
+            # Single drone: no opponent to observe, so the appended slots are zeros (matching the
+            # zero-padded opponent obs the policy saw during single-agent pre-training).
+            vec = jnp.concatenate(
+                [vec, jnp.zeros((1, _OPPONENT_OBS_DIM), dtype=jnp.float32)], axis=-1
+            )
+        return vec
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None

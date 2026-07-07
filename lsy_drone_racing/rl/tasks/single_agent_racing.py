@@ -454,6 +454,6 @@ def make_functional_env(args: Args, config: dict = None) -> Wrapper:
     )
     env = NormalizeActions.create(env)
     env = ZeroYaw.create(env)
-    env = RelativeRacingObs.create(env)
+    env = RelativeRacingObs.create(env, include_opponent=args.include_opponent_obs)
     env = FlattenJaxObservation.create(env)
     return env
