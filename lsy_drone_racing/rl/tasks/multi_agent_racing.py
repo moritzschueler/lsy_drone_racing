@@ -50,35 +50,25 @@ class MultiAgentRacingArgs(RacingArgs):
 
     # -- Multi-drone layout --
     # Number of frozen opponent drones sharing the track with the ego. The underlying functional
-    # env is built with ``n_drones = 1 + n_opponents`` (drone 0 = trainable ego). Start at 1 for
-    # bring-up; the sim already carries the n_drones axis natively. Must match the loaded track
-    # config's drone count (``len(track.drones) == 1 + n_opponents``).
+    # env is built with ``n_drones = 1 + n_opponents``
     n_opponents: int = 1
 
     # -- On-device self-play opponent pool (ring buffer) --
-    # Number of past-ego snapshots kept on device. ``opponent_pool_size == 1`` recovers naive
-    # latest-only self-play (fewest moving parts) and is the recommended setting for first bring-up;
-    # a small buffer (5-8) then stabilises training by exposing a spread of past-self skill levels,
-    # avoiding the non-transitive cycling / forgetting of latest-only. Cost is negligible
-    # (~78 KB per snapshot), so the buffer is essentially free.
+    # Number of past-ego snapshots kept on device
     opponent_pool_size: int = 8
-    # How often (in global steps) to snapshot the current ego params into the next ring-buffer slot.
-    # The buffer spans ``opponent_pool_size * opponent_snapshot_interval`` steps of history; tune so
-    # the oldest slot is a meaningfully weaker policy, not just "a few minutes ago".
+    # How often (in global steps) to snapshot the current ego params into the next ring-buffer slot
     opponent_snapshot_interval: int = 1_000_000
-    # Global step at which opponents are activated. Before this the pool has no meaningful snapshot,
-    # so opponent drones are held inert (the ego trains effectively single-agent) until it passes.
+    # Global step at which opponents are activated
     opponent_start_step: int = 10_000_000
-    # Per-episode opponent sampling bias toward recent snapshots (0 = uniform over filled slots,
-    # ->1 = almost always the most recent). Recency-weighted sampling over the self-play pool.
+    # Recency-weighted sampling over the self-play pool: 0 = uniform over filled slots,
+    # 1 = almost always the most recent. 
     opponent_recency_bias: float = 0.7
 
     # -- Warm start --
     # Optional path to a trained single-agent checkpoint to initialize the ego AND seed the whole
     # opponent pool from, so self-play begins with a competent racer on both drones instead of from
     # scratch. Accepts an absolute/relative path, or a bare filename resolved against the
-    # single_agent_racing checkpoint dir. The optimizer state always starts fresh. None = train from
-    # random init. Single-agent racing checkpoints are architecture-compatible (obs 52 / action 4).
+    # single_agent_racing checkpoint dir.
     init_checkpoint: str | None = None
 
 
