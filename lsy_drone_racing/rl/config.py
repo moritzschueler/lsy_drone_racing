@@ -63,10 +63,10 @@ class Args:
     # Wrapper settings (observation history + action/angle reward shaping)
     n_obs: int = 2
     rpy_coef: float = 0.06
-    d_act_th_coef: float = 0.4 # Coefficient for thrust change penalty (thrust smoothness)
-    d_act_xy_coef: float = 1.0 # Coefficient for xy action change penalty (attitude smoothness)
-    act_coef: float = 0.02 # Coefficient for action penalty (energy smoothness)
-    d_act_coef: float = 0.01 # Coefficient for single action term penalty
+    d_act_th_coef: float = 0.4  # Coefficient for thrust change penalty (thrust smoothness)
+    d_act_xy_coef: float = 1.0  # Coefficient for xy action change penalty (attitude smoothness)
+    act_coef: float = 0.02  # Coefficient for action penalty (energy smoothness)
+    d_act_coef: float = 0.01  # Coefficient for single action term penalty
 
     # Env (in-step) racing reward coefficients. Only used by the racing task; other tasks
     # compute their reward inside their env class and ignore these. The progress term itself is

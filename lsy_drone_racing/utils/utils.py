@@ -5,11 +5,11 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
+import random
 import sys
 from typing import TYPE_CHECKING, Type
-import random
-import numpy as np
 
+import numpy as np
 import toml
 from ml_collections import ConfigDict
 

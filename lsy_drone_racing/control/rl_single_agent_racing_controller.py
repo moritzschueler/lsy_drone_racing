@@ -25,7 +25,7 @@ from __future__ import annotations
 import pickle
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING    
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
@@ -117,7 +117,15 @@ class RLSingleAgentRacingController(Controller):
         # + obstacles_rel_pos(O*3) + obstacles_visited(O) + vel(3). O read from the obs (works
         # regardless of any leading drone/env dim).
         n_obstacles = int(np.asarray(obs["obstacles_pos"]).shape[-2])
-        obs_dim = 3 + N_NEXT_GATES * 4 * 3 + N_NEXT_GATES + _ACTION_DIM + n_obstacles * 3 + n_obstacles + 3
+        obs_dim = (
+            3
+            + N_NEXT_GATES * 4 * 3
+            + N_NEXT_GATES
+            + _ACTION_DIM
+            + n_obstacles * 3
+            + n_obstacles
+            + 3
+        )
 
         # Build the network and load the trained parameters (nnx owns its weights; update in place).
         self._agent = Agent(obs_dim, _ACTION_DIM, rngs=nnx.Rngs(0))
@@ -161,7 +169,9 @@ class RLSingleAgentRacingController(Controller):
         obs_vec = self._obs_vector(obs)
         action = self._infer(self._agent, obs_vec)[0]  # (4,) in [-1, 1]
         action = action.at[2].set(0.0)  # ZeroYaw
-        action = jnp.clip(action, -1.0, 1.0) * self._act_scale + self._act_offset  # NormalizeActions
+        action = (
+            jnp.clip(action, -1.0, 1.0) * self._act_scale + self._act_offset
+        )  # NormalizeActions
         self._last_action = action  # feed the denormalized, yaw-zeroed action to the next obs
         return np.asarray(action, dtype=np.float32)
 

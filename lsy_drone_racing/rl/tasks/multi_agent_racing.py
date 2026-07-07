@@ -61,7 +61,7 @@ class MultiAgentRacingArgs(RacingArgs):
     # Global step at which opponents are activated
     opponent_start_step: int = 10_000_000
     # Recency-weighted sampling over the self-play pool: 0 = uniform over filled slots,
-    # 1 = almost always the most recent. 
+    # 1 = almost always the most recent.
     opponent_recency_bias: float = 0.7
 
     # -- Warm start --

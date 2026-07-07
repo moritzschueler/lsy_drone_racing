@@ -103,8 +103,10 @@ def simulate(
         controller.episode_reset()
         ep_times.append(curr_time if obs["target_gate"] == -1 else None)
 
-        gates_passed.append(obs["target_gate"] if obs["target_gate"] != -1 else len(config.env.track.gates))
-    print(f"Average number of gates passed: {round(sum(gates_passed)/n_runs, 1)}")
+        gates_passed.append(
+            obs["target_gate"] if obs["target_gate"] != -1 else len(config.env.track.gates)
+        )
+    print(f"Average number of gates passed: {round(sum(gates_passed) / n_runs, 1)}")
     # Close the environment
     env.close()
     return ep_times

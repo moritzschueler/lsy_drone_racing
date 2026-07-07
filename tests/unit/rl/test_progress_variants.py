@@ -35,7 +35,7 @@ def _phi(name: str, along: float, y: float = 0.0, z: float = 0.0) -> float:
 
 @pytest.mark.unit
 def test_registry_holds_the_three_shipped_variants():
-    """champion / asymmetric / fancy are all registered and buildable."""
+    """Champion / asymmetric / fancy are all registered and buildable."""
     assert set(PROGRESS_VARIANTS) == {"champion", "asymmetric", "fancy"}
     for name in PROGRESS_VARIANTS:
         assert callable(build_progress_potential(name, default_progress_params()))
@@ -59,10 +59,12 @@ def test_potential_is_a_deterministic_function_of_state(name: str):
 
 @pytest.mark.unit
 def test_champion_potential_equals_negative_opening_distance():
-    """champion is exactly Phi = -gate_opening_distance, so it reproduces the old progress reward."""
+    """Champion is exactly Phi = -gate_opening_distance, so it reproduces the old progress reward."""
     for along, y in [(-2.8, 0.0), (-0.5, 0.0), (0.5, 1.2), (-1.3, GATE_HALF_EXTENT)]:
         pos = jnp.array([[[along, y, 0.0]]])
-        d = float(gate_opening_distance(pos, _GATES_POS, _GATES_QUAT, _TARGET, GATE_HALF_EXTENT)[0, 0])
+        d = float(
+            gate_opening_distance(pos, _GATES_POS, _GATES_QUAT, _TARGET, GATE_HALF_EXTENT)[0, 0]
+        )
         assert _phi("champion", along, y=y) == pytest.approx(-d, abs=1e-6)
 
 
@@ -93,6 +95,6 @@ def test_build_ignores_dormant_variant_params():
     # champion ignores all of asymmetric's params and still builds + matches -distance.
     pot = build_progress_potential("champion", params)
     pos = jnp.array([[[-0.5, 0.0, 0.0]]])
-    assert float(pot(pos, _GATES_POS, _GATES_QUAT, _TARGET, GATE_HALF_EXTENT)[0, 0]) == pytest.approx(
-        -0.5, abs=1e-6
-    )
+    assert float(
+        pot(pos, _GATES_POS, _GATES_QUAT, _TARGET, GATE_HALF_EXTENT)[0, 0]
+    ) == pytest.approx(-0.5, abs=1e-6)

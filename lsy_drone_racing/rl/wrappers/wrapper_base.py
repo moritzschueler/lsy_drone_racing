@@ -1,7 +1,9 @@
+from typing import Any
+
 from flax import struct
 from gymnasium import spaces
 from jax import Array
-from typing import Any
+
 
 @struct.dataclass
 class Wrapper(struct.PyTreeNode):

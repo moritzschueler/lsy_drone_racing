@@ -86,8 +86,5 @@ class SpinUpRotors(Wrapper):
             return env, (obs, reward, terminated, truncated, info)
 
         return cls(
-            base=base,
-            done_last_step=jnp.zeros(num_envs, dtype=bool),
-            step=step,
-            reset=reset,
+            base=base, done_last_step=jnp.zeros(num_envs, dtype=bool), step=step, reset=reset
         )

@@ -1,18 +1,17 @@
 import pickle
-import fire
-import numpy as np
-import jax.numpy as jnp
-
 from pathlib import Path
 from typing import Any
+
+import fire
+import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax import Array
 
 from lsy_drone_racing.rl.agents.ppo_agent import Agent
-from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 from lsy_drone_racing.rl.tasks import get_task
+from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 from lsy_drone_racing.utils import load_config
-
 
 CHECKPOINT_DIR = Path(__file__).parents[1] / "checkpoints"
 
@@ -27,7 +26,7 @@ def main(
     task: str = "single_agent_racing",
     config: str = "level0.toml",
     checkpoint: str | None = None,
-    **kwargs: Any
+    **kwargs: Any,
 ):
     """Render the simulation for a single trained PPO agent on the given task.
 
@@ -47,7 +46,9 @@ def main(
     if not checkpoint:
         latest_checkpoint = _latest_checkpoint(task)
         if not latest_checkpoint:
-            raise FileNotFoundError(f"No checkpoints found for task '{task}' in {checkpoint_dir}, can't render. Aborting!")
+            raise FileNotFoundError(
+                f"No checkpoints found for task '{task}' in {checkpoint_dir}, can't render. Aborting!"
+            )
         else:
             print(f"No checkpoint specified, using latest checkpoint: {latest_checkpoint}")
             model_path = latest_checkpoint
@@ -63,7 +64,7 @@ def main(
     agent = Agent(obs_dim, action_dim, rngs=nnx.Rngs(0))
     with open(model_path, "rb") as f:
         nnx.update(agent, pickle.load(f))
-            
+
     @nnx.jit
     def policy_step(agent: Agent, env: Wrapper, obs: Array) -> tuple[Wrapper, Array, Array, Array]:
         """One deterministic (mean-action) env step, compiled so the full wrapper stack fuses.
@@ -84,6 +85,7 @@ def main(
         eval_env.render()
         done = bool(jnp.any(terminated | truncated))
     eval_env.close()
+
 
 if __name__ == "__main__":
     fire.Fire(main)

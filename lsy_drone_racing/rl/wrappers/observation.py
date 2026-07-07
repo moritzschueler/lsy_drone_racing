@@ -27,12 +27,7 @@ N_NEXT_GATES = 2
 GATE_OPENING_HALF_EXTENT = 0.225
 _h = GATE_OPENING_HALF_EXTENT
 _GATE_CORNERS_LOCAL = jnp.array(
-    [
-        [0.0, _h, _h],
-        [0.0, _h, -_h],
-        [0.0, -_h, _h],
-        [0.0, -_h, -_h],
-    ]
+    [[0.0, _h, _h], [0.0, _h, -_h], [0.0, -_h, _h], [0.0, -_h, -_h]]
 )  # (4, 3) gate-frame corner offsets
 
 
@@ -268,12 +263,6 @@ class RelativeRacingObs(Wrapper):
             env: RelativeRacingObs, action: Array
         ) -> tuple[RelativeRacingObs, tuple[Any, ...]]:
             base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
-            return env.replace(base=base_env), (
-                transform(obs),
-                reward,
-                terminated,
-                truncated,
-                info,
-            )
+            return env.replace(base=base_env), (transform(obs), reward, terminated, truncated, info)
 
         return cls(base=base, step=step, reset=reset)

@@ -82,7 +82,12 @@ def train_ippo(
     drones ``1..`` are opponents sampled from an on-device ring buffer of past ego snapshots.
     """
     if wandb_enabled and wandb.run is None:
-        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args), group="multi_agent_racing")
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            config=vars(args),
+            group="multi_agent_racing",
+        )
         prov = pin_run_to_branch(wandb.run.name, wandb.run.id)
         wandb.config.update(prov, allow_val_change=True)
         if prov.get("wandb_branch"):
@@ -138,7 +143,9 @@ def train_ippo(
     rng = jax.random.PRNGKey(args.seed)
 
     if args.anneal_lr:
-        schedule = optax.cosine_decay_schedule(args.learning_rate, args.num_iterations * args.update_epochs * args.num_minibatches)
+        schedule = optax.cosine_decay_schedule(
+            args.learning_rate, args.num_iterations * args.update_epochs * args.num_minibatches
+        )
     else:
         schedule = args.learning_rate
     tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(schedule, eps=1e-5))
@@ -434,8 +441,24 @@ def train_ippo(
         return pool, write_ptr, filled
 
     def train_iteration(carry: tuple, iter_idx: Array) -> tuple[tuple, dict]:
-        (params, opt_state, env, obs, prev_done, rng, ep_ret, ep_len,
-         pool, write_ptr, filled, opp_idx, best_params, best_score, ep_step, finish_step) = carry
+        (
+            params,
+            opt_state,
+            env,
+            obs,
+            prev_done,
+            rng,
+            ep_ret,
+            ep_len,
+            pool,
+            write_ptr,
+            filled,
+            opp_idx,
+            best_params,
+            best_score,
+            ep_step,
+            finish_step,
+        ) = carry
 
         # -- Rollout (ego trained, opponents frozen from the pool) --
         rng, roll_rng = jax.random.split(rng)
@@ -521,10 +544,10 @@ def train_ippo(
             best_key: best_score,
         }
         for k in metric_keys:
-            name = f"reward/{k[len('rew/'):]}" if k.startswith("rew/") else k
+            name = f"reward/{k[len('rew/') :]}" if k.startswith("rew/") else k
             metrics[name] = jnp.sum(outs["metrics"][k]) / denom
         for k in max_keys:
-            metrics[f"diagnostics/{k[len('max/'):]}_max"] = jnp.max(outs["metrics_max"][k])
+            metrics[f"diagnostics/{k[len('max/') :]}_max"] = jnp.max(outs["metrics_max"][k])
 
         last_iter = iter_idx == args.num_iterations - 1
         if console_live:
@@ -532,7 +555,12 @@ def train_ippo(
             jax.lax.cond(
                 should_log,
                 lambda: jax.debug.callback(
-                    _log_iter, iter_idx, ep_return, gates_passed, value_loss, approx_kl,
+                    _log_iter,
+                    iter_idx,
+                    ep_return,
+                    gates_passed,
+                    value_loss,
+                    approx_kl,
                     ordered=True,
                 ),
                 lambda: None,
@@ -548,8 +576,22 @@ def train_ippo(
             )
 
         new_carry = (
-            params, opt_state, env, last_obs, next_done, rng, ep_ret, ep_len,
-            pool, write_ptr, filled, opp_idx, best_params, best_score, ep_step, finish_step,
+            params,
+            opt_state,
+            env,
+            last_obs,
+            next_done,
+            rng,
+            ep_ret,
+            ep_len,
+            pool,
+            write_ptr,
+            filled,
+            opp_idx,
+            best_params,
+            best_score,
+            ep_step,
+            finish_step,
         )
         return new_carry, metrics
 
@@ -579,7 +621,9 @@ def train_ippo(
         params,  # best_params
         jnp.asarray(-jnp.inf, dtype=jnp.float32),  # best_score
         jnp.zeros(num_envs, dtype=jnp.int32),  # ep_step (within-episode step counter)
-        -jnp.ones((num_envs, n_drones), dtype=jnp.int32),  # finish_step (per drone; -1 = unfinished)
+        -jnp.ones(
+            (num_envs, n_drones), dtype=jnp.int32
+        ),  # finish_step (per drone; -1 = unfinished)
     )
     print(f"Compiling and running {args.num_iterations} iterations as one scan...")
     final_carry, metrics_stack = jax.lax.scan(
@@ -654,13 +698,7 @@ def evaluate_ippo(
         return (env, next_obs, done_so_far, ret, length), None
 
     env0, (obs0, _) = eval_env.reset(eval_env, seed=args.seed)
-    carry0 = (
-        env0,
-        obs0,
-        jnp.zeros(n_eval, dtype=bool),
-        jnp.zeros(n_eval),
-        jnp.zeros(n_eval),
-    )
+    carry0 = (env0, obs0, jnp.zeros(n_eval, dtype=bool), jnp.zeros(n_eval), jnp.zeros(n_eval))
     (_, _, _, ret, length), _ = jax.lax.scan(eval_scan, carry0, None, length=max_steps)
     eval_env.close()
     return np.array(ret), np.array(length)

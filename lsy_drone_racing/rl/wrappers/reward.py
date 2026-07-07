@@ -1,22 +1,20 @@
 """Reward / action-shaping wrappers for the vectorized JAX drone environments."""
+
 from __future__ import annotations
 
+from typing import Any, Callable
+
+import flax.struct as struct
 import jax.numpy as jnp
 import numpy as np
-import flax.struct as struct
 from gymnasium import spaces
-from gymnasium.vector import (
-    VectorActionWrapper,
-    VectorEnv,
-    VectorObservationWrapper,
-    VectorRewardWrapper,
-)
-from typing import Any, Callable
+from gymnasium.vector import VectorEnv, VectorRewardWrapper
 from gymnasium.vector.utils import batch_space
 from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
+
 
 class AngleReward(VectorRewardWrapper):
     """Wrapper to penalize orientation in the reward."""
@@ -41,6 +39,7 @@ class AngleReward(VectorRewardWrapper):
         rpy_norm = jnp.linalg.norm(R.from_quat(observations["quat"]).as_euler("xyz"), axis=-1)
         rewards -= self.rpy_coef * rpy_norm
         return rewards
+
 
 @struct.dataclass
 class ActionPenalty(Wrapper):
@@ -91,9 +90,7 @@ class ActionPenalty(Wrapper):
             obs = {**obs, "last_action": env.last_action}
             return env, (obs, info)
 
-        def step(
-            env: ActionPenalty, action: Array
-        ) -> tuple[ActionPenalty, tuple[Any, ...]]:
+        def step(env: ActionPenalty, action: Array) -> tuple[ActionPenalty, tuple[Any, ...]]:
             base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
             action_diff = action - env.last_action
             act_term = -act_coef * action[..., -1] ** 2  # energy
@@ -134,16 +131,17 @@ class ZeroYaw(Wrapper):
     reset: Callable = struct.field(pytree_node=False)
     step: Callable = struct.field(pytree_node=False)
 
-
     @classmethod
     def create(cls, base: struct.PyTreeNode) -> ZeroYaw:
-        """ Create a ZeroYaw wrapper around the base environment. """
+        """Create a ZeroYaw wrapper around the base environment."""
 
-        def reset(env: ZeroYaw, *, seed: int | None = None, options: dict | None = None) -> tuple[ZeroYaw, tuple[Any, Any]]:
+        def reset(
+            env: ZeroYaw, *, seed: int | None = None, options: dict | None = None
+        ) -> tuple[ZeroYaw, tuple[Any, Any]]:
             base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
             env = env.replace(base=base_env)
             return env, (obs, info)
-        
+
         def step(env: ZeroYaw, actions: Array) -> tuple[ZeroYaw, tuple[Any, ...]]:
             """Zero the yaw channel of the (normalized) action."""
             actions = actions.at[..., 2].set(0.0)
@@ -156,8 +154,7 @@ class ZeroYaw(Wrapper):
 
 @struct.dataclass
 class NormalizeActions(Wrapper):
-    """Expose actions in ``[-1, 1]`` and rescale them to the simulator's action range.
-    """
+    """Expose actions in ``[-1, 1]`` and rescale them to the simulator's action range."""
 
     base: struct.PyTreeNode = struct.field(pytree_node=True)
     step: Callable = struct.field(pytree_node=False)
@@ -192,4 +189,3 @@ class NormalizeActions(Wrapper):
             return env.replace(base=base_env), payload
 
         return cls(base=base, step=step, reset=reset)
-
