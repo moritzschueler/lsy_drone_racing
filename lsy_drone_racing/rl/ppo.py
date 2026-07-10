@@ -294,6 +294,8 @@ def train_ppo(
 
     # Which metric key holds the best-checkpoint score, and the chart it logs to.
     best_key = "charts/gates_passed" if n_gates is not None else "charts/best_reward"
+    tag = "g" if n_gates is not None else "r"
+    metric = "gates-passed" if n_gates is not None else "return"
 
     # Periodic in-scan logging. Both are Python (compile-time) flags: when disabled (<=0) the
     # corresponding callback is never emitted into the traced graph, so it adds zero overhead.
@@ -303,6 +305,16 @@ def train_ppo(
         print(f"Console progress every {args.console_log_interval} iterations")
     if wandb_live:
         print(f"Publishing metrics to wandb every {args.wandb_log_interval} iterations (live)")
+
+    # Periodic checkpoint saving (in addition to the best checkpoint written at the end): disabled
+    # unless both a checkpoint dir is given and checkpoint_save_interval > 0.
+    checkpoint_live = checkpoint_dir is not None and args.checkpoint_save_interval > 0
+    if checkpoint_live:
+        save_every = max(1, round(args.checkpoint_save_interval / args.batch_size))
+        print(
+            f"Saving periodic checkpoints every {save_every} iterations "
+            f"(~{args.checkpoint_save_interval} steps)"
+        )
 
     def _log_iter(
         iter_idx: Array, reward: Array, gates: Array, value_loss: Array, approx_kl: Array
@@ -318,6 +330,18 @@ def train_ppo(
     def _wandb_log(step: Array, metrics: dict) -> None:
         """Host-side wandb.log of one iteration's metrics; called via an ordered callback."""
         wandb.log({k: float(v) for k, v in metrics.items()}, step=int(step))
+
+    def _save_checkpoint(step: Array, params_state: nnx.State, score: Array) -> None:
+        """Host-side periodic checkpoint write; called by an ordered jax.debug.callback."""
+        nnx.update(agent, params_state)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        name = f"{run_name}_{timestamp}_{tag}{float(score):.2f}_step{int(step)}.ckpt"
+        path = checkpoint_dir / name
+        with open(path, "wb") as f:
+            pickle.dump(nnx.state(agent, nnx.Param), f)
+        print(
+            f"Periodic checkpoint (step {int(step)}, {metric} {float(score):.2f}) saved to {path}"
+        )
 
     def train_iteration(carry: tuple, iter_idx: Array) -> tuple[tuple, dict]:
         params, opt_state, env, obs, prev_done, rng, ep_ret, ep_len, best_params, best_score = carry
@@ -433,6 +457,15 @@ def train_ppo(
                 ),
                 lambda: None,
             )
+        if checkpoint_live:
+            should_save = ((iter_idx + 1) % save_every) == 0
+            jax.lax.cond(
+                should_save,
+                lambda: jax.debug.callback(
+                    _save_checkpoint, (iter_idx + 1) * args.batch_size, params, score, ordered=True
+                ),
+                lambda: None,
+            )
 
         new_carry = (
             params,
@@ -492,8 +525,6 @@ def train_ppo(
     model_path = None
     if checkpoint_dir is not None:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        tag = "g" if n_gates is not None else "r"
-        metric = "gates-passed" if n_gates is not None else "return"
         model_path = checkpoint_dir / f"{run_name}_{timestamp}_{tag}{best_score:.2f}_best.ckpt"
         nnx.update(agent, best_params)
         with open(model_path, "wb") as f:
