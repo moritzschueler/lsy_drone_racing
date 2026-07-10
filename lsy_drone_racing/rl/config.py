@@ -11,9 +11,12 @@ class Args:
     seed: int = 42
     jax_device: str = "gpu"
     wandb_project_name: str = "maadr"
-    wandb_entity: str = "maad-flies"
+    wandb_entity: str = None
     console_log_interval: int = 10
     wandb_log_interval: int = 1
+    checkpoint_save_interval: int = 50_000_000
+    """save a periodic checkpoint every this many global steps, in addition to the best checkpoint
+    saved at the end of training. 0 disables periodic checkpointing (only the best is saved)."""
 
     # Algorithm specific arguments
     total_timesteps: int = 1_500_000
