@@ -8,13 +8,12 @@ buffer threaded through the rollout scan carry (no host round-trips): every
 ``opponent_snapshot_interval`` steps the current ego params are written into a rotating slot, and
 each episode samples a slot as that env's opponent. See the ``[[multi-agent-integration-plan]]``.
 
-Scope note: this cut is **self-play only**. The ego observes the nearest opponent's ego-relative,
-body-frame position and velocity (``include_opponent_obs``, on by default; see
-``RelativeRacingObs``/``_opponent_body_frame``). Heterogeneous opponents (PID / fixed
-trajectory-followers via ``lax.switch`` dispatch) and the competition/downwash reward shaping are
-deliberately deferred to later phases and are NOT wired here -- they would be dead config today. The
-``MultiAgentRacingArgs`` below carries only knobs that are actually consumed by the self-play
-pipeline.
+Scope note: this cut is **self-play only**, with 1v1 competition reward shaping. The ego observes
+the nearest opponent's ego-relative, body-frame position and velocity (``include_opponent_obs``, on
+by default; see ``RelativeRacingObs``/``_opponent_body_frame``), and additionally receives the
+``CompetitionReward`` shaping (rank / segment-lead / proximity / downwash / victory), ported from
+the host-side ``OpponentWrapper``. Heterogeneous opponents (PID / fixed trajectory-followers via
+``lax.switch`` dispatch) are deliberately deferred to later phases and are NOT wired here.
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ from lsy_drone_racing.rl.tasks.single_agent_racing import (
     RacingArgs,
     build_racing_reward,
 )
+from lsy_drone_racing.rl.wrappers.competition_reward import CompetitionReward
 from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, RelativeRacingObs
 from lsy_drone_racing.rl.wrappers.racing_env import MultiRacingEnv
 from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, NormalizeActions, ZeroYaw
@@ -63,12 +63,25 @@ class MultiAgentRacingArgs(RacingArgs):
     # Number of past-ego snapshots kept on device
     opponent_pool_size: int = 8
     # How often (in global steps) to snapshot the current ego params into the next ring-buffer slot
-    opponent_snapshot_interval: int = 1_000_000
+    opponent_snapshot_interval: int = 5_000_000
     # Global step at which opponents are activated
-    opponent_start_step: int = 10_000_000
+    opponent_start_step: int = 0
     # Recency-weighted sampling over the self-play pool: 0 = uniform over filled slots,
     # 1 = almost always the most recent.
     opponent_recency_bias: float = 0.7
+
+    # -- Competition reward (ego vs. opponent shaping; see CompetitionReward) --
+    # Master switch: set False to fall back to plain progress-based racing reward only.
+    use_competition_reward: bool = True
+    competition_rank_coef: float = 1.0
+    competition_segment_lead_coef: float = 0.5
+    competition_proximity_coef: float = 1.0
+    competition_proximity_threshold: float = 0.1
+    competition_victory_coef: float = 50.0
+    competition_downwash_coef: float = 1.0
+    competition_downwash_base_radius: float = 0.2
+    competition_downwash_expansion: float = 0.5
+    competition_downwash_vertical_softening: float = 0.5
 
     # -- Warm start --
     # Optional path to a trained single-agent checkpoint to initialize the ego AND seed the whole
@@ -85,6 +98,11 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
     :class:`~lsy_drone_racing.rl.wrappers.racing_env.MultiRacingEnv` base: the ``n_drones`` axis is
     kept through the whole wrapper chain (drone 0 = trainable ego, drones ``1..`` = opponents), and
     the obs/action wrappers are told ``n_drones`` so their per-drone transforms map over that axis.
+
+    ``CompetitionReward`` is inserted right after ``LogRewardComponents`` and before
+    ``SpinUpRotors``/``RelativeRacingObs``: it needs the raw per-drone ``pos``/``target_gate`` and
+    the env-shared ``gates_pos`` that ``RelativeRacingObs`` later discards/transforms away, so it
+    must run upstream of it. It adds its shaped reward to the ego drone's (index 0) reward only.
 
     ``n_drones`` is determined by the loaded track config (``len(config.env.track.drones)``), so a
     multi-drone config must be selected on the CLI, e.g.
@@ -154,6 +172,21 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
         speed_coef=args.speed_coef,
         speed_threshold=args.speed_threshold,
     )
+    if args.use_competition_reward:
+        # Must run before RelativeRacingObs -- see CompetitionReward's module docstring.
+        env = CompetitionReward.create(
+            env,
+            n_drones=n_drones,
+            rank_coef=args.competition_rank_coef,
+            segment_lead_coef=args.competition_segment_lead_coef,
+            proximity_coef=args.competition_proximity_coef,
+            proximity_threshold=args.competition_proximity_threshold,
+            victory_coef=args.competition_victory_coef,
+            downwash_coef=args.competition_downwash_coef,
+            downwash_base_radius=args.competition_downwash_base_radius,
+            downwash_expansion=args.competition_downwash_expansion,
+            downwash_vertical_softening=args.competition_downwash_vertical_softening,
+        )
     env = SpinUpRotors.create(env, n_drones=n_drones)
     env = ActionPenalty.create(
         env,
