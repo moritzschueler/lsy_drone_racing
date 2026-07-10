@@ -11,7 +11,7 @@ class Args:
     seed: int = 42
     jax_device: str = "gpu"
     wandb_project_name: str = "maadr"
-    wandb_entity: str = "maad-flies"
+    wandb_entity: str = None
     console_log_interval: int = 10
     wandb_log_interval: int = 1
 
