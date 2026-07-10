@@ -16,9 +16,23 @@ parameter snapshots (``opponent_pool_size`` slots). Every ``opponent_snapshot_in
 current ego params are written into the next slot; each env samples a slot per episode as its
 opponent. The whole run is still one ``lax.scan`` over iterations.
 
-Deferred vs. the eventual design (documented so the gaps are explicit):
-  * ``opponent_start_step`` is not yet honoured -- opponents are active from step 0 (pure self-play
-    against the initial-then-improving policy). The pool is seeded with the initial ego params.
+``opponent_start_step`` gates two things, both via a single traced ``opponent_active`` boolean
+recomputed once per training iteration (``iter_idx * batch_size >= opponent_start_step``):
+  * the opponent's action -- before the threshold, drone 1 gets a frozen no-op/zero action instead
+    of a forward pass through the still-largely-random self-play pool (mirrors the host-side
+    ``OpponentWrapper``'s behavior for an inactive opponent);
+  * the competition-reward shaping (rank / segment-lead / proximity / downwash / victory) --
+    ``CompetitionReward`` always computes and adds these into ``reward[:, 0]`` (it has no notion of
+    training progress), so before the threshold the rollout strips them back out via the
+    ``rew/comp_*`` breakdown it logs in ``info``, leaving plain solo-racing reward. Meaningless
+    opponent-relative terms (e.g. "victory" against a stationary drone) would otherwise leak free
+    reward into the ego's early training.
+
+The self-play pool itself is *not* gated: it is seeded with the initial ego params and keeps
+snapshotting/filling from step 0 regardless, so a real (if still early) opponent is ready to go the
+moment ``opponent_active`` flips.
+
+Deferred vs. the eventual design (documented so the gap is explicit):
   * ``opponent_recency_bias`` is not yet applied -- pool slots are sampled uniformly over the filled
     slots. Recency weighting is a drop-in change to the sampling distribution.
 """
@@ -34,13 +48,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from drone_models.core import load_params
 from flax import nnx
 from jax import Array
 
 import wandb
+from lsy_drone_racing.envs.race_core import build_action_space
 from lsy_drone_racing.rl.agents.ppo_agent import Agent, _entropy, _log_prob
 from lsy_drone_racing.rl.config import Args
 from lsy_drone_racing.rl.git_provenance import pin_run_to_branch
+from lsy_drone_racing.rl.wrappers.trajectory_opponent import TrajectoryPID, build_trajectory_pid
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 from lsy_drone_racing.utils.utils import set_seeds
 
@@ -128,6 +145,40 @@ def train_ippo(
         else None
     )
 
+    # -- Scripted PID trajectory-follower opponents, mixed in with the self-play pool --
+    use_pid_opponents = (
+        getattr(args, "opponent_pid_prob_start", 0.0) > 0.0
+        or getattr(args, "opponent_pid_prob_end", 0.0) > 0.0
+    )
+    traj_pid: TrajectoryPID | None = None
+    if use_pid_opponents:
+        assert config.env.control_mode == "attitude", (
+            "opponent_pid_prob_start/opponent_pid_prob_end mixing needs an attitude-control track "
+            f"config (physical roll/pitch/yaw/thrust setpoints), got control_mode="
+            f"'{config.env.control_mode}'."
+        )
+        drone_mass = load_params(config.sim.physics, config.sim.drone_model)["mass"]
+        action_space = build_action_space(config.env.control_mode, config.sim.drone_model)
+        traj_pid = build_trajectory_pid(
+            start_pos=np.asarray(config.env.track.drones[1]["pos"]),
+            drone_mass=drone_mass,
+            freq=config.env.freq,
+            control_mode=config.env.control_mode,
+            action_low=np.asarray(action_space.low),
+            action_high=np.asarray(action_space.high),
+            t_total=args.opponent_pid_t_total,
+            kp=args.opponent_pid_kp,
+            ki=args.opponent_pid_ki,
+            kd=args.opponent_pid_kd,
+            ki_range=args.opponent_pid_ki_range,
+        )
+        print(
+            f"Scripted PID opponents: prob {args.opponent_pid_prob_start:.2f} -> "
+            f"{args.opponent_pid_prob_end:.2f} over {args.opponent_pid_decay_steps} steps, speed "
+            f"in [{args.opponent_pid_speed_min}, {args.opponent_pid_speed_max}]x "
+            f"({args.opponent_pid_t_total}s nominal single pass)."
+        )
+
     # -- Agent + optimizer (functional) -- identical to ppo.py: the ego Agent is per-drone. --
     agent = Agent(obs_dim, action_dim, rngs=nnx.Rngs(args.seed))
     # Optional warm start: load a trained (single-agent) checkpoint into the ego. The seeded
@@ -154,12 +205,14 @@ def train_ippo(
     # -- Self-play pool config --
     pool_size = int(args.opponent_pool_size)
     batch_size = args.batch_size
+    opponent_start_step = int(args.opponent_start_step)
     # Snapshot cadence in iterations (each iteration advances the global step by batch_size).
     snapshot_every = max(1, round(args.opponent_snapshot_interval / batch_size))
     print(
         f"Self-play pool: {pool_size} slots, snapshot every {snapshot_every} iterations "
         f"(~{snapshot_every * batch_size} steps), uniform sampling over filled slots."
     )
+    print(f"Opponent activates at global step {opponent_start_step} (action + competition reward).")
 
     def forward(params: nnx.State, obs: Array) -> tuple[Array, Array, Array]:
         """Param-pure forward pass: (action_mean, log_std, value)."""
@@ -273,6 +326,23 @@ def train_ippo(
     )
     max_keys = sorted(k for k in _probe_info if isinstance(k, str) and k.startswith("max/"))
     denom = float(args.num_steps * num_envs)
+    # Static (python-level) list of the competition-reward breakdown keys CompetitionReward logs,
+    # used to strip its shaped reward back out of the ego reward before opponent_start_step. Empty
+    # if CompetitionReward isn't in the wrapper stack (use_competition_reward=False) -- gating then
+    # becomes a no-op on the reward side but the opponent-action gate below still applies.
+    comp_keys = [k for k in metric_keys if k.startswith("rew/comp_")]
+
+    def pid_actions(env: Wrapper, traj_t: Array, i_error: Array) -> tuple[Array, Array]:
+        """Normalized PID actions for every opponent slot, from the env's raw (unwrapped) state.
+
+        Reads world ``pos``/``vel``/``quat`` directly off the innermost sim state (bypassing the
+        flattened/relative observation the policy sees, which drops absolute position) -- the same
+        pattern ``SpinUpRotors`` uses. Returns ``(action_norm, new_i_error)``, both ``(E, k, ...)``.
+        """
+        states = env.unwrapped.data.sim_data.states
+        opp_pos, opp_vel, opp_quat = states.pos[:, 1:], states.vel[:, 1:], states.quat[:, 1:]
+        action_phys, i_error = traj_pid.action(opp_pos, opp_vel, opp_quat, traj_t, i_error)
+        return traj_pid.normalize(action_phys), i_error
 
     def rollout(
         params: nnx.State,
@@ -286,27 +356,60 @@ def train_ippo(
         opp_idx: Array,
         ep_step: Array,
         finish_step: Array,
+        opponent_active: Array,
+        traj_state: tuple,
+        pid_prob_now: Array | None,
     ) -> tuple[tuple, dict]:
         """One rollout of ``num_steps``; only ego (drone 0) transitions are stored for the update.
 
         ``obs`` is the full ``(num_envs, n_drones, obs_dim)`` observation. Each step runs the ego
-        policy on drone 0 and the frozen pool opponents on drones 1.., concatenates the actions, and
-        steps the multi-drone env. Opponent slot indices ``opp_idx`` are resampled per env whenever
-        the ego episode ends.
+        policy on drone 0 and, for each opponent slot, either the frozen self-play pool or the
+        scripted PID trajectory-follower (see ``pid_actions``), concatenates the actions, and steps
+        the multi-drone env. Opponent slot indices ``opp_idx`` and, when ``use_pid_opponents``, the
+        per-slot PID phase/speed/integral-error/behavior-choice in ``traj_state`` are resampled per
+        env whenever the ego episode ends.
+
+        ``opponent_active`` (scalar bool, constant for the duration of this rollout) gates both the
+        opponent's action -- a frozen no-op action is substituted while inactive, for *either*
+        opponent behavior -- and the competition-reward shaping added into ``reward[:, 0]`` by
+        ``CompetitionReward``, which is stripped back out via the ``rew/comp_*`` breakdown in
+        ``info`` while inactive.
         """
 
         def step(carry: tuple, _: Any) -> tuple[tuple, dict]:
-            env, obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step = carry
+            env, obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step, traj_state = carry
             ego_obs = obs[:, 0]  # (E, obs_dim)
             opp_obs = obs[:, 1:]  # (E, k, obs_dim)
 
             rng, akey = jax.random.split(rng)
             ego_action, logprob, value = policy_step(params, ego_obs, akey)  # (E, act_dim)
-            opp_action = opponent_actions(pool, opp_obs, opp_idx)  # (E, k, act_dim)
+            opp_action_pool = opponent_actions(pool, opp_obs, opp_idx)  # (E, k, act_dim)
+            if use_pid_opponents:
+                traj_t, traj_speed, traj_i_error, is_pid_opp = traj_state
+                pid_action, traj_i_error = pid_actions(env, traj_t, traj_i_error)
+                opp_action_selfplay = jnp.where(
+                    opponent_active, opp_action_pool, jnp.zeros_like(opp_action_pool)
+                )
+                use_pid = is_pid_opp & opponent_active
+                opp_action = jnp.where(use_pid[..., None], pid_action, opp_action_selfplay)
+                traj_t = traj_t + traj_speed / config.env.freq  # advance virtual trajectory time
+            else:
+                # Before opponent_start_step, freeze the opponent to a no-op action instead of
+                # racing against a still-largely-random self-play snapshot (mirrors
+                # OpponentWrapper's inactive-opponent behavior).
+                opp_action = jnp.where(
+                    opponent_active, opp_action_pool, jnp.zeros_like(opp_action_pool)
+                )
             action = jnp.concatenate([ego_action[:, None], opp_action], axis=1)  # (E, D, act_dim)
 
             env, (next_obs, reward, term, trunc, info) = env.step(env, action)
-            ego_reward = reward[:, 0]
+            # CompetitionReward (if present) always adds its shaped components into reward[:, 0];
+            # strip them back out before opponent_start_step so the ego trains on plain solo-racing
+            # reward until the opponent is actually active (opponent-relative terms are meaningless
+            # against a frozen no-op drone, and would otherwise leak free/spurious reward).
+            comp_reward = sum((info[k] for k in comp_keys), jnp.zeros_like(reward[:, 0]))
+            ego_reward_solo = reward[:, 0] - comp_reward
+            ego_reward = jnp.where(opponent_active, reward[:, 0], ego_reward_solo)
             done = jnp.logical_or(term[:, 0], trunc[:, 0])  # ego episode boundary
             donef = done.astype(jnp.float32)
 
@@ -322,6 +425,8 @@ def train_ippo(
             # Drones are ranked lexicographically: more gates passed wins; if tied on gates and both
             # finished the whole track (target_gate == -1), the earlier finish step wins. The ego
             # (drone 0) wins the episode only if it strictly beats every opponent (ties are not wins).
+            # Note: while opponent_active is False the opponent is frozen in place, so ego "wins"
+            # trivially -- win_rate/gates_passed metrics are informative only once activated.
             all_target_gate = info["target_gate"]  # (E, D)
             finished = all_target_gate == -1  # completed the whole track (crashes keep target >= 0)
             new_ep_step = ep_step + 1  # within-episode step counter (per env)
@@ -365,13 +470,40 @@ def train_ippo(
             rng, skey = jax.random.split(rng)
             resampled = jax.random.randint(skey, opp_idx.shape, 0, filled)
             opp_idx = jnp.where(done[:, None], resampled, opp_idx)
-            return (env, next_obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step), out
+            if use_pid_opponents:
+                # Resample the PID phase/speed/behavior-choice at the same episode boundary; the
+                # integral error always resets there too (it's meaningless across episodes).
+                reset = done[:, None]  # (E, 1), broadcasts over the opponent-slot axis
+                rng, speed_key, pid_key = jax.random.split(rng, 3)
+                resampled_speed = jax.random.uniform(
+                    speed_key,
+                    traj_speed.shape,
+                    minval=args.opponent_pid_speed_min,
+                    maxval=args.opponent_pid_speed_max,
+                )
+                resampled_is_pid = jax.random.bernoulli(pid_key, pid_prob_now, is_pid_opp.shape)
+                traj_t = jnp.where(reset, 0.0, traj_t)
+                traj_speed = jnp.where(reset, resampled_speed, traj_speed)
+                traj_i_error = jnp.where(reset[..., None], 0.0, traj_i_error)
+                is_pid_opp = jnp.where(reset, resampled_is_pid, is_pid_opp)
+                traj_state = (traj_t, traj_speed, traj_i_error, is_pid_opp)
+            return (
+                env,
+                next_obs,
+                rng,
+                ep_ret,
+                ep_len,
+                opp_idx,
+                ep_step,
+                finish_step,
+                traj_state,
+            ), out
 
-        carry0 = (env, obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step)
-        (env, last_obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step), outs = jax.lax.scan(
-            step, carry0, None, length=args.num_steps
+        carry0 = (env, obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step, traj_state)
+        (env, last_obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step, traj_state), outs = (
+            jax.lax.scan(step, carry0, None, length=args.num_steps)
         )
-        return (env, last_obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step), outs
+        return (env, last_obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step, traj_state), outs
 
     def update_epochs(
         params: nnx.State, opt_state: Any, flat_data: tuple, rng: Array, ent_coef: Array
@@ -458,12 +590,41 @@ def train_ippo(
             best_score,
             ep_step,
             finish_step,
+            traj_state,
         ) = carry
 
-        # -- Rollout (ego trained, opponents frozen from the pool) --
+        # -- Opponent activation gate: static threshold, traced comparison (iter_idx is the scan
+        # loop var) so it stays a single compiled program across the whole run. --
+        global_step_at_iter = iter_idx * args.batch_size
+        opponent_active = global_step_at_iter >= opponent_start_step
+
+        # -- Scripted-PID mixing fraction: linear anneal, held constant at *_end afterwards. --
+        pid_prob_now = None
+        if use_pid_opponents:
+            frac = jnp.clip(global_step_at_iter / max(args.opponent_pid_decay_steps, 1), 0.0, 1.0)
+            pid_prob_now = args.opponent_pid_prob_start + frac * (
+                args.opponent_pid_prob_end - args.opponent_pid_prob_start
+            )
+
+        # -- Rollout (ego trained, opponents frozen from the pool / scripted-PID once active) --
         rng, roll_rng = jax.random.split(rng)
-        (env, last_obs, _, ep_ret, ep_len, opp_idx, ep_step, finish_step), outs = rollout(
-            params, pool, filled, env, obs, roll_rng, ep_ret, ep_len, opp_idx, ep_step, finish_step
+        (env, last_obs, _, ep_ret, ep_len, opp_idx, ep_step, finish_step, traj_state), outs = (
+            rollout(
+                params,
+                pool,
+                filled,
+                env,
+                obs,
+                roll_rng,
+                ep_ret,
+                ep_len,
+                opp_idx,
+                ep_step,
+                finish_step,
+                opponent_active,
+                traj_state,
+                pid_prob_now,
+            )
         )
 
         # -- GAE (ego only) --
@@ -494,6 +655,8 @@ def train_ippo(
         params, opt_state, auxs = update_epochs(params, opt_state, flat_data, upd_rng, ent_coef_now)
 
         # -- Self-play snapshot: write current ego params into the pool on the snapshot cadence --
+        # Unconditional on opponent_active -- the pool keeps filling from step 0 so a real (if
+        # still-early) opponent is ready the moment activation flips.
         is_snapshot = ((iter_idx + 1) % snapshot_every) == 0
         pool, write_ptr, filled = jax.lax.cond(
             is_snapshot,
@@ -536,6 +699,7 @@ def train_ippo(
             "loss/explained_variance": explained_var,
             "charts/ent_coef": ent_coef_now,
             "charts/pool_filled": filled.astype(jnp.float32),
+            "charts/opponent_active": opponent_active.astype(jnp.float32),
             "train/reward": ep_return,
             "train/episode_length": ep_length,
             "train/gates_passed": gates_passed,
@@ -543,6 +707,8 @@ def train_ippo(
             "train/win_rate": win_rate,
             best_key: best_score,
         }
+        if use_pid_opponents:
+            metrics["charts/opponent_pid_prob"] = pid_prob_now
         for k in metric_keys:
             name = f"reward/{k[len('rew/') :]}" if k.startswith("rew/") else k
             metrics[name] = jnp.sum(outs["metrics"][k]) / denom
@@ -592,6 +758,7 @@ def train_ippo(
             best_score,
             ep_step,
             finish_step,
+            traj_state,
         )
         return new_carry, metrics
 
@@ -605,6 +772,22 @@ def train_ippo(
     )
     rng, idx_rng = jax.random.split(rng)
     opp_idx0 = jnp.zeros((num_envs, n_opponents), dtype=jnp.int32)  # all use slot 0 initially
+    traj_state0 = ()
+    if use_pid_opponents:
+        rng, speed_key, pid_key = jax.random.split(rng, 3)
+        traj_state0 = (
+            jnp.zeros((num_envs, n_opponents)),  # traj_t (virtual elapsed trajectory time)
+            jax.random.uniform(
+                speed_key,
+                (num_envs, n_opponents),
+                minval=args.opponent_pid_speed_min,
+                maxval=args.opponent_pid_speed_max,
+            ),  # traj_speed
+            jnp.zeros((num_envs, n_opponents, 3)),  # traj_i_error
+            jax.random.bernoulli(
+                pid_key, args.opponent_pid_prob_start, (num_envs, n_opponents)
+            ),  # is_pid_opp
+        )
     init_carry = (
         params,
         opt_state,
@@ -624,6 +807,7 @@ def train_ippo(
         -jnp.ones(
             (num_envs, n_drones), dtype=jnp.int32
         ),  # finish_step (per drone; -1 = unfinished)
+        traj_state0,
     )
     print(f"Compiling and running {args.num_iterations} iterations as one scan...")
     final_carry, metrics_stack = jax.lax.scan(
@@ -657,6 +841,8 @@ def train_ippo(
             pickle.dump(nnx.state(agent, nnx.Param), f)
         print(f"Best model (mean {metric} {best_score:.2f}) saved to {model_path}")
     envs.close()
+    if wandb_enabled:
+        wandb.finish()
     return model_path
 
 
