@@ -16,9 +16,23 @@ parameter snapshots (``opponent_pool_size`` slots). Every ``opponent_snapshot_in
 current ego params are written into the next slot; each env samples a slot per episode as its
 opponent. The whole run is still one ``lax.scan`` over iterations.
 
-Deferred vs. the eventual design (documented so the gaps are explicit):
-  * ``opponent_start_step`` is not yet honoured -- opponents are active from step 0 (pure self-play
-    against the initial-then-improving policy). The pool is seeded with the initial ego params.
+``opponent_start_step`` gates two things, both via a single traced ``opponent_active`` boolean
+recomputed once per training iteration (``iter_idx * batch_size >= opponent_start_step``):
+  * the opponent's action -- before the threshold, drone 1 gets a frozen no-op/zero action instead
+    of a forward pass through the still-largely-random self-play pool (mirrors the host-side
+    ``OpponentWrapper``'s behavior for an inactive opponent);
+  * the competition-reward shaping (rank / segment-lead / proximity / downwash / victory) --
+    ``CompetitionReward`` always computes and adds these into ``reward[:, 0]`` (it has no notion of
+    training progress), so before the threshold the rollout strips them back out via the
+    ``rew/comp_*`` breakdown it logs in ``info``, leaving plain solo-racing reward. Meaningless
+    opponent-relative terms (e.g. "victory" against a stationary drone) would otherwise leak free
+    reward into the ego's early training.
+
+The self-play pool itself is *not* gated: it is seeded with the initial ego params and keeps
+snapshotting/filling from step 0 regardless, so a real (if still early) opponent is ready to go the
+moment ``opponent_active`` flips.
+
+Deferred vs. the eventual design (documented so the gap is explicit):
   * ``opponent_recency_bias`` is not yet applied -- pool slots are sampled uniformly over the filled
     slots. Recency weighting is a drop-in change to the sampling distribution.
 """
@@ -154,12 +168,14 @@ def train_ippo(
     # -- Self-play pool config --
     pool_size = int(args.opponent_pool_size)
     batch_size = args.batch_size
+    opponent_start_step = int(args.opponent_start_step)
     # Snapshot cadence in iterations (each iteration advances the global step by batch_size).
     snapshot_every = max(1, round(args.opponent_snapshot_interval / batch_size))
     print(
         f"Self-play pool: {pool_size} slots, snapshot every {snapshot_every} iterations "
         f"(~{snapshot_every * batch_size} steps), uniform sampling over filled slots."
     )
+    print(f"Opponent activates at global step {opponent_start_step} (action + competition reward).")
 
     def forward(params: nnx.State, obs: Array) -> tuple[Array, Array, Array]:
         """Param-pure forward pass: (action_mean, log_std, value)."""
@@ -273,6 +289,11 @@ def train_ippo(
     )
     max_keys = sorted(k for k in _probe_info if isinstance(k, str) and k.startswith("max/"))
     denom = float(args.num_steps * num_envs)
+    # Static (python-level) list of the competition-reward breakdown keys CompetitionReward logs,
+    # used to strip its shaped reward back out of the ego reward before opponent_start_step. Empty
+    # if CompetitionReward isn't in the wrapper stack (use_competition_reward=False) -- gating then
+    # becomes a no-op on the reward side but the opponent-action gate below still applies.
+    comp_keys = [k for k in metric_keys if k.startswith("rew/comp_")]
 
     def rollout(
         params: nnx.State,
@@ -286,6 +307,7 @@ def train_ippo(
         opp_idx: Array,
         ep_step: Array,
         finish_step: Array,
+        opponent_active: Array,
     ) -> tuple[tuple, dict]:
         """One rollout of ``num_steps``; only ego (drone 0) transitions are stored for the update.
 
@@ -293,6 +315,11 @@ def train_ippo(
         policy on drone 0 and the frozen pool opponents on drones 1.., concatenates the actions, and
         steps the multi-drone env. Opponent slot indices ``opp_idx`` are resampled per env whenever
         the ego episode ends.
+
+        ``opponent_active`` (scalar bool, constant for the duration of this rollout) gates both the
+        opponent's action -- a frozen no-op action is substituted while inactive -- and the
+        competition-reward shaping added into ``reward[:, 0]`` by ``CompetitionReward``, which is
+        stripped back out via the ``rew/comp_*`` breakdown in ``info`` while inactive.
         """
 
         def step(carry: tuple, _: Any) -> tuple[tuple, dict]:
@@ -302,11 +329,23 @@ def train_ippo(
 
             rng, akey = jax.random.split(rng)
             ego_action, logprob, value = policy_step(params, ego_obs, akey)  # (E, act_dim)
-            opp_action = opponent_actions(pool, opp_obs, opp_idx)  # (E, k, act_dim)
+            opp_action_pool = opponent_actions(pool, opp_obs, opp_idx)  # (E, k, act_dim)
+            # Before opponent_start_step, freeze the opponent to a no-op action instead of racing
+            # against a still-largely-random self-play snapshot (mirrors OpponentWrapper's
+            # inactive-opponent behavior).
+            opp_action = jnp.where(
+                opponent_active, opp_action_pool, jnp.zeros_like(opp_action_pool)
+            )
             action = jnp.concatenate([ego_action[:, None], opp_action], axis=1)  # (E, D, act_dim)
 
             env, (next_obs, reward, term, trunc, info) = env.step(env, action)
-            ego_reward = reward[:, 0]
+            # CompetitionReward (if present) always adds its shaped components into reward[:, 0];
+            # strip them back out before opponent_start_step so the ego trains on plain solo-racing
+            # reward until the opponent is actually active (opponent-relative terms are meaningless
+            # against a frozen no-op drone, and would otherwise leak free/spurious reward).
+            comp_reward = sum((info[k] for k in comp_keys), jnp.zeros_like(reward[:, 0]))
+            ego_reward_solo = reward[:, 0] - comp_reward
+            ego_reward = jnp.where(opponent_active, reward[:, 0], ego_reward_solo)
             done = jnp.logical_or(term[:, 0], trunc[:, 0])  # ego episode boundary
             donef = done.astype(jnp.float32)
 
@@ -322,6 +361,8 @@ def train_ippo(
             # Drones are ranked lexicographically: more gates passed wins; if tied on gates and both
             # finished the whole track (target_gate == -1), the earlier finish step wins. The ego
             # (drone 0) wins the episode only if it strictly beats every opponent (ties are not wins).
+            # Note: while opponent_active is False the opponent is frozen in place, so ego "wins"
+            # trivially -- win_rate/gates_passed metrics are informative only once activated.
             all_target_gate = info["target_gate"]  # (E, D)
             finished = all_target_gate == -1  # completed the whole track (crashes keep target >= 0)
             new_ep_step = ep_step + 1  # within-episode step counter (per env)
@@ -460,10 +501,26 @@ def train_ippo(
             finish_step,
         ) = carry
 
-        # -- Rollout (ego trained, opponents frozen from the pool) --
+        # -- Opponent activation gate: static threshold, traced comparison (iter_idx is the scan
+        # loop var) so it stays a single compiled program across the whole run. --
+        global_step_at_iter = iter_idx * args.batch_size
+        opponent_active = global_step_at_iter >= opponent_start_step
+
+        # -- Rollout (ego trained, opponents frozen from the pool once active) --
         rng, roll_rng = jax.random.split(rng)
         (env, last_obs, _, ep_ret, ep_len, opp_idx, ep_step, finish_step), outs = rollout(
-            params, pool, filled, env, obs, roll_rng, ep_ret, ep_len, opp_idx, ep_step, finish_step
+            params,
+            pool,
+            filled,
+            env,
+            obs,
+            roll_rng,
+            ep_ret,
+            ep_len,
+            opp_idx,
+            ep_step,
+            finish_step,
+            opponent_active,
         )
 
         # -- GAE (ego only) --
@@ -494,6 +551,8 @@ def train_ippo(
         params, opt_state, auxs = update_epochs(params, opt_state, flat_data, upd_rng, ent_coef_now)
 
         # -- Self-play snapshot: write current ego params into the pool on the snapshot cadence --
+        # Unconditional on opponent_active -- the pool keeps filling from step 0 so a real (if
+        # still-early) opponent is ready the moment activation flips.
         is_snapshot = ((iter_idx + 1) % snapshot_every) == 0
         pool, write_ptr, filled = jax.lax.cond(
             is_snapshot,
@@ -536,6 +595,7 @@ def train_ippo(
             "loss/explained_variance": explained_var,
             "charts/ent_coef": ent_coef_now,
             "charts/pool_filled": filled.astype(jnp.float32),
+            "charts/opponent_active": opponent_active.astype(jnp.float32),
             "train/reward": ep_return,
             "train/episode_length": ep_length,
             "train/gates_passed": gates_passed,
