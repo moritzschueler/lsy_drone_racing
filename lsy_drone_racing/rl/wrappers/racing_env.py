@@ -23,6 +23,8 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import flax.struct as struct
+import numpy as np
+from crazyflow.sim.visualize import draw_points
 from gymnasium import spaces
 from gymnasium.vector.utils import batch_space
 from jax import Array
@@ -30,6 +32,11 @@ from jax import Array
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
 from lsy_drone_racing.envs.multi_drone_race import VecMultiDroneRaceEnv
 from lsy_drone_racing.envs.race_core import EnvData
+
+# Marker colors for MultiRacingEnv.render(): drone 0 (the trainable ego) vs drones 1.. (opponents,
+# self-play or scripted-PID) so the two are visually distinguishable in the viewer.
+_EGO_MARKER_RGBA = np.array([0.0, 1.0, 0.0, 1.0])  # green
+_OPPONENT_MARKER_RGBA = np.array([1.0, 0.0, 0.0, 1.0])  # red
 
 
 @struct.dataclass
@@ -169,12 +176,22 @@ class MultiRacingEnv(struct.PyTreeNode):
         return self.data.steps
 
     def render(self) -> None:
-        """Render the current functional state via the captured gym env's viewer (if kept)."""
+        """Render the current functional state, with a color marker above each drone.
+
+        The viewer only ever shows world 0. Drone 0 (the trainable ego) gets a green marker;
+        drones 1.. (opponents, self-play or scripted-PID) get a red marker, so the two are
+        distinguishable at a glance -- the drones themselves are otherwise identical.
+        """
         if self.base_env is None:
             raise RuntimeError(
                 "MultiRacingEnv.render() needs a live gym base_env, but none was captured."
             )
         self.base_env.data = self.data
+        # Markers must be (re-)added before every sim.render() call -- they don't persist.
+        marker_pos = np.asarray(self.data.sim_data.states.pos[0]) + np.array([0.0, 0.0, 0.12])
+        draw_points(self.base_env.sim, marker_pos[:1], rgba=_EGO_MARKER_RGBA, size=0.04)
+        if self.n_drones > 1:
+            draw_points(self.base_env.sim, marker_pos[1:], rgba=_OPPONENT_MARKER_RGBA, size=0.04)
         self.base_env.render()
 
     def close(self) -> None:
