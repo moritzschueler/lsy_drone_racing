@@ -12,7 +12,11 @@ from jax import Array
 from lsy_drone_racing.envs.race_core import build_action_space
 from lsy_drone_racing.rl.agents.ppo_agent import Agent
 from lsy_drone_racing.rl.tasks import get_task
-from lsy_drone_racing.rl.wrappers.trajectory_opponent import build_trajectory_pid
+from lsy_drone_racing.rl.wrappers.trajectory_opponent import (
+    SPAWN_TIME_MARGIN,
+    build_trajectory_pid,
+    teleport_opponents,
+)
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 from lsy_drone_racing.utils import load_config
 
@@ -31,6 +35,7 @@ def main(
     checkpoint: str | None = None,
     opponent: str = "self_play",
     opponent_pid_speed: float = 1.0,
+    opponent_pid_start_frac: float = 0.0,
     **kwargs: Any,
 ):
     """Render the simulation for a single trained PPO agent on the given task.
@@ -45,6 +50,10 @@ def main(
             needs ``control_mode == "attitude"``. Ignored for single-drone tasks.
         opponent_pid_speed: Speed multiplier for the PID opponent (1.0 == the nominal ~18s single
             pass). Only used when ``opponent == "pid"``.
+        opponent_pid_start_frac: Deterministic fraction of the trajectory at which the PID
+            opponent starts (0.0 == the pad, like training's random mid-track spawns but fixed for
+            visual inspection; clamped to stay before the last gate). Only used when
+            ``opponent == "pid"``.
     """
     assert opponent in ("self_play", "pid"), f"Unknown opponent mode '{opponent}'."
     task_spec = get_task(task)
@@ -95,6 +104,7 @@ def main(
             control_mode=env_config.env.control_mode,
             action_low=np.asarray(action_space.low),
             action_high=np.asarray(action_space.high),
+            gates=env_config.env.track.gates,
         )
         print(f"Opponent(s): scripted PID trajectory-follower, speed {opponent_pid_speed}x.")
 
@@ -131,10 +141,23 @@ def main(
         return env, obs, terminated, truncated, traj_t, i_error
 
     eval_env, (obs, _) = eval_env.reset(eval_env, seed=args.seed)
-    eval_env.render()
-    done = False
     traj_t = jnp.zeros((1, n_drones - 1))
     i_error = jnp.zeros((1, n_drones - 1, 3))
+    if traj_pid is not None and opponent_pid_start_frac > 0.0:
+        # Place the PID opponent(s) mid-track at the requested trajectory fraction, mirroring
+        # training's random mid-track spawns but deterministic for visual inspection.
+        spawn_t_max = float(traj_pid.gate_times[-1]) - SPAWN_TIME_MARGIN
+        traj_t = jnp.full_like(traj_t, min(opponent_pid_start_frac * traj_pid.t_total, spawn_t_max))
+        eval_env = teleport_opponents(
+            eval_env,
+            traj_pid,
+            traj_t,
+            jnp.full_like(traj_t, opponent_pid_speed),
+            jnp.ones_like(traj_t, dtype=bool),
+        )
+        print(f"PID opponent starts mid-track at t0 = {float(traj_t[0, 0]):.2f}s.")
+    eval_env.render()
+    done = False
 
     while not done:
         if traj_pid is not None:

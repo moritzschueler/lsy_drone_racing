@@ -57,7 +57,12 @@ from lsy_drone_racing.envs.race_core import build_action_space
 from lsy_drone_racing.rl.agents.ppo_agent import Agent, _entropy, _log_prob
 from lsy_drone_racing.rl.config import Args
 from lsy_drone_racing.rl.git_provenance import pin_run_to_branch
-from lsy_drone_racing.rl.wrappers.trajectory_opponent import TrajectoryPID, build_trajectory_pid
+from lsy_drone_racing.rl.wrappers.trajectory_opponent import (
+    SPAWN_TIME_MARGIN,
+    TrajectoryPID,
+    build_trajectory_pid,
+    teleport_opponents,
+)
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 from lsy_drone_racing.utils.utils import set_seeds
 
@@ -171,6 +176,7 @@ def train_ippo(
             ki=args.opponent_pid_ki,
             kd=args.opponent_pid_kd,
             ki_range=args.opponent_pid_ki_range,
+            gates=config.env.track.gates,
         )
         print(
             f"Scripted PID opponents: prob {args.opponent_pid_prob_start:.2f} -> "
@@ -178,6 +184,38 @@ def train_ippo(
             f"in [{args.opponent_pid_speed_min}, {args.opponent_pid_speed_max}]x "
             f"({args.opponent_pid_t_total}s nominal single pass)."
         )
+
+    # -- Random mid-track spawn for PID opponents (see teleport_opponents) --
+    # Static (python-level) gate: when disabled (frac_max == 0), no teleport code is traced and
+    # the traj_t reset below keeps the literal 0.0 -- byte-identical rollout to the pad-start
+    # behavior.
+    use_random_pid_start = (
+        use_pid_opponents and getattr(args, "opponent_pid_start_frac_max", 0.0) > 0.0
+    )
+    if use_random_pid_start:
+        assert 0.0 <= args.opponent_pid_start_frac_min <= args.opponent_pid_start_frac_max <= 1.0, (
+            "opponent_pid_start_frac_min/max must satisfy 0 <= min <= max <= 1, got "
+            f"[{args.opponent_pid_start_frac_min}, {args.opponent_pid_start_frac_max}]."
+        )
+        # Never spawn past (or within a margin of) the last gate: the opponent must always have at
+        # least one gate left, so it can't start the episode already "finished" (which would break
+        # victory/win-rate semantics).
+        spawn_t_max = float(traj_pid.gate_times[-1]) - SPAWN_TIME_MARGIN
+        print(
+            f"PID opponents spawn mid-track: t0 ~ U({args.opponent_pid_start_frac_min:.2f}, "
+            f"{args.opponent_pid_start_frac_max:.2f}) * {args.opponent_pid_t_total}s, clamped to "
+            f"<= {spawn_t_max:.2f}s (last gate pass at {float(traj_pid.gate_times[-1]):.2f}s)."
+        )
+
+        def sample_spawn_t(key: Array, shape: tuple[int, ...]) -> Array:
+            """Sample per-slot virtual spawn times along the opponent trajectory."""
+            frac = jax.random.uniform(
+                key,
+                shape,
+                minval=args.opponent_pid_start_frac_min,
+                maxval=args.opponent_pid_start_frac_max,
+            )
+            return jnp.minimum(frac * traj_pid.t_total, spawn_t_max)
 
     # -- Agent + optimizer (functional) -- identical to ppo.py: the ego Agent is per-drone. --
     agent = Agent(obs_dim, action_dim, rngs=nnx.Rngs(args.seed))
@@ -406,7 +444,23 @@ def train_ippo(
                 )
             action = jnp.concatenate([ego_action[:, None], opp_action], axis=1)  # (E, D, act_dim)
 
+            if use_random_pid_start:
+                # The env uses NEXT_STEP autoreset keyed on the *pre-step* marked_for_reset flags
+                # (race_core.build_step_fn), so these are exactly the envs whose reset fires inside
+                # the env.step below.
+                will_reset = env.unwrapped.data.marked_for_reset  # (E,)
             env, (next_obs, reward, term, trunc, info) = env.step(env, action)
+            if use_random_pid_start:
+                # Move freshly reset PID opponents from the pad onto the spline at their (just
+                # resampled) random start time. traj_t/traj_speed/is_pid_opp are the new episode's
+                # draws: resampled at the previous step's ego-done, which necessarily preceded this
+                # reset (a marked env has all drones settled, ego included). traj_t is post-advance
+                # here, matching the PID's next-step target exactly. Self-play slots keep the pad
+                # spawn. next_obs still shows the opponent on the pad for this one frame -- see
+                # teleport_opponents for why that is accepted.
+                env = teleport_opponents(
+                    env, traj_pid, traj_t, traj_speed, will_reset[:, None] & is_pid_opp
+                )
             # CompetitionReward (if present) always adds its shaped components into reward[:, 0];
             # strip them back out before opponent_start_step so the ego trains on plain solo-racing
             # reward until the opponent is actually active (opponent-relative terms are meaningless
@@ -486,7 +540,16 @@ def train_ippo(
                     maxval=args.opponent_pid_speed_max,
                 )
                 resampled_is_pid = jax.random.bernoulli(pid_key, pid_prob_now, is_pid_opp.shape)
-                traj_t = jnp.where(reset, 0.0, traj_t)
+                # Fresh episodes start at a random point along the trajectory when mid-track
+                # spawning is enabled (the teleport above places the drone there at the actual env
+                # reset); otherwise at the pad (t0 = 0). The extra rng split only exists when
+                # enabled, keeping the disabled path's random stream identical to before.
+                if use_random_pid_start:
+                    rng, spawn_key = jax.random.split(rng)
+                    resampled_t = sample_spawn_t(spawn_key, traj_t.shape)
+                else:
+                    resampled_t = 0.0
+                traj_t = jnp.where(reset, resampled_t, traj_t)
                 traj_speed = jnp.where(reset, resampled_speed, traj_speed)
                 traj_i_error = jnp.where(reset[..., None], 0.0, traj_i_error)
                 is_pid_opp = jnp.where(reset, resampled_is_pid, is_pid_opp)
@@ -812,8 +875,12 @@ def train_ippo(
     traj_state0 = ()
     if use_pid_opponents:
         rng, speed_key, pid_key = jax.random.split(rng, 3)
+        traj_t0 = jnp.zeros((num_envs, n_opponents))  # virtual elapsed trajectory time
+        if use_random_pid_start:
+            rng, spawn_key = jax.random.split(rng)
+            traj_t0 = sample_spawn_t(spawn_key, (num_envs, n_opponents))
         traj_state0 = (
-            jnp.zeros((num_envs, n_opponents)),  # traj_t (virtual elapsed trajectory time)
+            traj_t0,
             jax.random.uniform(
                 speed_key,
                 (num_envs, n_opponents),
@@ -825,6 +892,13 @@ def train_ippo(
                 pid_key, args.opponent_pid_prob_start, (num_envs, n_opponents)
             ),  # is_pid_opp
         )
+        if use_random_pid_start:
+            # The very first episodes should be randomized too: envs.reset above spawned every
+            # drone on the pad, so move the PID slots onto the spline at their sampled t0 (the
+            # in-rollout teleport only fires on autoresets). next_obs keeps the pad position for
+            # frame 0, same accepted one-frame staleness as in the rollout.
+            traj_t0, traj_speed0, _, is_pid_opp0 = traj_state0
+            env0 = teleport_opponents(env0, traj_pid, traj_t0, traj_speed0, is_pid_opp0)
     init_carry = (
         params,
         opt_state,
