@@ -125,6 +125,13 @@ class MultiAgentRacingArgs(RacingArgs):
     opponent_pid_ki: tuple[float, float, float] = (0.05, 0.05, 0.05)
     opponent_pid_kd: tuple[float, float, float] = (0.2, 0.2, 0.4)
     opponent_pid_ki_range: tuple[float, float, float] = (2.0, 2.0, 0.4)
+    # Random mid-track spawn for PID opponents: each PID episode starts at virtual trajectory time
+    # t0 ~ U(frac_min, frac_max) * opponent_pid_t_total (clamped to stay before the last gate's
+    # pass time), teleporting the opponent onto the spline there so the ego learns to overtake a
+    # leader. frac_min == 0 keeps a share of ordinary pad starts in the mix; set both to 0 to
+    # disable entirely (exact pad-start behavior, no teleport code traced).
+    opponent_pid_start_frac_min: float = 0.0
+    opponent_pid_start_frac_max: float = 0.5
 
 
 def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
