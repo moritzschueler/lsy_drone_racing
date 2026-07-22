@@ -3,7 +3,7 @@
 The dense per-step *progress* reward is always the telescoping increase of a per-gate **potential**
 ``Phi`` measured against the gate that was the target at the *start* of the step::
 
-    progress = progress_coef * (Phi(curr_pos) - Phi(prev_pos))      # both vs prev target gate
+    progress = progress_coef * (Phi(curr_pos) - Phi(prev_pos))  # both vs prev target gate
 
 Because every variant is a deterministic function of state (a potential), this difference
 telescopes over a path and cannot be farmed by looping -- that guarantee lives here, in the shared
@@ -76,11 +76,7 @@ def _target_gate_frame(
 
 
 def gate_opening_distance(
-    drone_pos: Array,
-    gates_pos: Array,
-    gates_quat: Array,
-    target_gate: Array,
-    half_extent: float,
+    drone_pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array, half_extent: float
 ) -> Array:
     """Euclidean distance (m) from each drone to its target gate's *opening* (lower == closer).
 
@@ -126,9 +122,9 @@ def _asymmetric_potential(
     blends two length scales, both maximal at the opening: ``reach`` (long-range pull) and
     ``sharpness`` (tight near-gate funnel)::
 
-        along_eff = along (entry) | exit_scale*along (exit)
-        distance  = sqrt(along_eff**2 + oy**2 + oz**2)
-        Phi       = 0.5*exp(-distance/reach) + 0.5*exp(-distance/sharpness)
+        along_eff = along(entry) | exit_scale * along(exit)
+        distance = sqrt(along_eff**2 + oy**2 + oz**2)
+        Phi = 0.5 * exp(-distance / reach) + 0.5 * exp(-distance / sharpness)
     """
 
     def phi(pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array, h: float) -> Array:

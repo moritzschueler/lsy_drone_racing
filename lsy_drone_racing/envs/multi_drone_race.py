@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import gymnasium
 from gymnasium import Env
@@ -133,6 +133,7 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
         seed: int = 1337,
         max_episode_steps: int = 1500,
         device: Literal["cpu", "gpu"] = "cpu",
+        reward_fn: Callable[[Any, Any], Array] | None = None,
     ):
         """Vectorized multi-agent drone racing environment.
 
@@ -148,6 +149,8 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
             seed: Random seed.
             max_episode_steps: Maximum number of steps per episode.
             device: Device used for the environment and the simulation.
+            reward_fn: Optional custom reward function ``f(data, prev_data) -> Array`` compiled into
+                the step. See `RaceCoreEnv`.
         """
         n_gates, n_obstacles, n_drones = len(track.gates), len(track.obstacles), len(track.drones)
         super().__init__(
@@ -163,6 +166,7 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
             seed=seed,
             max_episode_steps=max_episode_steps,
             device=device,
+            reward_fn=reward_fn,
         )
         self.num_envs = num_envs
         self.single_action_space = batch_space(

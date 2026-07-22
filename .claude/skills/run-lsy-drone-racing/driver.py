@@ -94,11 +94,7 @@ def run(
             finished = ctrl.step_callback(action, obs, reward, terminated, truncated, info)
             if i % shot_every == 0 and shot < frames:
                 img = u.sim.render(
-                    mode="rgb_array",
-                    camera=cam,
-                    cam_config=cam_cfg,
-                    width=width,
-                    height=height,
+                    mode="rgb_array", camera=cam, cam_config=cam_cfg, width=width, height=height
                 )
                 path = out_dir / f"run{run_idx}_frame{shot:02d}.png"
                 Image.fromarray(np.asarray(img)).save(path)

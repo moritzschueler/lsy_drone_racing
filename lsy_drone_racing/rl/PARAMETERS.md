@@ -263,6 +263,28 @@ carry and written out at the end of the run.
 - **`loss/entropy`** — proxy for action noise. A gate-pass collapse tends to track entropy
   annealing: exploration luck being smoothed away.
 
+## 7. Multi-agent: PID opponent spawn ([`tasks/multi_agent_racing.py`](tasks/multi_agent_racing.py))
+
+The scripted PID opponent (mixed into the self-play pool per `opponent_pid_prob_*`) can start each
+episode mid-trajectory instead of on the pad, so the ego actually meets — and must overtake — a
+leader. The opponent is teleported onto its waypoint spline at
+`t0 ~ U(frac_min, frac_max) · opponent_pid_t_total`, with matching velocity and its `target_gate`
+advanced to the gate it is approaching (so rank / segment-lead / victory shaping treats it as
+genuinely ahead). `t0` is always clamped below the last gate's pass time — the opponent never spawns
+already-finished.
+
+### `opponent_pid_start_frac_min` (current **0.0**) / `opponent_pid_start_frac_max` (current **0.5**)
+
+- ↑ `frac_max`: opponent spawns deeper into the track more often — more overtaking pressure, but
+  far-ahead spawns are often unwinnable and dilute the `victory`/rank signal.
+- ↑ `frac_min` above 0: removes ordinary pad starts from the mix entirely — only do this once
+  side-by-side racing from the pad is already solid.
+- **Both 0 disables** the feature exactly (pad starts, no teleport code traced). Self-play opponent
+  episodes are never teleported regardless — only the PID-controlled share.
+
+(The rest of the `opponent_pid_*` family — mixing probabilities/anneal, speed range, gains — is
+defined with inline comments in `MultiAgentRacingArgs` and not yet documented here.)
+
 ## Quick rules of thumb
 
 - **Make `progress` the positive workhorse; keep it positive.** Bonuses are seasoning.

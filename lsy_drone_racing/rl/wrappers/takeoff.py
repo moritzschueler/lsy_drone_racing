@@ -41,9 +41,23 @@ class SpinUpRotors(Wrapper):
     reset: Callable = struct.field(pytree_node=False)
 
     @classmethod
-    def create(cls, base: struct.PyTreeNode, rotor_vel: float = HOVER_ROTOR_VEL) -> SpinUpRotors:
-        """Create a SpinUpRotors wrapper around the base environment."""
+    def create(
+        cls, base: struct.PyTreeNode, rotor_vel: float = HOVER_ROTOR_VEL, n_drones: int = 1
+    ) -> SpinUpRotors:
+        """Create a SpinUpRotors wrapper around the base environment.
+
+        ``n_drones > 1`` (multi-agent racing): the base env reports per-drone ``(n_envs, n_drones)``
+        done flags, but rotor warming is per-env (a world reset warms every drone in it), so the
+        done flags are reduced with ``any`` over the drone axis into the ``(n_envs,)`` mask
+        ``done_last_step`` and ``warm_rotors`` expect.
+        """
         num_envs = base.num_envs
+        multi = n_drones > 1
+
+        def env_done(terminated: Array, truncated: Array) -> Array:
+            """Per-env done mask (n_envs,): reduce over the drone axis in multi-agent."""
+            done = terminated | truncated
+            return done.any(axis=-1) if multi else done
 
         def warm_rotors(env: SpinUpRotors, mask: Array) -> SpinUpRotors:
             """Seed rotor_vel to the hover value for the masked envs in the innermost env's data."""
@@ -68,12 +82,9 @@ class SpinUpRotors(Wrapper):
             # Envs done on the previous step were just autoreset by this step -> warm them now,
             # before their next action is applied. The mask makes "none done" a no-op.
             env = warm_rotors(env, env.done_last_step)
-            env = env.replace(done_last_step=terminated | truncated)
+            env = env.replace(done_last_step=env_done(terminated, truncated))
             return env, (obs, reward, terminated, truncated, info)
 
         return cls(
-            base=base,
-            done_last_step=jnp.zeros(num_envs, dtype=bool),
-            step=step,
-            reset=reset,
+            base=base, done_last_step=jnp.zeros(num_envs, dtype=bool), step=step, reset=reset
         )

@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax import Array
 
+
 class Agent(nnx.Module):
     """RL Agent implemented as a stateful Flax NNX module.
 
@@ -32,14 +33,18 @@ class Agent(nnx.Module):
         self.critic1 = nnx.Linear(
             obs_dim, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
         )
-        self.critic2 = nnx.Linear(128, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
+        self.critic2 = nnx.Linear(
+            128, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
+        )
         self.critic_out = nnx.Linear(128, 1, kernel_init=orth(1.0), bias_init=zeros, rngs=rngs)
 
         # Actor
         self.actor1 = nnx.Linear(
             obs_dim, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
         )
-        self.actor2 = nnx.Linear(128, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs)
+        self.actor2 = nnx.Linear(
+            128, 128, kernel_init=orth(jnp.sqrt(2)), bias_init=zeros, rngs=rngs
+        )
         self.actor_mean = nnx.Linear(
             128, action_dim, kernel_init=orth(0.01), bias_init=zeros, rngs=rngs
         )
@@ -74,8 +79,7 @@ def _log_prob(action: Array, mean: Array, log_std: Array) -> Array:
     """Compute log probability of actions under a diagonal Gaussian."""
     std = jnp.exp(log_std)
     return jnp.sum(
-        -0.5 * ((action - mean) / std) ** 2 - log_std - 0.5 * jnp.log(2.0 * jnp.pi),
-        axis=-1,
+        -0.5 * ((action - mean) / std) ** 2 - log_std - 0.5 * jnp.log(2.0 * jnp.pi), axis=-1
     )
 
 

@@ -27,12 +27,7 @@ N_NEXT_GATES = 2
 GATE_OPENING_HALF_EXTENT = 0.225
 _h = GATE_OPENING_HALF_EXTENT
 _GATE_CORNERS_LOCAL = jnp.array(
-    [
-        [0.0, _h, _h],
-        [0.0, _h, -_h],
-        [0.0, -_h, _h],
-        [0.0, -_h, -_h],
-    ]
+    [[0.0, _h, _h], [0.0, _h, -_h], [0.0, -_h, _h], [0.0, -_h, -_h]]
 )  # (4, 3) gate-frame corner offsets
 
 
@@ -107,13 +102,24 @@ class FlattenJaxObservation(Wrapper):
         return batch_space(self.single_observation_space, self.num_envs)
 
     @classmethod
-    def create(cls, base: struct.PyTreeNode) -> FlattenJaxObservation:
-        """Create a FlattenJaxObservation wrapper around the base environment."""
+    def create(cls, base: struct.PyTreeNode, n_drones: int = 1) -> FlattenJaxObservation:
+        """Create a FlattenJaxObservation wrapper around the base environment.
+
+        ``n_drones > 1`` (multi-agent racing) preserves the per-drone axis: each field is flattened
+        to ``(n_envs, n_drones, features)`` and concatenated on the last axis, yielding a
+        ``(n_envs, n_drones, obs_dim)`` observation. The per-drone flat space is unchanged.
+        """
         keys = list(base.single_observation_space.keys())
+        # Number of leading axes to preserve before flattening the per-field features: (n_envs,) for
+        # single-agent, (n_envs, n_drones) for multi-agent.
+        lead = 2 if n_drones > 1 else 1
 
         def flatten(obs: dict) -> Array:
             return jnp.concatenate(
-                [jnp.reshape(obs[k], (obs[k].shape[0], -1)).astype(jnp.float32) for k in keys],
+                [
+                    jnp.reshape(obs[k], obs[k].shape[:lead] + (-1,)).astype(jnp.float32)
+                    for k in keys
+                ],
                 axis=-1,
             )
 
@@ -178,6 +184,43 @@ def _relative_racing_obs(obs: dict) -> dict:
     }
 
 
+def _opponent_body_frame(obs: dict, n_drones: int) -> tuple[Array, Array]:
+    """Nearest opponent's position and velocity, ego-relative and in each drone's body frame.
+
+    Returns ``(opponent_rel_pos, opponent_rel_vel)``, each shaped like ``obs["pos"]`` (``(E, 3)``
+    single-agent, ``(E, D, 3)`` multi-agent). For ego drone ``i`` each is the *nearest* other
+    drone's world quantity minus the ego's, rotated into the ego's body frame -- the same frame the
+    rest of :func:`_relative_racing_obs` uses -- so it drops straight into that drone's observation.
+
+    With ``n_drones == 1`` (single-agent, or a flag-on pre-training run with no opponent) there is no
+    opponent, so both are zeros: the policy sees empty slots it can learn to ignore, and a later
+    multi-agent run with the same obs layout fills them with real signal (warm-start compatible).
+    For ``n_drones == 2`` "nearest other drone" is trivially the single opponent; the nearest rule
+    only matters if the track is ever run with >2 drones (one slot, filled by the closest rival).
+    """
+    pos, vel = obs["pos"], obs["vel"]
+    if n_drones == 1:
+        return jnp.zeros_like(pos), jnp.zeros_like(vel)
+    n_envs = pos.shape[0]
+    # Per-drone attitude, body -> world; its transpose rotates world quantities into that body frame.
+    rot_bw = R.from_quat(obs["quat"].reshape(-1, 4)).as_matrix().reshape(n_envs, n_drones, 3, 3)
+    # Pairwise world deltas: d[e, i, j] = X[e, j] - X[e, i] (opponent j relative to ego i).
+    dpos = pos[:, None, :, :] - pos[:, :, None, :]  # (E, i, j, 3)
+    dvel = vel[:, None, :, :] - vel[:, :, None, :]  # (E, i, j, 3)
+    # Nearest other drone per ego: mask the self-pair (j == i) to +inf before the argmin.
+    dist = jnp.where(jnp.eye(n_drones, dtype=bool)[None], jnp.inf, jnp.linalg.norm(dpos, axis=-1))
+    nearest = jnp.argmin(dist, axis=-1)  # (E, i)
+    env_idx = jnp.arange(n_envs)[:, None]  # (E, 1)
+    ego_idx = jnp.arange(n_drones)[None, :]  # (1, D)
+    rel_pos_world = dpos[env_idx, ego_idx, nearest]  # (E, D, 3)
+    rel_vel_world = dvel[env_idx, ego_idx, nearest]  # (E, D, 3)
+
+    def to_body(v_world: Array) -> Array:  # world -> ego body frame (rot_bw^T), per drone
+        return jnp.einsum("edji,edj->edi", rot_bw, v_world)
+
+    return to_body(rel_pos_world), to_body(rel_vel_world)
+
+
 @struct.dataclass
 class RelativeRacingObs(Wrapper):
     """Recast the observation into a relative, track-length-invariant racing representation.
@@ -201,6 +244,13 @@ class RelativeRacingObs(Wrapper):
       the body frame -- the only world reference a body-frame observation still needs (which way
       is "down" for thrust/attitude). Yaw-about-vertical is intentionally not observable.
 
+    When ``include_opponent_obs`` is set, two trailing keys are appended -- ``opponent_rel_pos`` and
+    ``opponent_rel_vel`` (each ``(3,)``) -- carrying the nearest opponent drone's position and
+    velocity, ego-relative and in the drone's body frame (see :func:`_opponent_body_frame`). They
+    are appended *last* so the layout is a superset of the plain obs: a single-agent run with the
+    flag on fills them with zeros (no opponent) and shares the exact obs layout of a multi-agent
+    run, so a single-agent checkpoint warm-starts a multi-agent policy 1:1.
+
     Requires ``last_action`` to already be present (i.e. wrap *after* the wrapper that adds it:
     ``ActionSmoothnessPenalty`` for racing, ``ActionPenalty`` for hover / trajectory).
     """
@@ -208,6 +258,7 @@ class RelativeRacingObs(Wrapper):
     base: struct.PyTreeNode = struct.field(pytree_node=True)
     step: Callable = struct.field(pytree_node=False)
     reset: Callable = struct.field(pytree_node=False)
+    include_opponent_obs: bool = struct.field(pytree_node=False, default=False)
 
     @property
     def single_observation_space(self) -> spaces.Space:
@@ -222,6 +273,9 @@ class RelativeRacingObs(Wrapper):
             "obstacles_visited": base["obstacles_visited"],
             "vel": base["vel"],
         }
+        if self.include_opponent_obs:
+            spec["opponent_rel_pos"] = spaces.Box(-np.inf, np.inf, shape=(3,))
+            spec["opponent_rel_vel"] = spaces.Box(-np.inf, np.inf, shape=(3,))
         return spaces.Dict(spec)
 
     @property
@@ -229,29 +283,48 @@ class RelativeRacingObs(Wrapper):
         return batch_space(self.single_observation_space, self.num_envs)
 
     @classmethod
-    def create(cls, base: struct.PyTreeNode) -> RelativeRacingObs:
+    def create(
+        cls, base: struct.PyTreeNode, n_drones: int = 1, include_opponent_obs: bool = False
+    ) -> RelativeRacingObs:
         """Create a RelativeRacingObs wrapper around the base environment.
 
         Requires ``last_action`` to already be present in the observation, i.e. wrap *after*
         ``ActionPenalty``.
+
+        ``n_drones > 1`` (multi-agent racing) applies the single-drone body-frame transform to each
+        drone by mapping :func:`_relative_racing_obs` over the ``n_drones`` axis (axis 1) of every
+        observation field, so the transform code is reused unchanged and the output keeps its
+        ``(n_envs, n_drones, ...)`` shape. The per-drone observation *space* is identical to the
+        single-agent case.
+
+        ``include_opponent_obs`` appends the ego-relative nearest-opponent position and velocity
+        (:func:`_opponent_body_frame`) as two trailing keys. The opponent features are computed
+        *outside* the per-drone vmap (each vmapped slice only sees its own drone), from the full
+        ``(n_envs, n_drones, ...)`` raw arrays. With ``n_drones == 1`` they are zeros.
         """
+        per_drone_transform = (
+            jax.vmap(_relative_racing_obs, in_axes=1, out_axes=1)
+            if n_drones > 1
+            else _relative_racing_obs
+        )
+
+        def transform(obs: dict) -> dict:
+            out = per_drone_transform(obs)
+            if include_opponent_obs:
+                opp_pos, opp_vel = _opponent_body_frame(obs, n_drones)
+                out = {**out, "opponent_rel_pos": opp_pos, "opponent_rel_vel": opp_vel}
+            return out
 
         def reset(
             env: RelativeRacingObs, *, seed: int | None = None, options: dict | None = None
         ) -> tuple[RelativeRacingObs, tuple[Any, Any]]:
             base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
-            return env.replace(base=base_env), (_relative_racing_obs(obs), info)
+            return env.replace(base=base_env), (transform(obs), info)
 
         def step(
             env: RelativeRacingObs, action: Array
         ) -> tuple[RelativeRacingObs, tuple[Any, ...]]:
             base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
-            return env.replace(base=base_env), (
-                _relative_racing_obs(obs),
-                reward,
-                terminated,
-                truncated,
-                info,
-            )
+            return env.replace(base=base_env), (transform(obs), reward, terminated, truncated, info)
 
-        return cls(base=base, step=step, reset=reset)
+        return cls(base=base, step=step, reset=reset, include_opponent_obs=include_opponent_obs)

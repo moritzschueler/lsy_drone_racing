@@ -11,9 +11,12 @@ class Args:
     seed: int = 42
     jax_device: str = "gpu"
     wandb_project_name: str = "maadr"
-    wandb_entity: str = "maad-flies"
+    wandb_entity: str = None
     console_log_interval: int = 10
     wandb_log_interval: int = 1
+    checkpoint_save_interval: int = 50_000_000
+    """save a periodic checkpoint every this many global steps, in addition to the best checkpoint
+    saved at the end of training. 0 disables periodic checkpointing (only the best is saved)."""
 
     # Algorithm specific arguments
     total_timesteps: int = 1_500_000
@@ -62,11 +65,16 @@ class Args:
 
     # Wrapper settings (observation history + action/angle reward shaping)
     n_obs: int = 2
+    include_opponent_obs: bool = False
+    """append the nearest opponent's ego-relative, body-frame position + velocity (2x3) to the
+    racing observation. Multi-agent racing defaults this on; single-agent leaves it off but can
+    enable it to pre-train with zero-padded opponent slots so a single-agent checkpoint shares the
+    multi-agent obs layout and warm-starts a multi-agent policy 1:1."""
     rpy_coef: float = 0.06
-    d_act_th_coef: float = 0.4 # Coefficient for thrust change penalty (thrust smoothness)
-    d_act_xy_coef: float = 1.0 # Coefficient for xy action change penalty (attitude smoothness)
-    act_coef: float = 0.02 # Coefficient for action penalty (energy smoothness)
-    d_act_coef: float = 0.01 # Coefficient for single action term penalty
+    d_act_th_coef: float = 0.4  # Coefficient for thrust change penalty (thrust smoothness)
+    d_act_xy_coef: float = 1.0  # Coefficient for xy action change penalty (attitude smoothness)
+    act_coef: float = 0.02  # Coefficient for action penalty (energy smoothness)
+    d_act_coef: float = 0.01  # Coefficient for single action term penalty
 
     # Env (in-step) racing reward coefficients. Only used by the racing task; other tasks
     # compute their reward inside their env class and ignore these. The progress term itself is

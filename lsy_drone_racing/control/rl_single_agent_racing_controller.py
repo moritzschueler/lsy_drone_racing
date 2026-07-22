@@ -25,7 +25,7 @@ from __future__ import annotations
 import pickle
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING    
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
@@ -46,6 +46,15 @@ CHECKPOINT_OVERRIDE: str = ""
 # ---------------------------------------------------------------------------------------------
 
 _ACTION_DIM = 4
+# Default for whether the policy expects the opponent obs slots; overridable per run via the config
+# (``[controller] include_opponent_obs``) or the deploy/sim CLI. Must match the
+# ``include_opponent_obs`` flag the checkpoint was trained with. Single-agent racing defaults it OFF;
+# enable it only when loading a checkpoint pre-trained with the opponent slots on (e.g. to later
+# warm-start a multi-agent policy). A single drone has no opponent, so the slots are fed zeros (see
+# _obs_vector). A mismatch vs. the checkpoint fails loudly at network load.
+_INCLUDE_OPPONENT_OBS = False
+# opponent_rel_pos(3) + opponent_rel_vel(3) appended when _INCLUDE_OPPONENT_OBS is set.
+_OPPONENT_OBS_DIM = 6
 _CHECKPOINT_DIR = Path(__file__).parents[1] / "rl" / "checkpoints" / "single_agent_racing"
 # The YYYYMMDD-HHMMSS stamp training embeds in each checkpoint filename (see rl/ppo.py).
 _TIMESTAMP_RE = re.compile(r"\d{8}-\d{6}")
@@ -113,11 +122,27 @@ class RLSingleAgentRacingController(Controller):
         # (ActionPenalty initializes it to zeros before any step).
         self._last_action = jnp.zeros(_ACTION_DIM, dtype=jnp.float32)
 
+        # Whether the policy was trained with the opponent obs slots. Read from the run config
+        # (``[controller] include_opponent_obs``, settable via the deploy/sim CLI), defaulting to
+        # _INCLUDE_OPPONENT_OBS. Must match the checkpoint or the network load below fails loudly.
+        self._include_opponent_obs = bool(
+            config.get("controller", {}).get("include_opponent_obs", _INCLUDE_OPPONENT_OBS)
+        )
+
         # Observation size: grav_body(3) + gates_corners(N*4*3) + gates_visited(N) + last_action(4)
         # + obstacles_rel_pos(O*3) + obstacles_visited(O) + vel(3). O read from the obs (works
         # regardless of any leading drone/env dim).
         n_obstacles = int(np.asarray(obs["obstacles_pos"]).shape[-2])
-        obs_dim = 3 + N_NEXT_GATES * 4 * 3 + N_NEXT_GATES + _ACTION_DIM + n_obstacles * 3 + n_obstacles + 3
+        obs_dim = (
+            3
+            + N_NEXT_GATES * 4 * 3
+            + N_NEXT_GATES
+            + _ACTION_DIM
+            + n_obstacles * 3
+            + n_obstacles
+            + 3
+            + (_OPPONENT_OBS_DIM if self._include_opponent_obs else 0)
+        )
 
         # Build the network and load the trained parameters (nnx owns its weights; update in place).
         self._agent = Agent(obs_dim, _ACTION_DIM, rngs=nnx.Rngs(0))
@@ -149,9 +174,17 @@ class RLSingleAgentRacingController(Controller):
         raw = {k: jnp.asarray(obs[k])[None] for k in _RAW_OBS_KEYS}
         raw["target_gate"] = jnp.atleast_1d(jnp.asarray(obs["target_gate"]))
         raw["last_action"] = self._last_action[None]
-        rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays, keys in the flatten order
+        rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays
+        if self._include_opponent_obs:
+            # Single drone: no opponent to observe, so the slots are zeros (matching the zero-padded
+            # opponent obs the policy saw during flag-on single-agent pre-training).
+            zeros = jnp.zeros((1, 3), dtype=jnp.float32)
+            rel = {**rel, "opponent_rel_pos": zeros, "opponent_rel_vel": zeros}
+        # gymnasium's spaces.Dict sorts its keys, and FlattenJaxObservation flattens in that sorted
+        # order at train time -- so concatenate by SORTED key here (not dict insertion order) to feed
+        # the network the identical layout. A mismatch permutes the obs and destroys the policy.
         return jnp.concatenate(
-            [v.reshape(1, -1).astype(jnp.float32) for v in rel.values()], axis=-1
+            [rel[k].reshape(1, -1).astype(jnp.float32) for k in sorted(rel)], axis=-1
         )
 
     def compute_control(
@@ -161,7 +194,9 @@ class RLSingleAgentRacingController(Controller):
         obs_vec = self._obs_vector(obs)
         action = self._infer(self._agent, obs_vec)[0]  # (4,) in [-1, 1]
         action = action.at[2].set(0.0)  # ZeroYaw
-        action = jnp.clip(action, -1.0, 1.0) * self._act_scale + self._act_offset  # NormalizeActions
+        action = (
+            jnp.clip(action, -1.0, 1.0) * self._act_scale + self._act_offset
+        )  # NormalizeActions
         self._last_action = action  # feed the denormalized, yaw-zeroed action to the next obs
         return np.asarray(action, dtype=np.float32)
 

@@ -13,7 +13,6 @@ import fire
 import numpy as np
 
 import wandb
-from lsy_drone_racing.rl.ppo import evaluate_ppo, train_ppo
 from lsy_drone_racing.rl.tasks import get_task
 from lsy_drone_racing.utils import load_config
 
@@ -52,8 +51,9 @@ def main(
 
     env_config = load_config(Path(__file__).parents[3] / "config" / config)
 
-    model_path = train_ppo(args, task_spec.make_env, env_config, checkpoint_dir, task,
-                           wandb_enabled)
+    model_path = task_spec.train_fn(
+        args, task_spec.make_env, env_config, checkpoint_dir, task, wandb_enabled
+    )
 
     if num_eval_iterations > 0:
         eval_path = model_path or _latest_checkpoint(task)
@@ -62,7 +62,7 @@ def main(
                 f"Can't evaluate because there is no checkpoint for task {task} in "
                 f"{checkpoint_dir} and training is disabled."
             )
-        episode_rewards, episode_lengths = evaluate_ppo(
+        episode_rewards, episode_lengths = task_spec.eval_fn(
             args, task_spec.make_env, env_config, num_eval_iterations, eval_path
         )
 
@@ -75,18 +75,21 @@ def main(
             f"Average Episode Reward: {np.mean(episode_rewards):.2f}, "
             f"Average Episode Length: {np.mean(episode_lengths):.1f}"
         )
-        print(f"Episode Reward Std: {np.std(episode_rewards):.2f}, Episode Length Std: {np.std(episode_lengths):.1f}")
+        print(
+            f"Episode Reward Std: {np.std(episode_rewards):.2f}, Episode Length Std: {np.std(episode_lengths):.1f}"
+        )
         if wandb_enabled:
             wandb.log(
                 {
                     "eval/rewards_mean": np.mean(episode_rewards),
                     "eval/steps_mean": np.mean(episode_lengths),
                     "eval/rewards_std": np.std(episode_rewards),
-                    "eval/steps_std": np.std(episode_lengths)
+                    "eval/steps_std": np.std(episode_lengths),
                 }
             )
     if wandb_enabled:
         wandb.finish()
+
 
 if __name__ == "__main__":
     fire.Fire(main)

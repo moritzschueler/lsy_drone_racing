@@ -1,22 +1,20 @@
 """Reward / action-shaping wrappers for the vectorized JAX drone environments."""
+
 from __future__ import annotations
 
+from typing import Any, Callable
+
+import flax.struct as struct
 import jax.numpy as jnp
 import numpy as np
-import flax.struct as struct
 from gymnasium import spaces
-from gymnasium.vector import (
-    VectorActionWrapper,
-    VectorEnv,
-    VectorObservationWrapper,
-    VectorRewardWrapper,
-)
-from typing import Any, Callable
+from gymnasium.vector import VectorEnv, VectorRewardWrapper
 from gymnasium.vector.utils import batch_space
 from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
+
 
 class AngleReward(VectorRewardWrapper):
     """Wrapper to penalize orientation in the reward."""
@@ -41,6 +39,7 @@ class AngleReward(VectorRewardWrapper):
         rpy_norm = jnp.linalg.norm(R.from_quat(observations["quat"]).as_euler("xyz"), axis=-1)
         rewards -= self.rpy_coef * rpy_norm
         return rewards
+
 
 @struct.dataclass
 class ActionPenalty(Wrapper):
@@ -69,9 +68,19 @@ class ActionPenalty(Wrapper):
         act_coef: float,
         d_act_th_coef: float,
         d_act_xy_coef: float,
+        n_drones: int = 1,
     ) -> ActionPenalty:
-        """Create an ActionPenalty wrapper around the base environment."""
-        last_action = jnp.zeros((base.num_envs, 4))
+        """Create an ActionPenalty wrapper around the base environment.
+
+        ``n_drones > 1`` (multi-agent racing) keeps the per-drone action axis: ``last_action`` is
+        shaped ``(num_envs, n_drones, 4)`` and the surfaced diagnostic/reward-component ``info``
+        entries are sliced to the ego drone (index 0), matching the single-agent ``(num_envs,)``
+        shape PPO logs. The reward penalty itself stays per-drone (``(num_envs, n_drones)``); only
+        the ego drone's reward is trained on downstream.
+        """
+        multi = n_drones > 1
+        act_shape = (base.num_envs, n_drones, 4) if multi else (base.num_envs, 4)
+        last_action = jnp.zeros(act_shape)
 
         def reset(
             env: ActionPenalty, *, seed: int | None = None, options: dict | None = None
@@ -81,9 +90,7 @@ class ActionPenalty(Wrapper):
             obs = {**obs, "last_action": env.last_action}
             return env, (obs, info)
 
-        def step(
-            env: ActionPenalty, action: Array
-        ) -> tuple[ActionPenalty, tuple[Any, ...]]:
+        def step(env: ActionPenalty, action: Array) -> tuple[ActionPenalty, tuple[Any, ...]]:
             base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
             action_diff = action - env.last_action
             act_term = -act_coef * action[..., -1] ** 2  # energy
@@ -94,13 +101,15 @@ class ActionPenalty(Wrapper):
             env = env.replace(base=base_env, last_action=action)
             obs = {**obs, "last_action": action}
             act_tilt = jnp.sqrt(action[..., 0] ** 2 + action[..., 1] ** 2)  # roll/pitch lean
+            # Slice info terms to the ego drone (0) in multi-agent, so logged shapes stay (num_envs,).
+            ego = (lambda x: x[:, 0]) if multi else (lambda x: x)
             info = {
                 **info,
-                "rew/act": act_term,
-                "rew/d_act_th": d_act_th_term,
-                "rew/d_act_xy": d_act_xy_term,
-                "diagnostics/act_thrust": action[..., -1],
-                "diagnostics/act_tilt": act_tilt,
+                "rew/act": ego(act_term),
+                "rew/d_act_th": ego(d_act_th_term),
+                "rew/d_act_xy": ego(d_act_xy_term),
+                "diagnostics/act_thrust": ego(action[..., -1]),
+                "diagnostics/act_tilt": ego(act_tilt),
             }
             return env, (obs, reward, terminated, truncated, info)
 
@@ -122,16 +131,17 @@ class ZeroYaw(Wrapper):
     reset: Callable = struct.field(pytree_node=False)
     step: Callable = struct.field(pytree_node=False)
 
-
     @classmethod
     def create(cls, base: struct.PyTreeNode) -> ZeroYaw:
-        """ Create a ZeroYaw wrapper around the base environment. """
+        """Create a ZeroYaw wrapper around the base environment."""
 
-        def reset(env: ZeroYaw, *, seed: int | None = None, options: dict | None = None) -> tuple[ZeroYaw, tuple[Any, Any]]:
+        def reset(
+            env: ZeroYaw, *, seed: int | None = None, options: dict | None = None
+        ) -> tuple[ZeroYaw, tuple[Any, Any]]:
             base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
             env = env.replace(base=base_env)
             return env, (obs, info)
-        
+
         def step(env: ZeroYaw, actions: Array) -> tuple[ZeroYaw, tuple[Any, ...]]:
             """Zero the yaw channel of the (normalized) action."""
             actions = actions.at[..., 2].set(0.0)
@@ -144,8 +154,7 @@ class ZeroYaw(Wrapper):
 
 @struct.dataclass
 class NormalizeActions(Wrapper):
-    """Expose actions in ``[-1, 1]`` and rescale them to the simulator's action range.
-    """
+    """Expose actions in ``[-1, 1]`` and rescale them to the simulator's action range."""
 
     base: struct.PyTreeNode = struct.field(pytree_node=True)
     step: Callable = struct.field(pytree_node=False)
@@ -180,4 +189,3 @@ class NormalizeActions(Wrapper):
             return env.replace(base=base_env), payload
 
         return cls(base=base, step=step, reset=reset)
-

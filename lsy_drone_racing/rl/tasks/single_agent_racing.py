@@ -33,7 +33,7 @@ class RacingArgs(Args):
     layers any explicit ``--flag`` overrides on top via ``RacingArgs.create(**kwargs)``.
     """
 
-    total_timesteps: int = 70_000_000
+    total_timesteps: int = 800_000_000
     gamma: float = 0.99
     learning_rate: float = 3e-4
     target_kl: float = 0.03
@@ -41,19 +41,19 @@ class RacingArgs(Args):
     clip_coef: float = 0.2
     ent_coef: float = 0.008
     anneal_ent_coef: bool = False  # decay entropy if True
-    progress: tuple[str, float] = ("fancy", 5.0) # Tuple of variant and coefficent
+    progress: tuple[str, float] = ("fancy", 5.0)  # Tuple of variant and coefficent
     progress_params: dict = field(default_factory=default_progress_params)
     speed_coef: float = 0.05  # quadratic speed-hinge weight (0 disables); starting guess, tune
     speed_threshold: float = 2  # speed (m/s) above which the hinge penalizes; free below it
-    d_act_coef: float = 0.000 
-    d_act_th_coef: float = 0.0005 # Coefficient for thrust change penalty (thrust smoothness)
-    d_act_xy_coef: float = 0.001 # Coefficient for xy action change penalty (attitude smoothness)
-    act_coef: float = 0.00 # Coefficient for action penalty (energy smoothness)
+    d_act_coef: float = 0.000
+    d_act_th_coef: float = 0.0005  # Coefficient for thrust change penalty (thrust smoothness)
+    d_act_xy_coef: float = 0.001  # Coefficient for xy action change penalty (attitude smoothness)
+    act_coef: float = 0.00  # Coefficient for action penalty (energy smoothness)
     gate_bonus: float = 20.0
     finish_bonus: float = 30.0
     crash_penalty: float = 3.0
     timeout_penalty: float = 0.0  # Terminal penalty if sim truncates without drone finished
-    time_alive_penalty: float = 0.03 # Continous penalty for each step alive and not finished
+    time_alive_penalty: float = 0.03  # Continous penalty for each step alive and not finished
     num_steps: int = 128
     max_episode_length: int = 1500
 
@@ -102,11 +102,17 @@ def racing_reward_components(
     # progress_coef -- so crossing is never meaningfully net-penalized). Left unmasked on the
     # crossing step to keep it a pure potential difference (no bias, no flat step).
     phi_prev = progress_potential(
-        prev_data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate,
+        prev_data.sim_data.states.pos,
+        data.gates_pos,
+        data.gates_quat,
+        prev_data.target_gate,
         gate_half_extent,
     )
     phi_curr = progress_potential(
-        data.sim_data.states.pos, data.gates_pos, data.gates_quat, prev_data.target_gate,
+        data.sim_data.states.pos,
+        data.gates_pos,
+        data.gates_quat,
+        prev_data.target_gate,
         gate_half_extent,
     )
     progress = phi_curr - phi_prev
@@ -354,7 +360,7 @@ def make_env(args: Args, config: dict = None) -> Any:
         seed=config.env.seed,
         device=args.jax_device,
         reward_fn=reward_fn,
-        max_episode_steps=args.max_episode_length
+        max_episode_steps=args.max_episode_length,
     )
     env = LogRewardComponents(
         env,
@@ -372,13 +378,19 @@ def make_env(args: Args, config: dict = None) -> Any:
     # Seed warm rotors on every (auto)reset so the drone starts in hover equilibrium instead of
     # falling with cold rotors.
     env = SpinUpRotors(env)
-    env = ActionPenalty(env, act_coef=args.act_coef, d_act_th_coef = args.d_act_th_coef, d_act_xy_coef = args.d_act_xy_coef)
+    env = ActionPenalty(
+        env,
+        act_coef=args.act_coef,
+        d_act_th_coef=args.d_act_th_coef,
+        d_act_xy_coef=args.d_act_xy_coef,
+    )
     env = NormalizeActions(env)
     env = ZeroYaw(env)
     # Relative geometry + next-2-gates + rotation matrices
     env = RelativeRacingObs(env)
     env = FlattenJaxObservation(env)
     return env
+
 
 def make_functional_env(args: Args, config: dict = None) -> Wrapper:
     """Build the fully-wrapped functional (scannable) racing environment.
@@ -402,18 +414,18 @@ def make_functional_env(args: Args, config: dict = None) -> Wrapper:
     )
 
     env = VecDroneRaceEnv(
-    num_envs=args.num_envs,
-    freq=config.env.freq,
-    sim_config=config.sim,
-    sensor_range=config.env.sensor_range,
-    control_mode=config.env.control_mode,
-    track=config.env.track,
-    disturbances=config.env.get("disturbances"),
-    randomizations=config.env.get("randomizations"),
-    seed=config.env.seed,
-    device=args.jax_device,
-    reward_fn=reward_fn,
-    max_episode_steps=args.max_episode_length
+        num_envs=args.num_envs,
+        freq=config.env.freq,
+        sim_config=config.sim,
+        sensor_range=config.env.sensor_range,
+        control_mode=config.env.control_mode,
+        track=config.env.track,
+        disturbances=config.env.get("disturbances"),
+        randomizations=config.env.get("randomizations"),
+        seed=config.env.seed,
+        device=args.jax_device,
+        reward_fn=reward_fn,
+        max_episode_steps=args.max_episode_length,
     )
 
     env = RacingEnv.create(env)
@@ -434,9 +446,14 @@ def make_functional_env(args: Args, config: dict = None) -> Wrapper:
         speed_threshold=args.speed_threshold,
     )
     env = SpinUpRotors.create(env)
-    env = ActionPenalty.create(env, act_coef=args.act_coef, d_act_th_coef = args.d_act_th_coef, d_act_xy_coef = args.d_act_xy_coef)
+    env = ActionPenalty.create(
+        env,
+        act_coef=args.act_coef,
+        d_act_th_coef=args.d_act_th_coef,
+        d_act_xy_coef=args.d_act_xy_coef,
+    )
     env = NormalizeActions.create(env)
     env = ZeroYaw.create(env)
-    env = RelativeRacingObs.create(env)
+    env = RelativeRacingObs.create(env, include_opponent_obs=args.include_opponent_obs)
     env = FlattenJaxObservation.create(env)
     return env

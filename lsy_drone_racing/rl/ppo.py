@@ -52,7 +52,12 @@ def train_ppo(
     The best checkpoint is tracked in the scan carry and written at the end.
     """
     if wandb_enabled and wandb.run is None:
-        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args), group="test")
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            config=vars(args),
+            group="single_agent_racing",
+        )
         # Pin the exact code behind this run to a branch wandb-runs/<name>-<id> so the chart
         # legend maps straight to reproducible code. Best-effort; never aborts training.
         prov = pin_run_to_branch(wandb.run.name, wandb.run.id)
@@ -100,7 +105,9 @@ def train_ppo(
     rng = jax.random.PRNGKey(args.seed)
 
     if args.anneal_lr:
-        schedule = optax.cosine_decay_schedule(args.learning_rate, args.num_iterations * args.update_epochs * args.num_minibatches)
+        schedule = optax.cosine_decay_schedule(
+            args.learning_rate, args.num_iterations * args.update_epochs * args.num_minibatches
+        )
     else:
         schedule = args.learning_rate
     tx = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(schedule, eps=1e-5))
@@ -287,6 +294,8 @@ def train_ppo(
 
     # Which metric key holds the best-checkpoint score, and the chart it logs to.
     best_key = "charts/gates_passed" if n_gates is not None else "charts/best_reward"
+    tag = "g" if n_gates is not None else "r"
+    metric = "gates-passed" if n_gates is not None else "return"
 
     # Periodic in-scan logging. Both are Python (compile-time) flags: when disabled (<=0) the
     # corresponding callback is never emitted into the traced graph, so it adds zero overhead.
@@ -296,6 +305,16 @@ def train_ppo(
         print(f"Console progress every {args.console_log_interval} iterations")
     if wandb_live:
         print(f"Publishing metrics to wandb every {args.wandb_log_interval} iterations (live)")
+
+    # Periodic checkpoint saving (in addition to the best checkpoint written at the end): disabled
+    # unless both a checkpoint dir is given and checkpoint_save_interval > 0.
+    checkpoint_live = checkpoint_dir is not None and args.checkpoint_save_interval > 0
+    if checkpoint_live:
+        save_every = max(1, round(args.checkpoint_save_interval / args.batch_size))
+        print(
+            f"Saving periodic checkpoints every {save_every} iterations "
+            f"(~{args.checkpoint_save_interval} steps)"
+        )
 
     def _log_iter(
         iter_idx: Array, reward: Array, gates: Array, value_loss: Array, approx_kl: Array
@@ -312,6 +331,18 @@ def train_ppo(
         """Host-side wandb.log of one iteration's metrics; called via an ordered callback."""
         wandb.log({k: float(v) for k, v in metrics.items()}, step=int(step))
 
+    def _save_checkpoint(step: Array, params_state: nnx.State, score: Array) -> None:
+        """Host-side periodic checkpoint write; called by an ordered jax.debug.callback."""
+        nnx.update(agent, params_state)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        name = f"{run_name}_{timestamp}_{tag}{float(score):.2f}_step{int(step)}.ckpt"
+        path = checkpoint_dir / name
+        with open(path, "wb") as f:
+            pickle.dump(nnx.state(agent, nnx.Param), f)
+        print(
+            f"Periodic checkpoint (step {int(step)}, {metric} {float(score):.2f}) saved to {path}"
+        )
+
     def train_iteration(carry: tuple, iter_idx: Array) -> tuple[tuple, dict]:
         params, opt_state, env, obs, prev_done, rng, ep_ret, ep_len, best_params, best_score = carry
 
@@ -321,7 +352,7 @@ def train_ppo(
             params, env, obs, roll_rng, ep_ret, ep_len
         )
 
-        # -- GAE -- 
+        # -- GAE --
         d = outs["done"]  # (T, E) post-step done
         dones_buf = jnp.concatenate([prev_done[None], d[:-1]], axis=0)
         next_done = d[-1]
@@ -391,11 +422,11 @@ def train_ppo(
         }
         # Reward components -> reward/<name>; diagnostics keep their prefix. Mean per step.
         for k in metric_keys:
-            name = f"reward/{k[len('rew/'):]}" if k.startswith("rew/") else k
+            name = f"reward/{k[len('rew/') :]}" if k.startswith("rew/") else k
             metrics[name] = jnp.sum(outs["metrics"][k]) / denom
         # Max-reduced metrics -> diagnostics/<name>_max: the rollout peak (e.g. max/vel).
         for k in max_keys:
-            metrics[f"diagnostics/{k[len('max/'):]}_max"] = jnp.max(outs["metrics_max"][k])
+            metrics[f"diagnostics/{k[len('max/') :]}_max"] = jnp.max(outs["metrics_max"][k])
 
         # Periodic in-scan side effects via ordered external callbacks. Each is gated by lax.cond so
         # the host round-trip happens only on the logged iterations (plus the last) -- the rest of
@@ -407,7 +438,12 @@ def train_ppo(
             jax.lax.cond(
                 should_log,
                 lambda: jax.debug.callback(
-                    _log_iter, iter_idx, ep_return, gates_passed, value_loss, approx_kl,
+                    _log_iter,
+                    iter_idx,
+                    ep_return,
+                    gates_passed,
+                    value_loss,
+                    approx_kl,
                     ordered=True,
                 ),
                 lambda: None,
@@ -421,10 +457,27 @@ def train_ppo(
                 ),
                 lambda: None,
             )
+        if checkpoint_live:
+            should_save = ((iter_idx + 1) % save_every) == 0
+            jax.lax.cond(
+                should_save,
+                lambda: jax.debug.callback(
+                    _save_checkpoint, (iter_idx + 1) * args.batch_size, params, score, ordered=True
+                ),
+                lambda: None,
+            )
 
         new_carry = (
-            params, opt_state, env, last_obs, next_done, rng, ep_ret, ep_len,
-            best_params, best_score,
+            params,
+            opt_state,
+            env,
+            last_obs,
+            next_done,
+            rng,
+            ep_ret,
+            ep_len,
+            best_params,
+            best_score,
         )
         return new_carry, metrics
 
@@ -472,8 +525,6 @@ def train_ppo(
     model_path = None
     if checkpoint_dir is not None:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        tag = "g" if n_gates is not None else "r"
-        metric = "gates-passed" if n_gates is not None else "return"
         model_path = checkpoint_dir / f"{run_name}_{timestamp}_{tag}{best_score:.2f}_best.ckpt"
         nnx.update(agent, best_params)
         with open(model_path, "wb") as f:
@@ -515,13 +566,7 @@ def evaluate_ppo(
         return (env, next_obs, done_so_far, ret, length), None
 
     env0, (obs0, _) = eval_env.reset(eval_env, seed=args.seed)
-    carry0 = (
-        env0,
-        obs0,
-        jnp.zeros(n_eval, dtype=bool),
-        jnp.zeros(n_eval),
-        jnp.zeros(n_eval),
-    )
+    carry0 = (env0, obs0, jnp.zeros(n_eval, dtype=bool), jnp.zeros(n_eval), jnp.zeros(n_eval))
     (_, _, _, ret, length), _ = jax.lax.scan(eval_scan, carry0, None, length=max_steps)
     episode_rewards = np.array(ret)
     episode_lengths = np.array(length)

@@ -331,7 +331,7 @@ class RrtController(Controller):
         # draw_points(sim, self.spline(t_now).reshape(1, -1), rgba=(0.5, 0.5, 1.0, 1.0), size=0.02)
 
         # Visualize waypoint milestones
-        #if len(self._pre_gate_waypoints) > 0:
+        # if len(self._pre_gate_waypoints) > 0:
         #    draw_points(sim, self._pre_gate_waypoints, rgba=(0.0, 0.0, 1.0, 1.0), size=0.012)
         #    draw_points(sim, self._gate_center_waypoints, rgba=(0.0, 1.0, 1.0, 1.0), size=0.015)
         #    draw_points(sim, self._post_gate_waypoints, rgba=(1.0, 1.0, 0.0, 1.0), size=0.012)
