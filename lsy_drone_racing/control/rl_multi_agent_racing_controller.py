@@ -175,7 +175,11 @@ class RLMultiAgentRacingController(Controller):
     def _obs_vector(self, obs: dict[str, NDArray[np.floating]]) -> jnp.ndarray:
         """Build this drone's flat policy observation from the batched multi-drone observation."""
         raw = {k: jnp.asarray(obs[k])[self.rank][None] for k in _RAW_OBS_KEYS}
-        raw["target_gate"] = jnp.atleast_1d(jnp.asarray(obs["target_gate"])[self.rank])
+        raw["n_gates_passed"] = jnp.atleast_1d(jnp.asarray(obs["n_gates_passed"])[self.rank])
+        # gate_sequence is (n_drones, k); slice this drone's row and normalize to the (E=1, k)
+        # shape _relative_racing_obs expects.
+        gate_sequence = jnp.asarray(obs["gate_sequence"])[self.rank]
+        raw["gate_sequence"] = gate_sequence.reshape((1, gate_sequence.shape[-1]))
         raw["last_action"] = self._last_action[None]
         rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays
         if self._include_opponent_obs:
@@ -217,9 +221,10 @@ class RLMultiAgentRacingController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Signal completion once this drone has passed the whole track."""
-        target_gate = np.asarray(obs["target_gate"]).reshape(-1)[self.rank]
-        self._finished = bool(target_gate == -1)
+        """Signal completion once this drone has passed the whole configured gate order."""
+        n_gates_passed = np.asarray(obs["n_gates_passed"]).reshape(-1)[self.rank]
+        n_gate_passes = np.asarray(obs["gate_sequence"]).shape[-1]
+        self._finished = bool(n_gates_passed >= n_gate_passes)
         return self._finished
 
     def episode_callback(self):

@@ -40,13 +40,39 @@ from jax.scipy.spatial.transform import Rotation as R
 # in sync so the dense reward's notion of "inside the opening" agrees with the env's pass detection.
 GATE_HALF_EXTENT = 0.225
 
-# A progress potential: drone position(s), gate geometry, the per-drone target gate index, and the
-# opening half-extent -> potential Phi, shape (n_envs, n_drones). Higher == closer to the goal.
+# A progress potential: drone position(s), gate geometry, the per-drone resolved gate id (see
+# resolve_gate_id), and the opening half-extent -> potential Phi, shape (n_envs, n_drones). Higher
+# == closer to the goal.
 PotentialFn = Callable[[Array, Array, Array, Array, float], Array]
 
 
+def resolve_gate_id(n_gates_passed: Array, gate_sequence: Array) -> Array:
+    """Map a per-drone gate-order progress count to the physical gate id it currently targets.
+
+    ``n_gates_passed`` is a *count* of completed gate-order entries, not a gate id -- under a
+    non-trivial ``track.gate_order`` (a permutation, or one that revisits a gate) the physical gate
+    at position ``i`` of the order is ``gate_sequence[i]``, which need not equal ``i``. Once
+    finished (``n_gates_passed == gate_sequence.shape[-1]``) there is nothing left to index, so the
+    count is clamped to the last entry -- matching ``race_core._update_target_gates``'s own
+    out-of-bounds convention. Callers that need to special-case "finished" (e.g. to gate a reward
+    term) must check that separately; this function only resolves the id.
+
+    Args:
+        n_gates_passed: Progress count per drone, any shape, e.g. (n_envs, n_drones).
+        gate_sequence: Either the raw ``(k,)`` sequence shared by every env/drone (as stored on
+            ``EnvData``), or already broadcast to ``n_gates_passed.shape + (k,)`` (as returned in
+            the observation dict) -- both are handled.
+
+    Returns:
+        Physical gate id (0-based), same shape as ``n_gates_passed``.
+    """
+    idx = jnp.clip(n_gates_passed, 0, gate_sequence.shape[-1] - 1)
+    seq = jnp.broadcast_to(gate_sequence, idx.shape + gate_sequence.shape[-1:])
+    return jnp.take_along_axis(seq, idx[..., None], axis=-1)[..., 0]
+
+
 def _target_gate_frame(
-    drone_pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array
+    drone_pos: Array, gates_pos: Array, gates_quat: Array, gate_id: Array
 ) -> tuple[Array, Array, Array]:
     """Locate each drone's target gate and express the drone offset in that gate's frame.
 
@@ -54,8 +80,8 @@ def _target_gate_frame(
         drone_pos: Drone positions, shape (n_envs, n_drones, 3).
         gates_pos: Gate centers, shape (n_envs, n_gates, 3).
         gates_quat: Gate orientations (xyzw), shape (n_envs, n_gates, 4).
-        target_gate: Current target gate index per drone, shape (n_envs, n_drones). -1 (finished)
-            wraps to the last gate.
+        gate_id: Physical gate index (0-based, already resolved via :func:`resolve_gate_id`) per
+            drone, shape (n_envs, n_drones).
 
     Returns:
         ``(gate_pos, rot, local)``: the target gate center (n_envs, n_drones, 3), the gate's
@@ -63,11 +89,9 @@ def _target_gate_frame(
         frame (n_envs, n_drones, 3) -- local x is the along-axis (traversal) coordinate, local y/z
         span the gate opening.
     """
-    n_gates = gates_pos.shape[1]
     env_idx = jnp.arange(gates_pos.shape[0])[:, None]
-    idx = target_gate % n_gates  # -1 (finished) indicates the last gate
-    gate_pos = gates_pos[env_idx, idx]  # (E, D, 3)
-    gate_quat = gates_quat[env_idx, idx]  # (E, D, 4)
+    gate_pos = gates_pos[env_idx, gate_id]  # (E, D, 3)
+    gate_quat = gates_quat[env_idx, gate_id]  # (E, D, 4)
     n_envs, n_drones = gate_pos.shape[:2]
     rot = R.from_quat(gate_quat.reshape(-1, 4)).as_matrix().reshape(n_envs, n_drones, 3, 3)
     # rot maps gate-frame vectors to world; its transpose maps the world offset into the gate frame.
@@ -76,7 +100,7 @@ def _target_gate_frame(
 
 
 def gate_opening_distance(
-    drone_pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array, half_extent: float
+    drone_pos: Array, gates_pos: Array, gates_quat: Array, gate_id: Array, half_extent: float
 ) -> Array:
     """Euclidean distance (m) from each drone to its target gate's *opening* (lower == closer).
 
@@ -96,7 +120,7 @@ def gate_opening_distance(
 
     Returns distance, shape (n_envs, n_drones).
     """
-    _, _, local = _target_gate_frame(drone_pos, gates_pos, gates_quat, target_gate)
+    _, _, local = _target_gate_frame(drone_pos, gates_pos, gates_quat, gate_id)
     along = local[..., 0]
     oy = jnp.maximum(jnp.abs(local[..., 1]) - half_extent, 0.0)
     oz = jnp.maximum(jnp.abs(local[..., 2]) - half_extent, 0.0)
@@ -106,8 +130,8 @@ def gate_opening_distance(
 def _champion_potential(**_: float) -> PotentialFn:
     """Champion-paper potential ``Phi = -gate_opening_distance`` (no shape params)."""
 
-    def phi(pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array, h: float) -> Array:
-        return -gate_opening_distance(pos, gates_pos, gates_quat, target_gate, h)
+    def phi(pos: Array, gates_pos: Array, gates_quat: Array, gate_id: Array, h: float) -> Array:
+        return -gate_opening_distance(pos, gates_pos, gates_quat, gate_id, h)
 
     return phi
 
@@ -127,8 +151,8 @@ def _asymmetric_potential(
         Phi = 0.5 * exp(-distance / reach) + 0.5 * exp(-distance / sharpness)
     """
 
-    def phi(pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array, h: float) -> Array:
-        _, _, local = _target_gate_frame(pos, gates_pos, gates_quat, target_gate)
+    def phi(pos: Array, gates_pos: Array, gates_quat: Array, gate_id: Array, h: float) -> Array:
+        _, _, local = _target_gate_frame(pos, gates_pos, gates_quat, gate_id)
         along = local[..., 0]
         oy = jnp.maximum(jnp.abs(local[..., 1]) - h, 0.0)
         oz = jnp.maximum(jnp.abs(local[..., 2]) - h, 0.0)
@@ -183,19 +207,17 @@ def _fancy_progress(pos: Array, gate_pos: Array, gate_quat: Array) -> Array:
 def _fancy_potential(**_: float) -> PotentialFn:
     """Blended angle/distance potential (no shape params); see :func:`_fancy_progress`."""
 
-    def phi(pos: Array, gates_pos: Array, gates_quat: Array, target_gate: Array, h: float) -> Array:
-        n_gates = gates_pos.shape[1]
+    def phi(pos: Array, gates_pos: Array, gates_quat: Array, gate_id: Array, h: float) -> Array:
         env_idx = jnp.arange(gates_pos.shape[0])[:, None]
-        idx = target_gate % n_gates  # -1 (finished) wraps to the last gate
-        gate_pos = gates_pos[env_idx, idx]  # (E, D, 3)
-        gate_quat = gates_quat[env_idx, idx]  # (E, D, 4)
+        gate_pos = gates_pos[env_idx, gate_id]  # (E, D, 3)
+        gate_quat = gates_quat[env_idx, gate_id]  # (E, D, 4)
         return _fancy_progress(pos, gate_pos, gate_quat)  # vectorized over (E, D)
 
     return phi
 
 
 # name -> factory(**shape_params) -> PotentialFn. Each factory binds the variant's shape params
-# (ignoring any it doesn't use) and returns a Phi(pos, gates_pos, gates_quat, target_gate, h) closure.
+# (ignoring any it doesn't use) and returns a Phi(pos, gates_pos, gates_quat, gate_id, h) closure.
 PROGRESS_VARIANTS: dict[str, Callable[..., PotentialFn]] = {
     "champion": _champion_potential,
     "asymmetric": _asymmetric_potential,

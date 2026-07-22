@@ -54,6 +54,10 @@ control_mode = "attitude"
 [env.track]
 randomize = false
 
+# Order in which the gates have to be passed. Entries are signed gate numbers, not gate IDs:
+# `1` means gate ID 0 in forward direction, `-1` means the same gate in reverse direction.
+gate_order = [1, 2, 3, 4]
+
 [[env.track.gates]]
 pos = [0.5 , 0.25, 0.7]
 rpy = [0.0, 0.0, -0.78]

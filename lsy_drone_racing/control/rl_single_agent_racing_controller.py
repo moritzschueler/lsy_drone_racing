@@ -60,7 +60,8 @@ _CHECKPOINT_DIR = Path(__file__).parents[1] / "rl" / "checkpoints" / "single_age
 _TIMESTAMP_RE = re.compile(r"\d{8}-\d{6}")
 
 # Keys the relative-racing observation reads from the raw per-drone observation, plus the ones this
-# controller supplies itself (``last_action``). Mirrors what ActionPenalty + RelativeRacingObs need.
+# controller supplies itself (``last_action``, ``n_gates_passed``, ``gate_sequence``). Mirrors what
+# ActionPenalty + RelativeRacingObs need.
 _RAW_OBS_KEYS = (
     "pos",
     "quat",
@@ -172,7 +173,11 @@ class RLSingleAgentRacingController(Controller):
         flattens its outputs in insertion order -- the same order ``FlattenJaxObservation`` uses.
         """
         raw = {k: jnp.asarray(obs[k])[None] for k in _RAW_OBS_KEYS}
-        raw["target_gate"] = jnp.atleast_1d(jnp.asarray(obs["target_gate"]))
+        raw["n_gates_passed"] = jnp.atleast_1d(jnp.asarray(obs["n_gates_passed"]))
+        # gate_sequence is (k,) or already (1, k) depending on the env; normalize to (1, k) -- the
+        # (E, k) shape _relative_racing_obs expects.
+        gate_sequence = jnp.asarray(obs["gate_sequence"])
+        raw["gate_sequence"] = gate_sequence.reshape((1, gate_sequence.shape[-1]))
         raw["last_action"] = self._last_action[None]
         rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays
         if self._include_opponent_obs:
@@ -209,13 +214,14 @@ class RLSingleAgentRacingController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Signal completion once the whole track has been passed (target_gate == -1).
+        """Signal completion once the whole configured gate order has been passed.
 
         Returns:
             True if the track is finished, False otherwise.
         """
-        target_gate = np.asarray(obs["target_gate"]).reshape(-1)[0]
-        self._finished = bool(target_gate == -1)
+        n_gates_passed = np.asarray(obs["n_gates_passed"]).reshape(-1)[0]
+        n_gate_passes = np.asarray(obs["gate_sequence"]).shape[-1]
+        self._finished = bool(n_gates_passed >= n_gate_passes)
         return self._finished
 
     def episode_callback(self):

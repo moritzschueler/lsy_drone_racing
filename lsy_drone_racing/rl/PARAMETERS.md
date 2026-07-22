@@ -69,8 +69,8 @@ The three shipped variants:
   incentives. (The old bounded potential sat at ~0 by construction; this term should not.)
 
 ### `gate_bonus` (current **20.0**)
-One-off bonus each time `target_gate` advances (an actual pass). Provides the discrete "go *through*,
-not just *near*" incentive that the telescoping progress term can't.
+One-off bonus each time `n_gates_passed` advances (an actual pass). Provides the discrete "go
+*through*, not just *near*" incentive that the telescoping progress term can't.
 - **↑** Crossing becomes worth more risk. The crash-vs-cross break-even success probability is
   `crash / (gate_bonus + crash)` — at 5/5 that's `5/25 = 0.20`; raising `gate_bonus` lowers it
   further. Lower threshold ⇒ the policy attempts crossings even when it's only moderately likely to
@@ -85,7 +85,8 @@ not just *near*" incentive that the telescoping progress term can't.
   see `GATE_HALF_EXTENT`) and symmetric failure penalties, raising it is safe.
 
 ### `finish_bonus` (current **30.0**)
-Large one-off bonus when the final gate is passed (`target_gate → −1`).
+Large one-off bonus when the final gate is passed (`n_gates_passed` reaches the gate-order sequence
+length).
 - **↑** Stronger pull to complete the *whole* track vs. stopping after a few gates.
 - **↓** Less incentive to finish; the policy may settle for partial laps.
 - **Note:** keep it clearly above `gate_bonus` and the failure penalties so finishing always wins.
@@ -268,10 +269,15 @@ carry and written out at the end of the run.
 The scripted PID opponent (mixed into the self-play pool per `opponent_pid_prob_*`) can start each
 episode mid-trajectory instead of on the pad, so the ego actually meets — and must overtake — a
 leader. The opponent is teleported onto its waypoint spline at
-`t0 ~ U(frac_min, frac_max) · opponent_pid_t_total`, with matching velocity and its `target_gate`
-advanced to the gate it is approaching (so rank / segment-lead / victory shaping treats it as
+`t0 ~ U(frac_min, frac_max) · opponent_pid_t_total`, with matching velocity and its `n_gates_passed`
+advanced to match the gate it is approaching (so rank / segment-lead / victory shaping treats it as
 genuinely ahead). `t0` is always clamped below the last gate's pass time — the opponent never spawns
 already-finished.
+- **`track.gate_order` must be the plain forward sequence `[1, 2, ..., n_gates]` whenever PID
+  opponents are enabled** (`opponent_pid_prob_start`/`_end` > 0). The scripted PID flies a fixed,
+  single-pass, non-looping spline that crosses the physical gates in `config.env.track.gates`' raw
+  list order; a permuted or repeating `gate_order` desyncs its real flight path from the
+  `n_gates_passed` bookkeeping (asserted at startup in `ippo.py`, see there).
 
 ### `opponent_pid_start_frac_min` (current **0.0**) / `opponent_pid_start_frac_max` (current **0.5**)
 

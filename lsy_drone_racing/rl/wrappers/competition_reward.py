@@ -5,14 +5,14 @@ the host-side ``OpponentWrapper`` into the JAX functional pipeline, so it compil
 ``lax.scan``/``jit`` along with the rest of the rollout.
 
 Placement matters: this wrapper must sit **before** ``RelativeRacingObs`` in the chain. It needs
-the raw, per-drone ``pos``/``target_gate``/``gates_pos`` straight out of ``race_core.obs`` --
-exactly the fields ``RelativeRacingObs`` drops or transforms into body-frame features. Note that
-``gates_pos`` is per-drone (``(n_envs, n_drones, n_gates, 3)``) despite the underlying gate layout
-being shared across drones: ``race_core.obs()`` broadcasts the shared gate positions against each
-drone's own ``gates_visited`` sensor mask. Any position in the chain before ``RelativeRacingObs``
-(after ``LogRewardComponents``, before/after
+the raw, per-drone ``pos``/``n_gates_passed``/``gate_sequence``/``gates_pos`` straight out of
+``race_core.obs`` -- exactly the fields ``RelativeRacingObs`` drops or transforms into body-frame
+features. Note that ``gates_pos`` is per-drone (``(n_envs, n_drones, n_gates, 3)``) despite the
+underlying gate layout being shared across drones: ``race_core.obs()`` broadcasts the shared gate
+positions against each drone's own ``gates_visited`` sensor mask. Any position in the chain before
+``RelativeRacingObs`` (after ``LogRewardComponents``, before/after
 ``SpinUpRotors``/``ActionPenalty``/``NormalizeActions``/``ZeroYaw``) works, since none of those
-touch ``pos``/``target_gate``/``gates_pos``.
+touch ``pos``/``n_gates_passed``/``gate_sequence``/``gates_pos``.
 
 Only the ego drone (index 0) receives the competition reward, matching ``OpponentWrapper``.
 Currently supports exactly 2 drones (1 opponent) -- generalizing to >2 drones would need a
@@ -35,6 +35,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
+from lsy_drone_racing.rl.tasks.progress_variants import resolve_gate_id
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
 
 
@@ -48,21 +49,23 @@ def _build_competition_reward_fn(
     downwash_base_radius: float,
     downwash_expansion: float,
     downwash_vertical_softening: float,
-) -> Callable[[Array, Array, Array, Array, Array, Array], dict[str, Array]]:
+) -> Callable[..., dict[str, Array]]:
     """Build the pure-JAX ego-vs-single-opponent reward function (identical math to OpponentWrapper)."""
 
     def _competition_reward(
         ego_pos: Array,
-        ego_gate: Array,
+        ego_gates_passed: Array,
+        ego_gate_id: Array,
         ego_gates_pos: Array,
         opp_pos: Array,
-        opp_gate: Array,
+        opp_gates_passed: Array,
+        n_gate_passes: int,
         terminated: Array,
     ) -> dict[str, Array]:
-        # --- rank reward: how many gates ahead of the opponent the ego is ---
-        ego_gate_f = ego_gate.astype(jnp.float32)
-        opp_gate_f = opp_gate.astype(jnp.float32)
-        rank = jnp.clip(ego_gate_f - opp_gate_f, 0, 3)
+        # --- rank reward: how many gate-order entries ahead of the opponent the ego is ---
+        ego_gates_passed_f = ego_gates_passed.astype(jnp.float32)
+        opp_gates_passed_f = opp_gates_passed.astype(jnp.float32)
+        rank = jnp.clip(ego_gates_passed_f - opp_gates_passed_f, 0, n_gate_passes)
 
         # --- proximity penalty: discourage flying too close to the opponent ---
         rel_pos = opp_pos - ego_pos
@@ -70,17 +73,18 @@ def _build_competition_reward_fn(
         proximity = -jnp.clip(proximity_threshold - dist, 0.0, proximity_threshold)
 
         # --- segment lead reward: closer to the shared next gate than the opponent is ---
-        safe_gate = jnp.clip(ego_gate, 0, ego_gates_pos.shape[1] - 1)
-        ego_next_gate_pos = ego_gates_pos[jnp.arange(ego_gates_pos.shape[0]), safe_gate]
+        # ego_gate_id is already resolved (via resolve_gate_id) to a valid physical gate index, so
+        # no extra clipping is needed here.
+        ego_next_gate_pos = ego_gates_pos[jnp.arange(ego_gates_pos.shape[0]), ego_gate_id]
         ego_dist = jnp.linalg.norm(ego_next_gate_pos - ego_pos, axis=-1)
         opp_dist = jnp.linalg.norm(ego_next_gate_pos - opp_pos, axis=-1)
         dist_advantage = jnp.clip(opp_dist - ego_dist, 0.0, 5.0)
-        same_segment = (ego_gate == opp_gate).astype(jnp.float32)
+        same_segment = (ego_gates_passed == opp_gates_passed).astype(jnp.float32)
         segment_lead = same_segment * dist_advantage
 
         # --- victory reward: ego finished, opponent didn't, episode ended ---
-        ego_finished = ego_gate == -1
-        ego_leading = opp_gate != -1
+        ego_finished = ego_gates_passed >= n_gate_passes
+        ego_leading = opp_gates_passed < n_gate_passes
         victory = (ego_finished & ego_leading & terminated).astype(jnp.float32)
 
         # --- downwash penalty: penalize ego for flying directly below the opponent ---
@@ -134,7 +138,8 @@ class CompetitionReward(Wrapper):
 
         Args:
             base: The wrapped env, upstream of ``RelativeRacingObs`` in the chain (its ``obs`` dict
-                must still expose the raw, per-drone ``pos``/``target_gate``/``gates_pos``).
+                must still expose the raw, per-drone
+                ``pos``/``n_gates_passed``/``gate_sequence``/``gates_pos``).
             n_drones: Number of drones in the track config. Must be exactly 2 (ego + 1 opponent);
                 asserted at build time.
             rank_coef, segment_lead_coef, proximity_coef, proximity_threshold, victory_coef,
@@ -164,17 +169,31 @@ class CompetitionReward(Wrapper):
         def _apply(
             obs: dict, reward: Array, terminated: Array
         ) -> tuple[Array, dict[str, Array]]:
-            # pos/target_gate: (n_envs, n_drones, ...) -> index the drone axis.
+            # pos/n_gates_passed: (n_envs, n_drones, ...) -> index the drone axis.
             ego_pos, opp_pos = obs["pos"][:, 0], obs["pos"][:, 1]
-            ego_gate, opp_gate = obs["target_gate"][:, 0], obs["target_gate"][:, 1]
+            ego_gates_passed, opp_gates_passed = (
+                obs["n_gates_passed"][:, 0],
+                obs["n_gates_passed"][:, 1],
+            )
             # gates_pos: (n_envs, n_drones, n_gates, 3) -- race_core.obs() broadcasts the raw,
             # env-shared gate positions against the per-drone gates_visited sensor mask, so it
             # comes out per-drone despite the underlying gate layout being shared. Slice to ego's
-            # view of the gates.
+            # view of the gates. gate_sequence is similarly per-drone-broadcast; resolve ego's
+            # progress count into the physical gate id ego_gates_pos is indexed by (n_gates_passed
+            # is a position in the gate order, not a gate id -- see resolve_gate_id).
             ego_gates_pos = obs["gates_pos"][:, 0]
+            ego_gate_id = resolve_gate_id(ego_gates_passed, obs["gate_sequence"][:, 0])
+            n_gate_passes = obs["gate_sequence"].shape[-1]
             ego_terminated = terminated[:, 0]
             components = competition_reward_fn(
-                ego_pos, ego_gate, ego_gates_pos, opp_pos, opp_gate, ego_terminated
+                ego_pos,
+                ego_gates_passed,
+                ego_gate_id,
+                ego_gates_pos,
+                opp_pos,
+                opp_gates_passed,
+                n_gate_passes,
+                ego_terminated,
             )
             competition_reward = sum(components.values())
             # reward: (n_envs, n_drones) from the base env's reward_fn. Only the ego slot gets the

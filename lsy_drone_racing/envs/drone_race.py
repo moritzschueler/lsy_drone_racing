@@ -195,7 +195,7 @@ class VecDroneRaceEnv(RaceCoreEnv, VectorEnv):
         self.data, (obs, reward, terminated, truncated, info) = self._step(self.data, action)
         obs = {k: v[:, 0] for k, v in obs.items()}
         info = {k: v[:, 0] for k, v in info.items()}
-        # Expose the current target gate (next gate to pass, or -1 once the track is completed)
-        # so training can log gate-progress / completion metrics.
-        info["target_gate"] = self.data.target_gate[:, 0]
+        # Expose the current gate-order progress count (== gate_sequence length once finished) so
+        # training can log gate-progress / completion metrics.
+        info["n_gates_passed"] = self.data.n_gates_passed[:, 0]
         return obs, reward[:, 0], terminated[:, 0], truncated[:, 0], info

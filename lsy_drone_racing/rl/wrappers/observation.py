@@ -81,7 +81,7 @@ def _flat_size(space: spaces.Space) -> int:
 class FlattenJaxObservation(Wrapper):
     """Flatten the dict observation into a single float32 vector per environment.
 
-    gym's ``flatten_space`` one-hot-encodes ``Discrete`` spaces (e.g. ``target_gate``), which would
+    gym's ``flatten_space`` one-hot-encodes ``Discrete`` spaces (e.g. ``n_gates_passed``), which would
     not match a plain concatenation of the raw observation values. We build the flattened space
     ourselves: each entry contributes ``prod(shape)`` features (a ``Discrete`` contributes 1), and
     ``step``/``reset`` concatenate the same keys, cast to float32, in the same fixed order.
@@ -143,7 +143,6 @@ def _relative_racing_obs(obs: dict) -> dict:
     """Recast a raw racing observation into the fully body-frame, next-2-gates representation."""
     pos = obs["pos"]  # (E, 3)
     n_envs = pos.shape[0]
-    n_gates = obs["gates_pos"].shape[1]
     # Drone attitude, body -> world. Its transpose (world -> body) rotates world quantities into
     # the drone frame.
     rot_bw = R.from_quat(obs["quat"]).as_matrix()  # (E, 3, 3)
@@ -154,10 +153,18 @@ def _relative_racing_obs(obs: dict) -> dict:
     # Gravity direction in the body frame: the only world reference a relative observation needs
     # (tells the policy which way is "down" for thrust/attitude). Equals -rot_bw[:, 2, :].
     grav_body = to_body_vec(jnp.array([0.0, 0.0, -1.0]) + jnp.zeros_like(pos))
-    # Indices of the next N_NEXT_GATES gates, clamped to the last gate (and to 0 once finished).
-    base_idx = jnp.maximum(obs["target_gate"], 0)  # target_gate is -1 when the track is done
-    idx = jnp.minimum(base_idx[:, None] + jnp.arange(N_NEXT_GATES)[None, :], n_gates - 1)  # (E, k)
+    # Sequence positions (not gate ids -- see gate_sequence below) of the next N_NEXT_GATES
+    # gate-order entries, clamped to the last entry once finished.
+    n_gate_passes = obs["gate_sequence"].shape[-1]
+    base_seq_idx = jnp.minimum(obs["n_gates_passed"], n_gate_passes - 1)
+    seq_idx = jnp.minimum(
+        base_seq_idx[:, None] + jnp.arange(N_NEXT_GATES)[None, :], n_gate_passes - 1
+    )  # (E, k)
     env_idx = jnp.arange(n_envs)[:, None]
+    # gate_sequence maps a sequence position to the physical gate id -- gates_pos/quat/visited are
+    # indexed by physical gate id, which need not equal the sequence position under a permuted or
+    # repeating track.gate_order.
+    idx = obs["gate_sequence"][env_idx, seq_idx]  # (E, k) physical gate ids
     gates_pos = obs["gates_pos"][env_idx, idx]  # (E, k, 3)
     gates_quat = obs["gates_quat"][env_idx, idx]  # (E, k, 4)
     gates_visited = obs["gates_visited"][env_idx, idx]  # (E, k)
@@ -239,7 +246,8 @@ class RelativeRacingObs(Wrapper):
       (``(N_NEXT_GATES, 4, 3)``) instead of a gate-centre + relative-rotation-matrix pair; the four
       corners jointly encode the gate centre, orientation and scale with no quaternion double-cover
       discontinuity,
-    * drops the ``target_gate`` index (implicit once only the upcoming gates are shown),
+    * drops the ``n_gates_passed``/``gate_sequence`` progress fields (implicit once only the
+      upcoming gates are shown),
     * replaces the full world-frame drone attitude with ``grav_body``, the gravity direction in
       the body frame -- the only world reference a body-frame observation still needs (which way
       is "down" for thrust/attitude). Yaw-about-vertical is intentionally not observable.
