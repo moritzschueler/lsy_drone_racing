@@ -81,7 +81,7 @@ class MultiAgentRacingArgs(RacingArgs):
     opponent_start_step: int = 0
     # Recency-weighted sampling over the self-play pool: 0 = uniform over filled slots,
     # 1 = almost always the most recent.
-    opponent_recency_bias: float = 0.7
+    opponent_recency_bias: float = 0.3
 
     # -- Competition reward (ego vs. opponent shaping; see CompetitionReward) --
     # Master switch: set False to fall back to plain progress-based racing reward only.
@@ -107,10 +107,10 @@ class MultiAgentRacingArgs(RacingArgs):
     # Fraction of envs whose opponent(s) are PID/spline-controlled rather than drawn from the
     # self-play pool, resampled every episode. Requires control_mode == "attitude"; set both
     # opponent_pid_prob_start and opponent_pid_prob_end to 0 to disable entirely.
-    opponent_pid_prob_start: float = 0.8
+    opponent_pid_prob_start: float = 0.9
     # Target fraction once the anneal (below) completes -- lower than the start so self-play comes
     # to dominate opponent behavior as the pool matures.
-    opponent_pid_prob_end: float = 0.3
+    opponent_pid_prob_end: float = 0.1
     # Global steps over which opponent_pid_prob linearly anneals from *_start to *_end (held
     # constant at *_end afterwards).
     opponent_pid_decay_steps: int = 300_000_000
