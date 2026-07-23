@@ -47,10 +47,7 @@ if TYPE_CHECKING:
 # Force specific checkpoints per drone rank (index 0 = drone 0, index 1 = drone 1, ...). Entries
 # are absolute paths, or filenames resolved against the multi_agent_racing checkpoints folder.
 # Leave an entry as "" (or the list short) to auto-pick the rank-th most recent checkpoint.
-CHECKPOINT_OVERRIDES: list[str] = [
-    "multi_agent_racing_20260723-020831_g2.49_best.ckpt",
-    "multi_agent_racing_20260723-020005_g1.47_step299630592.ckpt",
-]
+CHECKPOINT_OVERRIDES: list[str] = []
 # ---------------------------------------------------------------------------------------------
 
 _ACTION_DIM = 4
