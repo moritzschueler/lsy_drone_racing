@@ -17,6 +17,8 @@ from lsy_drone_racing.rl.tasks.progress_variants import (
     _target_gate_frame,
     build_progress_potential,
     default_progress_params,
+    gate_opening_distance,
+    resolve_gate_id,
 )
 from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, RelativeRacingObs
 from lsy_drone_racing.rl.wrappers.racing_env import RacingEnv
@@ -95,36 +97,40 @@ def racing_reward_components(
     """
     # Progress = the per-step INCREASE of the selected progress potential Phi (progress_potential,
     # one of progress_variants.PROGRESS_VARIANTS), measured against the gate that was the target at
-    # the start of the step (prev_data.target_gate for both terms, so the gate-advance is handled
-    # without an artifact). Every variant is a deterministic function of state, so this difference
-    # telescopes and cannot be farmed by looping; the gate-advance resets the reference potential to
-    # the next gate (a one-step change bounded by the drone's per-step displacement, not by
-    # progress_coef -- so crossing is never meaningfully net-penalized). Left unmasked on the
-    # crossing step to keep it a pure potential difference (no bias, no flat step).
+    # the start of the step (the physical gate resolved from prev_data.n_gates_passed via the
+    # gate-order sequence, for both terms, so the gate-advance is handled without an artifact).
+    # Every variant is a deterministic function of state, so this difference telescopes and cannot
+    # be farmed by looping; the gate-advance resets the reference potential to the next gate (a
+    # one-step change bounded by the drone's per-step displacement, not by progress_coef -- so
+    # crossing is never meaningfully net-penalized). Left unmasked on the crossing step to keep it a
+    # pure potential difference (no bias, no flat step).
+    gate_id = resolve_gate_id(prev_data.n_gates_passed, prev_data.gate_sequence)
     phi_prev = progress_potential(
         prev_data.sim_data.states.pos,
         data.gates_pos,
         data.gates_quat,
-        prev_data.target_gate,
+        gate_id,
         gate_half_extent,
     )
     phi_curr = progress_potential(
         data.sim_data.states.pos,
         data.gates_pos,
         data.gates_quat,
-        prev_data.target_gate,
+        gate_id,
         gate_half_extent,
     )
     progress = phi_curr - phi_prev
 
-    active = prev_data.target_gate != -1  # episode was not already finished
-    passed_gate = (data.target_gate != prev_data.target_gate) & active
-    finished = (data.target_gate == -1) & active
-    not_finished = data.target_gate != -1
+    n_gate_passes = prev_data.gate_sequence.shape[0]
+    active = prev_data.n_gates_passed < n_gate_passes  # episode was not already finished
+    passed_gate = (data.n_gates_passed != prev_data.n_gates_passed) & active
+    finished = (data.n_gates_passed >= n_gate_passes) & active
+    not_finished = data.n_gates_passed < n_gate_passes
     crashed = data.disabled_drones & ~prev_data.disabled_drones & not_finished
     # Truncation fires at the step steps == max_episode_steps; NEXT_STEP autoreset doesn't reset
     # `steps` until the following step, so it's still readable here. Penalize only if not finished
-    # (a drone that already finished and idles to timeout has target_gate == -1 -> exempt).
+    # (a drone that already finished and idles to timeout has n_gates_passed >= n_gate_passes ->
+    # exempt).
     timed_out = (data.steps >= data.max_episode_steps)[:, None] & not_finished & active
 
     # Speed hinge: a one-sided penalty on speed above speed_threshold (see quadratic_speed_penalty).
@@ -177,7 +183,8 @@ def build_racing_reward(
       change bounded by the drone's per-step displacement (not by ``progress_coef``), so crossing a
       gate is never meaningfully net-penalized,
     * gate_bonus: a one-off bonus each time the target gate advances,
-    * finish_bonus: a large one-off bonus when the final gate is passed (target_gate -> -1),
+    * finish_bonus: a large one-off bonus when the final gate is passed (n_gates_passed reaches the
+      gate-order sequence length),
     * crash_penalty: a penalty when the drone is disabled without finishing (out of bounds
       or collision),
     * timeout_penalty: a one-off penalty when the episode truncates (hits ``max_episode_steps``)
@@ -293,8 +300,9 @@ class LogRewardComponents(Wrapper):
 
         def vel_diag(data: Any) -> tuple[Array, Array, Array]:
             """Velocity along the target gate normal (forward), world-up, and its magnitude."""
+            gate_id = resolve_gate_id(data.n_gates_passed, data.gate_sequence)
             _, rot, _ = _target_gate_frame(
-                data.sim_data.states.pos, data.gates_pos, data.gates_quat, data.target_gate
+                data.sim_data.states.pos, data.gates_pos, data.gates_quat, gate_id
             )
             normal = rot[..., :, 0]  # (E, D, 3) through-gate (+x) direction in world
             vel = data.sim_data.states.vel  # (E, D, 3)

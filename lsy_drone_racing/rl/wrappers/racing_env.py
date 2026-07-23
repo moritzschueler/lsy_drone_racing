@@ -105,8 +105,9 @@ class RacingEnv(struct.PyTreeNode):
             data, (obs, reward, terminated, truncated, info) = raw_step(env.data, action)
             obs = {k: v[:, 0] for k, v in obs.items()}
             info = {k: v[:, 0] for k, v in info.items()}
-            # Expose the current target gate (next gate to pass, -1 once finished) for metrics.
-            info = {**info, "target_gate": data.target_gate[:, 0]}
+            # Expose the current gate-order progress count (== gate_sequence length once finished)
+            # for metrics.
+            info = {**info, "n_gates_passed": data.n_gates_passed[:, 0]}
             env = env.replace(data=data)
             return env, (obs, reward[:, 0], terminated[:, 0], truncated[:, 0], info)
 
@@ -137,7 +138,7 @@ class MultiRacingEnv(struct.PyTreeNode):
     The multi-agent counterpart of :class:`RacingEnv`. Identical in spirit -- it captures the pure
     ``_step``/``_reset`` closures of a ``VecMultiDroneRaceEnv`` and threads ``data: EnvData`` as the
     only pytree field -- but it keeps the ``n_drones`` axis instead of squeezing ``[:, 0]``: obs
-    fields, reward, done flags and ``target_gate`` all stay ``(n_envs, n_drones, ...)``. Drone 0 is
+    fields, reward, done flags and ``n_gates_passed`` all stay ``(n_envs, n_drones, ...)``. Drone 0 is
     the trainable ego; drones ``1..n_drones-1`` are opponents whose actions the rollout supplies.
 
     ``single_observation_space`` / ``single_action_space`` are the **per-drone** spaces (exactly what
@@ -222,7 +223,7 @@ class MultiRacingEnv(struct.PyTreeNode):
         def step(env: MultiRacingEnv, action: Array) -> tuple[MultiRacingEnv, tuple[Any, ...]]:
             # action: (n_envs, n_drones, act_dim). Keep the full drone axis on every output.
             data, (obs, reward, terminated, truncated, info) = raw_step(env.data, action)
-            info = {**info, "target_gate": data.target_gate}  # (n_envs, n_drones)
+            info = {**info, "n_gates_passed": data.n_gates_passed}  # (n_envs, n_drones)
             env = env.replace(data=data)
             return env, (obs, reward, terminated, truncated, info)
 

@@ -25,3 +25,4 @@ acados/
 
 *wandb/
 *.ckpt
+pixi.lock

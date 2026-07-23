@@ -143,9 +143,10 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
     the obs/action wrappers are told ``n_drones`` so their per-drone transforms map over that axis.
 
     ``CompetitionReward`` is inserted right after ``LogRewardComponents`` and before
-    ``SpinUpRotors``/``RelativeRacingObs``: it needs the raw per-drone ``pos``/``target_gate`` and
-    the env-shared ``gates_pos`` that ``RelativeRacingObs`` later discards/transforms away, so it
-    must run upstream of it. It adds its shaped reward to the ego drone's (index 0) reward only.
+    ``SpinUpRotors``/``RelativeRacingObs``: it needs the raw per-drone ``pos``/``n_gates_passed``/
+    ``gate_sequence`` and the env-shared ``gates_pos`` that ``RelativeRacingObs`` later
+    discards/transforms away, so it must run upstream of it. It adds its shaped reward to the ego
+    drone's (index 0) reward only.
 
     ``n_drones`` is determined by the loaded track config (``len(config.env.track.drones)``), so a
     multi-drone config must be selected on the CLI, e.g.
@@ -165,6 +166,7 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
         f"{args.n_opponents}. Set --n_opponents {n_drones - 1} or pick a matching config."
     )
     n_gates, n_obstacles = len(config.env.track.gates), len(config.env.track.obstacles)
+    n_gate_passes = len(config.env.track.gate_order)
 
     progress_variant, progress_coef = args.progress
     progress_potential = build_progress_potential(progress_variant, args.progress_params)
@@ -199,7 +201,7 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
     # n_drones axis, but the spaces describe a single drone so the wrappers reuse their space logic.
     env = MultiRacingEnv.create(
         base,
-        single_observation_space=build_observation_space(n_gates, n_obstacles),
+        single_observation_space=build_observation_space(n_gates, n_obstacles, n_gate_passes),
         single_action_space=build_action_space(config.env.control_mode, config.sim.drone_model),
     )
     env = LogRewardComponents.create(

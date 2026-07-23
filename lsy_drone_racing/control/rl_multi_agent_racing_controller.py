@@ -47,7 +47,10 @@ if TYPE_CHECKING:
 # Force specific checkpoints per drone rank (index 0 = drone 0, index 1 = drone 1, ...). Entries
 # are absolute paths, or filenames resolved against the multi_agent_racing checkpoints folder.
 # Leave an entry as "" (or the list short) to auto-pick the rank-th most recent checkpoint.
-CHECKPOINT_OVERRIDES: list[str] = []
+CHECKPOINT_OVERRIDES: list[str] = [
+    "multi_agent_racing_20260723-020831_g2.49_best.ckpt",
+    "multi_agent_racing_20260723-020005_g1.47_step299630592.ckpt",
+]
 # ---------------------------------------------------------------------------------------------
 
 _ACTION_DIM = 4
@@ -131,11 +134,14 @@ class RLMultiAgentRacingController(Controller):
         self._act_offset = (high + low) / 2.0
         self._last_action = jnp.zeros(_ACTION_DIM, dtype=jnp.float32)
 
-        # Whether the policy was trained with the opponent obs slots. Read from the run config
-        # (``[controller] include_opponent_obs``, settable via the deploy/sim CLI), defaulting to
-        # _INCLUDE_OPPONENT_OBS. Must match the checkpoint or the network load below fails loudly.
+        # Whether the policy was trained with the opponent obs slots. Read from this drone's
+        # ``[[controller]]`` table (``config.controller`` is a list, one entry per drone, for
+        # multi-drone configs -- unlike the single-agent controller's single ``[controller]``
+        # table), settable via the deploy/sim CLI. Defaults to _INCLUDE_OPPONENT_OBS. Must match
+        # the checkpoint or the network load below fails loudly.
+        controller_cfg = config.controller[self.rank] if self.rank < len(config.controller) else {}
         self._include_opponent_obs = bool(
-            config.get("controller", {}).get("include_opponent_obs", _INCLUDE_OPPONENT_OBS)
+            controller_cfg.get("include_opponent_obs", _INCLUDE_OPPONENT_OBS)
         )
 
         n_obstacles = int(np.asarray(obs0["obstacles_pos"]).shape[-2])
@@ -175,7 +181,11 @@ class RLMultiAgentRacingController(Controller):
     def _obs_vector(self, obs: dict[str, NDArray[np.floating]]) -> jnp.ndarray:
         """Build this drone's flat policy observation from the batched multi-drone observation."""
         raw = {k: jnp.asarray(obs[k])[self.rank][None] for k in _RAW_OBS_KEYS}
-        raw["target_gate"] = jnp.atleast_1d(jnp.asarray(obs["target_gate"])[self.rank])
+        raw["n_gates_passed"] = jnp.atleast_1d(jnp.asarray(obs["n_gates_passed"])[self.rank])
+        # gate_sequence is (n_drones, k); slice this drone's row and normalize to the (E=1, k)
+        # shape _relative_racing_obs expects.
+        gate_sequence = jnp.asarray(obs["gate_sequence"])[self.rank]
+        raw["gate_sequence"] = gate_sequence.reshape((1, gate_sequence.shape[-1]))
         raw["last_action"] = self._last_action[None]
         rel = _relative_racing_obs(raw)  # dict of (1, ...) arrays
         if self._include_opponent_obs:
@@ -217,9 +227,10 @@ class RLMultiAgentRacingController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Signal completion once this drone has passed the whole track."""
-        target_gate = np.asarray(obs["target_gate"]).reshape(-1)[self.rank]
-        self._finished = bool(target_gate == -1)
+        """Signal completion once this drone has passed the whole configured gate order."""
+        n_gates_passed = np.asarray(obs["n_gates_passed"]).reshape(-1)[self.rank]
+        n_gate_passes = np.asarray(obs["gate_sequence"]).shape[-1]
+        self._finished = bool(n_gates_passed >= n_gate_passes)
         return self._finished
 
     def episode_callback(self):

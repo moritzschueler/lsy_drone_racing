@@ -10,7 +10,8 @@ expressed entirely in the **drone body frame**.
 Built in [`make_env`](tasks/single_agent_racing.py) (inner → outer):
 
 ```
-VecDroneRaceEnv          # raw dict obs: pos, quat, vel, ang_vel, target_gate,
+VecDroneRaceEnv          # raw dict obs: pos, quat, vel, ang_vel, n_gates_passed,
+                         #               gate_sequence, gate_sequence_direction,
                          #               gates_pos, gates_quat, gates_visited,
                          #               obstacles_pos, obstacles_visited
   → SpinUpRotors         # takeoff (no obs change)
@@ -67,10 +68,11 @@ sorts keys), casting everything to `float32`. Column ranges:
   must know its tilt relative to gravity to stay controlled. `grav_body` is the gravity direction
   in the body frame: the minimal world reference the observation keeps. Yaw-about-vertical is
   intentionally not observable (it is frozen and irrelevant once everything else is relative).
-- **Next 2 gates only**: the current target gate plus the following one (selected via the
-  internal `target_gate` index, which is *not* part of the observation). Indices are clamped to
-  the last gate; once the track is finished (`target_gate = -1`) the index clamps to 0. This
-  keeps the observation size independent of track length.
+- **Next 2 gates only**: the current target gate plus the following one, selected by resolving the
+  next 2 entries of the configured gate order (`n_gates_passed`/`gate_sequence`, neither of which
+  is itself part of the observation) into physical gate ids. Sequence positions are clamped to the
+  last entry once the track is finished. This keeps the observation size independent of track
+  length, and generalizes to a `gate_order` that permutes or revisits gates.
 - **Gates as opening corners**: each upcoming gate is given as the body-frame positions of its four
   opening corners (`(0, ±0.225, ±0.225)` in the gate frame) rather than a center + rotation-matrix
   pair. Four corner points encode the gate's center, orientation *and* scale jointly, with no

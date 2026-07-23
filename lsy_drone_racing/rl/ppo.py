@@ -95,6 +95,14 @@ def train_ppo(
         if hasattr(base_space, "spaces") and "gates_pos" in base_space.spaces
         else None
     )
+    # Length of the configured gate order (track.gate_order) -- the number of gates a drone must
+    # pass to finish. Not necessarily equal to n_gates (the physical gate count) under a repeating
+    # gate_order, so this (not n_gates) is what "finished"/"gates passed" must be compared against.
+    n_gate_passes = (
+        base_space["gate_sequence"].shape[0]
+        if hasattr(base_space, "spaces") and "gate_sequence" in base_space.spaces
+        else None
+    )
 
     # -- Agent + optimizer (functional) --
     # NNX owns the weights statefully; split once into a static graphdef + a param ``State`` pytree,
@@ -222,8 +230,9 @@ def train_ppo(
 
             new_ret = ep_ret + reward
             new_len = ep_len + 1.0
-            gates_passed = jnp.where(info["target_gate"] == -1, n_gates or 0, info["target_gate"])
-            gates_passed = gates_passed.astype(jnp.float32)
+            # n_gates_passed is already the gates-passed count (including at finish -- no -1
+            # sentinel to translate), unlike the old target_gate index.
+            gates_passed = info["n_gates_passed"].astype(jnp.float32)
             out = {
                 "obs": obs,
                 "action": action,
@@ -236,7 +245,7 @@ def train_ppo(
                 "len_done": jnp.where(done, new_len, 0.0),
                 "gates_done": jnp.where(done, gates_passed, 0.0),
                 "completed_done": jnp.where(
-                    done, (gates_passed == (n_gates or -1)).astype(jnp.float32), 0.0
+                    done, (gates_passed == (n_gate_passes or -1)).astype(jnp.float32), 0.0
                 ),
                 # Per-step reward-component / diagnostic sums over envs (scalar each).
                 "metrics": {k: jnp.sum(info[k]) for k in metric_keys},

@@ -26,8 +26,8 @@ def _latest_checkpoint(task: str) -> Path | None:
 
 
 def main(
-    task: str = "single_agent_racing",
-    config: str = "level2.toml",
+    task: str = "multi_agent_racing",
+    config: str = "rl_multi_level2_norand.toml",
     wandb_enabled: bool = True,
     num_eval_iterations: int = 30,
     **kwargs: Any,

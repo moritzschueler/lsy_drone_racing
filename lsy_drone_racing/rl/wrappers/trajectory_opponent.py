@@ -53,9 +53,9 @@ DEFAULT_KI_RANGE = (2.0, 2.0, 0.4)
 # Random mid-track spawn support (see teleport_opponents). Both in seconds of nominal (speed
 # multiplier == 1.0) trajectory time, the same axis as ``virtual_t``/``gate_times``.
 GATE_TIME_EPS = 0.1  # Forward bias when mapping a spawn time to a target gate: spawning a hair
-# past gate g's plane with target_gate == g would stall the gate counter forever (``gate_passed``
-# requires the *previous* position strictly before the plane), while targeting gate g + 1 a hair
-# early is monotone and self-corrects at the next plane crossing.
+# past gate g's plane with n_gates_passed still targeting g would stall the gate counter forever
+# (``gate_passed`` requires the *previous* position strictly before the plane), while targeting
+# gate g + 1 a hair early is monotone and self-corrects at the next plane crossing.
 SPAWN_TIME_MARGIN = 0.5  # Latest allowed spawn time is this far before the last gate's pass time,
 # so a teleported opponent always has at least one gate left to fly (never spawns "finished").
 
@@ -282,10 +282,17 @@ def teleport_opponents(
     position and velocity are set to the spline state at ``traj_t`` (velocity scaled by the
     per-slot speed multiplier so it matches the PID's feedforward), ``last_drone_pos`` is set to
     the spawn position so ``_update_target_gates`` doesn't see a phantom pad->mid-track gate
-    crossing on the next step, and ``target_gate`` is advanced to the gate the spline approaches
-    at ``traj_t`` (forward-biased by ``GATE_TIME_EPS``, see there) so gate bookkeeping and the
-    competition-reward rank/segment-lead/victory terms treat the opponent as genuinely ahead. The
-    reset-randomized attitude and the pad ``takeoff_pos`` are deliberately kept.
+    crossing on the next step, and ``n_gates_passed`` is advanced to match the gate the spline
+    approaches at ``traj_t`` (forward-biased by ``GATE_TIME_EPS``, see there) so gate bookkeeping
+    and the competition-reward rank/segment-lead/victory terms treat the opponent as genuinely
+    ahead. The reset-randomized attitude and the pad ``takeoff_pos`` are deliberately kept.
+
+    ``pid.gate_times`` has exactly ``n_gates`` entries (one crossing time per physical gate along
+    the single-pass, non-looping spline) and is built from ``config.env.track.gates`` in raw list
+    order -- so the searchsorted result below only lines up with ``n_gates_passed`` when
+    ``track.gate_order`` is the plain identity ``[1, 2, ..., n_gates]`` (see the assertion at the
+    ``build_trajectory_pid`` call site in ``ippo.py``). A permuted or repeating gate_order would
+    desync this opponent's real (fixed) flight path from the bookkeeping's expected target gate.
 
     Call this right *after* the env step in which the NEXT_STEP autoreset fired (masked by the
     pre-step ``marked_for_reset`` flags): the reset has just restored pad spawn state, and this
@@ -309,7 +316,7 @@ def teleport_opponents(
     states = data.sim_data.states
     pos, vel_dtau = pid._spline(traj_t)  # (E, k, 3) each
     vel = vel_dtau * traj_speed[..., None]
-    target_gate = jnp.searchsorted(pid.gate_times, traj_t + GATE_TIME_EPS, side="right")
+    n_gates_passed = jnp.searchsorted(pid.gate_times, traj_t + GATE_TIME_EPS, side="right")
     m = mask[..., None]
     new_states = states.replace(
         pos=states.pos.at[:, 1:].set(jnp.where(m, pos, states.pos[:, 1:])),
@@ -317,8 +324,12 @@ def teleport_opponents(
     )
     new_data = data.replace(
         sim_data=data.sim_data.replace(states=new_states),
-        target_gate=data.target_gate.at[:, 1:].set(
-            jnp.where(mask, target_gate.astype(data.target_gate.dtype), data.target_gate[:, 1:])
+        n_gates_passed=data.n_gates_passed.at[:, 1:].set(
+            jnp.where(
+                mask,
+                n_gates_passed.astype(data.n_gates_passed.dtype),
+                data.n_gates_passed[:, 1:],
+            )
         ),
         last_drone_pos=data.last_drone_pos.at[:, 1:].set(
             jnp.where(m, pos, data.last_drone_pos[:, 1:])

@@ -23,14 +23,14 @@ from lsy_drone_racing.rl.tasks.progress_variants import (
 # ``along`` is the gate-local +x (traversal) coordinate (<0 entry side, >0 exit side).
 _GATES_POS = jnp.zeros((1, 1, 3))
 _GATES_QUAT = jnp.array([[[0.0, 0.0, 0.0, 1.0]]])  # identity xyzw
-_TARGET = jnp.array([[0]])
+_GATE_ID = jnp.array([[0]])
 
 
 def _phi(name: str, along: float, y: float = 0.0, z: float = 0.0) -> float:
     """Potential of variant ``name`` at gate-local offset (along, y, z), default shape params."""
     potential = build_progress_potential(name, default_progress_params())
     pos = jnp.array([[[along, y, z]]])  # (E=1, D=1, 3)
-    return float(potential(pos, _GATES_POS, _GATES_QUAT, _TARGET, GATE_HALF_EXTENT)[0, 0])
+    return float(potential(pos, _GATES_POS, _GATES_QUAT, _GATE_ID, GATE_HALF_EXTENT)[0, 0])
 
 
 @pytest.mark.unit
@@ -63,7 +63,7 @@ def test_champion_potential_equals_negative_opening_distance():
     for along, y in [(-2.8, 0.0), (-0.5, 0.0), (0.5, 1.2), (-1.3, GATE_HALF_EXTENT)]:
         pos = jnp.array([[[along, y, 0.0]]])
         d = float(
-            gate_opening_distance(pos, _GATES_POS, _GATES_QUAT, _TARGET, GATE_HALF_EXTENT)[0, 0]
+            gate_opening_distance(pos, _GATES_POS, _GATES_QUAT, _GATE_ID, GATE_HALF_EXTENT)[0, 0]
         )
         assert _phi("champion", along, y=y) == pytest.approx(-d, abs=1e-6)
 
@@ -96,5 +96,5 @@ def test_build_ignores_dormant_variant_params():
     pot = build_progress_potential("champion", params)
     pos = jnp.array([[[-0.5, 0.0, 0.0]]])
     assert float(
-        pot(pos, _GATES_POS, _GATES_QUAT, _TARGET, GATE_HALF_EXTENT)[0, 0]
+        pot(pos, _GATES_POS, _GATES_QUAT, _GATE_ID, GATE_HALF_EXTENT)[0, 0]
     ) == pytest.approx(-0.5, abs=1e-6)

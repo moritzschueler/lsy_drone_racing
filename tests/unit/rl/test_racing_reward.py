@@ -22,8 +22,8 @@ def _dist(along: float, y: float = 0.0, z: float = 0.0) -> float:
     drone_pos = jnp.array([[[along, y, z]]])  # (E=1, D=1, 3)
     gates_pos = jnp.zeros((1, 1, 3))
     gates_quat = jnp.array([[[0.0, 0.0, 0.0, 1.0]]])  # identity xyzw
-    target_gate = jnp.array([[0]])
-    d = gate_opening_distance(drone_pos, gates_pos, gates_quat, target_gate, GATE_HALF_EXTENT)
+    gate_id = jnp.array([[0]])
+    d = gate_opening_distance(drone_pos, gates_pos, gates_quat, gate_id, GATE_HALF_EXTENT)
     return float(d[0, 0])
 
 

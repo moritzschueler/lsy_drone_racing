@@ -149,6 +149,14 @@ def train_ippo(
         if hasattr(base_space, "spaces") and "gates_pos" in base_space.spaces
         else None
     )
+    # Length of the configured gate order (track.gate_order) -- the number of gates a drone must
+    # pass to finish. Not necessarily equal to n_gates (the physical gate count) under a repeating
+    # gate_order, so this (not n_gates) is what "finished"/"gates passed" must be compared against.
+    n_gate_passes = (
+        base_space["gate_sequence"].shape[0]
+        if hasattr(base_space, "spaces") and "gate_sequence" in base_space.spaces
+        else None
+    )
 
     # -- Scripted PID trajectory-follower opponents, mixed in with the self-play pool --
     use_pid_opponents = (
@@ -161,6 +169,20 @@ def train_ippo(
             "opponent_pid_prob_start/opponent_pid_prob_end mixing needs an attitude-control track "
             f"config (physical roll/pitch/yaw/thrust setpoints), got control_mode="
             f"'{config.env.control_mode}'."
+        )
+        # The scripted PID opponent flies a fixed, single-pass, non-looping spline that crosses
+        # the physical gates in config.env.track.gates' raw list order (see
+        # trajectory_opponent._compute_gate_pass_times / teleport_opponents). Its progress
+        # bookkeeping only lines up with n_gates_passed under the plain identity gate_order --
+        # a permutation desyncs it from the very first gate, and a repeat leaves it permanently
+        # stuck one (or more) gate-order entries short of finishing, since the spline can't fly
+        # back around. Fail fast rather than silently degrade self-play against PID opponents.
+        assert list(config.env.track.gate_order) == list(range(1, (n_gates or 0) + 1)), (
+            "scripted PID opponents require track.gate_order to be the plain forward sequence "
+            f"[1..n_gates] ({list(range(1, (n_gates or 0) + 1))}), got "
+            f"{list(config.env.track.gate_order)}. Disable PID opponents "
+            "(opponent_pid_prob_start=0, opponent_pid_prob_end=0) to train on a permuted or "
+            "repeating gate order."
         )
         drone_mass = load_params(config.sim.physics, config.sim.drone_model)["mass"]
         action_space = build_action_space(config.env.control_mode, config.sim.drone_model)
@@ -473,24 +495,25 @@ def train_ippo(
 
             new_ret = ep_ret + ego_reward
             new_len = ep_len + 1.0
-            ego_target_gate = info["target_gate"][:, 0]
-            gates_passed = jnp.where(ego_target_gate == -1, n_gates or 0, ego_target_gate)
-            gates_passed = gates_passed.astype(jnp.float32)
+            # n_gates_passed is already the gates-passed count (including at finish -- no -1
+            # sentinel to translate), unlike the old target_gate index.
+            gates_passed = info["n_gates_passed"][:, 0].astype(jnp.float32)
 
             # -- Ego win rate (decided at the env-episode boundary: all drones settled) --
             # The multi-drone env only resets once every drone has finished/crashed/timed out, so the
             # winner is decided when ``all(term | trunc)`` fires (true only on that terminal step).
             # Drones are ranked lexicographically: more gates passed wins; if tied on gates and both
-            # finished the whole track (target_gate == -1), the earlier finish step wins. The ego
-            # (drone 0) wins the episode only if it strictly beats every opponent (ties are not wins).
-            # Note: while opponent_active is False the opponent is frozen in place, so ego "wins"
-            # trivially -- win_rate/gates_passed metrics are informative only once activated.
-            all_target_gate = info["target_gate"]  # (E, D)
-            finished = all_target_gate == -1  # completed the whole track (crashes keep target >= 0)
+            # finished the whole track (n_gates_passed reached n_gate_passes), the earlier finish
+            # step wins. The ego (drone 0) wins the episode only if it strictly beats every opponent
+            # (ties are not wins). Note: while opponent_active is False the opponent is frozen in
+            # place, so ego "wins" trivially -- win_rate/gates_passed metrics are informative only
+            # once activated.
+            all_gates_passed = info["n_gates_passed"]  # (E, D)
+            finished = all_gates_passed >= (n_gate_passes or 0)  # completed the whole track
             new_ep_step = ep_step + 1  # within-episode step counter (per env)
             newly_finished = finished & (finish_step < 0)  # first step a drone reaches the finish
             finish_step = jnp.where(newly_finished, new_ep_step[:, None], finish_step)  # (E, D)
-            gates_all = jnp.where(finished, n_gates or 0, all_target_gate)  # (E, D)
+            gates_all = all_gates_passed  # (E, D) -- already the full count once finished
             env_done = jnp.all(term | trunc, axis=1)  # (E,) true only on the terminal step
             ego_gates = gates_all[:, :1]  # (E, 1)
             ego_finished = finished[:, :1]  # (E, 1)
@@ -511,7 +534,7 @@ def train_ippo(
                 "len_done": jnp.where(done, new_len, 0.0),
                 "gates_done": jnp.where(done, gates_passed, 0.0),
                 "completed_done": jnp.where(
-                    done, (gates_passed == (n_gates or -1)).astype(jnp.float32), 0.0
+                    done, (gates_passed == (n_gate_passes or -1)).astype(jnp.float32), 0.0
                 ),
                 "win_done": jnp.where(env_done, win.astype(jnp.float32), 0.0),
                 "ep_done": jnp.where(env_done, 1.0, 0.0),
@@ -950,8 +973,6 @@ def train_ippo(
             pickle.dump(nnx.state(agent, nnx.Param), f)
         print(f"Best model (mean {metric} {best_score:.2f}) saved to {model_path}")
     envs.close()
-    if wandb_enabled:
-        wandb.finish()
     return model_path
 
 
