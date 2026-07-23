@@ -34,8 +34,8 @@ class AttitudeController(SingleAttitudeController):
         self.rank = info["rank"]
         super().__init__({k: v[self.rank] for k, v in obs.items()}, info, config)
         # We don't want the example controllers to crash, so we speed up this one to get ahead
-        self._t_total = 10
-        waypoints = self._des_pos_spline._c[-1]
+        self._t_total = 8
+        waypoints = self._des_pos_spline.c[-1]
         t = np.linspace(0, self._t_total, len(waypoints))
         self._des_pos_spline = CubicSpline(t, waypoints)
         self._des_vel_spline = self._des_pos_spline.derivative()
@@ -55,3 +55,29 @@ class AttitudeController(SingleAttitudeController):
             [r_des, p_des, y_des, t_des] as a numpy array.
         """
         return super().compute_control({k: v[self.rank] for k, v in obs.items()}, info)
+
+    def step_callback(
+        self,
+        action: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Slice this drone's row out of the batched observation, then delegate to the base.
+
+        In multi-agent sims the observation is batched across all drones; the base
+        ``step_callback`` expects a single drone's observation to read its gate progress.
+
+        Returns:
+            True if this drone has passed the whole configured gate order, False otherwise.
+        """
+        return super().step_callback(
+            action,
+            {k: v[self.rank] for k, v in obs.items()},
+            reward,
+            terminated,
+            truncated,
+            info,
+        )

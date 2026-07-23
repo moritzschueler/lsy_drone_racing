@@ -19,7 +19,7 @@ import gymnasium
 import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.utils import load_config, load_controller
+from lsy_drone_racing.utils import load_config, load_controller, strip_env_randomization
 
 if TYPE_CHECKING:
     from lsy_drone_racing.control.controller import Controller
@@ -34,6 +34,7 @@ def simulate(
     controllers: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
+    no_randomization: bool = False,
 ) -> list[float]:
     """Evaluate the drone controller over multiple episodes.
 
@@ -43,12 +44,17 @@ def simulate(
             If None, the controllers specified in the config file are used.
         n_runs: The number of episodes.
         render: Enable/disable the simulation GUI.
+        no_randomization: If True, strip the config's `[env.randomizations]` / `[env.disturbances]`
+            blocks for a clean, deterministic race -- e.g. so a scripted-PID opponent
+            (`attitude_controller_multi.py`) doesn't crash into randomized gates.
 
     Returns:
         A list of episode times.
     """
     # Load configuration and check if firmare should be used.
     config = load_config(Path(__file__).parents[1] / "config" / config)
+    if no_randomization:
+        strip_env_randomization(config)
     if render is None:
         render = config.sim.render
     else:
@@ -67,6 +73,15 @@ def simulate(
     periods = base_freq // controller_freqs  # Precompute the periods for each controller.
     if np.any(base_freq % controller_freqs != 0):
         raise ValueError(f"Controller frequencies must be multiples ({controller_freqs.tolist()})")
+    # Per-drone start delay (seconds): a drone rests inert on its pad -- zero action, zero thrust --
+    # for this long before its controller engages, e.g. to give an opponent a head start so the
+    # other drone has to catch up. Read from each `[[controller]]`'s `start_delay` (default 0), so it
+    # applies by rank even when `--controllers` overrides the files.
+    start_delays = [
+        (config.controller[rank].get("start_delay", 0.0) if rank < len(config.controller) else 0.0)
+        for rank in range(len(controller_names))
+    ]
+    start_ticks = np.round(np.asarray(start_delays, dtype=np.float64) * base_freq).astype(np.int64)
 
     # Create the racing environment
     env: MultiDroneRacingEnv = gymnasium.make(
@@ -113,6 +128,9 @@ def simulate(
                 if disabled_drones[rank]:  # Only compute action if drone is not disabled
                     controller_finished[rank] = True
                     continue
+                if i < start_ticks[rank]:  # Rest inert on the pad until this drone's start delay
+                    actions[rank] = 0.0  # zero action = zero thrust: the drone stays on its pad
+                    continue
                 if controller_mask[rank]:
                     actions[rank] = ctrl.compute_control(obs, ctrl_info)
 
@@ -124,6 +142,8 @@ def simulate(
             # Update the controllers' internal state and models.
             for rank, (ctrl, ctrl_info) in enumerate(zip(controller_instances, ranked_infos)):
                 if disabled_drones[rank]:
+                    continue
+                if i < start_ticks[rank]:  # Still resting: keep the controller's state frozen
                     continue
                 if controller_mask[rank]:
                     controller_finished[rank] = ctrl.step_callback(

@@ -46,6 +46,7 @@ from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, Rela
 from lsy_drone_racing.rl.wrappers.racing_env import MultiRacingEnv
 from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, NormalizeActions, ZeroYaw
 from lsy_drone_racing.rl.wrappers.takeoff import SpinUpRotors
+from lsy_drone_racing.utils import env_param
 
 if TYPE_CHECKING:
     from lsy_drone_racing.rl.config import Args
@@ -184,10 +185,10 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
 
     base = VecMultiDroneRaceEnv(
         num_envs=args.num_envs,
-        freq=config.env.freq,
+        freq=env_param(config, "freq"),
         sim_config=config.sim,
-        sensor_range=config.env.sensor_range,
-        control_mode=config.env.control_mode,
+        sensor_range=env_param(config, "sensor_range"),
+        control_mode=env_param(config, "control_mode"),
         track=config.env.track,
         disturbances=config.env.get("disturbances"),
         randomizations=config.env.get("randomizations"),
@@ -202,7 +203,9 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
     env = MultiRacingEnv.create(
         base,
         single_observation_space=build_observation_space(n_gates, n_obstacles, n_gate_passes),
-        single_action_space=build_action_space(config.env.control_mode, config.sim.drone_model),
+        single_action_space=build_action_space(
+            env_param(config, "control_mode"), config.sim.drone_model
+        ),
     )
     env = LogRewardComponents.create(
         env,

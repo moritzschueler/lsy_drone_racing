@@ -64,7 +64,7 @@ from lsy_drone_racing.rl.wrappers.trajectory_opponent import (
     teleport_opponents,
 )
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
-from lsy_drone_racing.utils.utils import set_seeds
+from lsy_drone_racing.utils.utils import env_param, set_seeds
 
 # Env factory: (args, config) -> fully-wrapped functional multi-drone env (a ``Wrapper``).
 MakeEnv = Callable[[Args, Any], Wrapper]
@@ -165,10 +165,10 @@ def train_ippo(
     )
     traj_pid: TrajectoryPID | None = None
     if use_pid_opponents:
-        assert config.env.control_mode == "attitude", (
+        assert env_param(config, "control_mode") == "attitude", (
             "opponent_pid_prob_start/opponent_pid_prob_end mixing needs an attitude-control track "
             f"config (physical roll/pitch/yaw/thrust setpoints), got control_mode="
-            f"'{config.env.control_mode}'."
+            f"'{env_param(config, 'control_mode')}'."
         )
         # The scripted PID opponent flies a fixed, single-pass, non-looping spline that crosses
         # the physical gates in config.env.track.gates' raw list order (see
@@ -185,12 +185,12 @@ def train_ippo(
             "repeating gate order."
         )
         drone_mass = load_params(config.sim.physics, config.sim.drone_model)["mass"]
-        action_space = build_action_space(config.env.control_mode, config.sim.drone_model)
+        action_space = build_action_space(env_param(config, "control_mode"), config.sim.drone_model)
         traj_pid = build_trajectory_pid(
             start_pos=np.asarray(config.env.track.drones[1]["pos"]),
             drone_mass=drone_mass,
-            freq=config.env.freq,
-            control_mode=config.env.control_mode,
+            freq=env_param(config, "freq"),
+            control_mode=env_param(config, "control_mode"),
             action_low=np.asarray(action_space.low),
             action_high=np.asarray(action_space.high),
             t_total=args.opponent_pid_t_total,
@@ -456,7 +456,7 @@ def train_ippo(
                 )
                 use_pid = is_pid_opp & opponent_active
                 opp_action = jnp.where(use_pid[..., None], pid_action, opp_action_selfplay)
-                traj_t = traj_t + traj_speed / config.env.freq  # advance virtual trajectory time
+                traj_t = traj_t + traj_speed / env_param(config, "freq")  # advance virtual traj time
             else:
                 # Before opponent_start_step, freeze the opponent to a no-op action instead of
                 # racing against a still-largely-random self-play snapshot (mirrors

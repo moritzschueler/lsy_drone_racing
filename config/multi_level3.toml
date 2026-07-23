@@ -1,20 +1,22 @@
-# Multi-drone racing -- Level 0
+# Multi-drone racing -- Level 3
 #
 # ONE config, two uses:
-#   * training : pixi run python -m lsy_drone_racing.rl.scripts.train --config multi_level0.toml
+#   * training : pixi run python -m lsy_drone_racing.rl.scripts.train --config multi_level3.toml
 #                Shared env params are read from env.kwargs[0] (via utils.env_param); the
 #                [[controller]] entries are ignored -- the opponent is the self-play pool + scripted
 #                PID, configured through the CLI / MultiAgentRacingArgs.
-#   * sim eval : pixi run python scripts/multi_sim.py --config multi_level0.toml
+#   * sim eval : pixi run python scripts/multi_sim.py --config multi_level3.toml
 #                One Python controller per drone, taken from the [[controller]] entries below (or
 #                --controllers "a.py,b.py"). Each drone may step at its own env.kwargs freq.
 #
-# | Level | Rand. Inertial | Rand. Gates/Obstacles | Rand. Track | Notes             |
-# | :---: | :------------: | :-------------------: | :---------: | :---------------: |
-# |   0   | *No*           | *No*                  | *No*        | Perfect knowledge |
+# | Level | Rand. Inertial | Rand. Gates/Obstacles | Rand. Track | Notes           |
+# | :---: | :------------: | :-------------------: | :---------: | :-------------: |
+# |   3   | *Yes*          | *Yes*                 | *Yes*       | Online planning |
 #
-# Pass --no_randomization (train.py / render.py) to also strip the dynamics/action disturbances for a
-# fully deterministic race.
+# NOTE: track.randomize = true regenerates gate/obstacle/drone x-y each episode, so the nominal
+# positions below are placeholders (only the gate heights and gate_order are kept). A scripted-PID
+# opponent flies a fixed spline and cannot follow a randomized track -- use self-play opponents, or
+# pass --no_randomization for a fixed layout.
 
 # One [[controller]] per drone, in rank order (drone 0, drone 1). Used by multi_sim.py; ignored by
 # training. Override with --controllers "a.py,b.py".
@@ -72,45 +74,42 @@ sensor_range = 0.7
 control_mode = "attitude"
 
 [env.track]
-randomize = false
-
-# Order in which the gates have to be passed. Entries are signed gate numbers, not gate IDs:
-# `1` means gate ID 0 in forward direction, `-1` means the same gate in reverse direction.
+# Full track randomization: gate/obstacle/drone x-y and yaw are randomized inside the safety limits
+# every episode. Gate order and height are NOT randomized.
+randomize = true
 gate_order = [1, 2, 3, 4]
 
-# Tall gates: 1.195m height. Short gates: 0.695m height. Height is measured from the ground to the center of the gate.
-# Gates are square. Gates are 0.72m wide (outer dimensions of the frame) with a 0.4m wide opening.
 [[env.track.gates]]
-pos = [0.5 , 0.25, 0.7]
-rpy = [0.0, 0.0, -0.78]
+pos = [0.0, 0.0, 0.7]
+rpy = [0.0, 0.0, 0.0]
 [[env.track.gates]]
-pos = [1.05, 0.75, 1.2]
-rpy = [0.0, 0.0, 2.35]
+pos = [0.0, 0.0, 1.2]
+rpy = [0.0, 0.0, 0.0]
 [[env.track.gates]]
-pos = [-1.0, -0.25, 0.7]
-rpy = [0.0, 0.0, 3.14]
+pos = [0.0, 0.0, 0.7]
+rpy = [0.0, 0.0, 0.0]
 [[env.track.gates]]
-pos = [0.0, -0.75, 1.2]
+pos = [0.0, 0.0, 1.2]
 rpy = [0.0, 0.0, 0.0]
 
 [[env.track.obstacles]]
-pos = [0.0, 0.75, 1.55]
+pos = [0.0, 0.0, 1.55]
 [[env.track.obstacles]]
-pos = [1.0, 0.25, 1.55]
+pos = [0.0, 0.0, 1.55]
 [[env.track.obstacles]]
-pos = [-1.5, -0.25, 1.55]
+pos = [0.0, 0.0, 1.55]
 [[env.track.obstacles]]
-pos = [-0.5, -0.75, 1.55]
+pos = [0.0, 0.0, 1.55]
 
-# Drone 0 = trainable ego / rank 0. Drone 1 = opponent / rank 1 (its pos is the scripted-PID
-# opponent's start, read as track.drones[1] by ippo.py / render.py).
+# Drone 0 = trainable ego / rank 0. Drone 1 = opponent / rank 1. Positions are randomized each
+# episode (track.randomize = true).
 [[env.track.drones]]
-pos = [-1.5, 0.55, 0.01]
+pos = [0.0, 0.0, 0.0]
 rpy = [0.0, 0.0, 0.0]
 vel = [0, 0, 0]
 ang_vel = [0, 0, 0]
 [[env.track.drones]]
-pos = [-1.5, 0.95, 0.01]
+pos = [0.0, 0.0, 0.0]
 rpy = [0.0, 0.0, 0.0]
 vel = [0, 0, 0]
 ang_vel = [0, 0, 0]
@@ -128,3 +127,45 @@ fn = "uniform"
 [env.disturbances.dynamics.kwargs]
 minval = [-0.1, -0.1, -0.1]
 maxval = [0.1, 0.1, 0.1]
+
+[env.randomizations.drone_pos]
+fn = "uniform"
+[env.randomizations.drone_pos.kwargs]
+minval = [-0.1, -0.1, 0.0]
+maxval = [0.1, 0.1, 0.02]
+
+[env.randomizations.drone_rpy]
+fn = "uniform"
+[env.randomizations.drone_rpy.kwargs]
+minval = [-0.1, -0.1, -0.1]
+maxval = [0.1, 0.1, 0.1]
+
+[env.randomizations.drone_mass]
+fn = "uniform"
+[env.randomizations.drone_mass.kwargs]
+minval = -0.005
+maxval = 0.005
+
+[env.randomizations.drone_inertia]
+fn = "uniform"
+[env.randomizations.drone_inertia.kwargs]
+minval = [-0.000001, -0.000001, -0.000001]
+maxval = [0.000001, 0.000001, 0.000001]
+
+[env.randomizations.gate_pos]
+fn = "uniform"
+[env.randomizations.gate_pos.kwargs]
+minval = [-0.15, -0.15, -0.1]
+maxval = [0.15, 0.15, 0.1]
+
+[env.randomizations.gate_rpy]
+fn = "uniform"
+[env.randomizations.gate_rpy.kwargs]
+minval = [-0.05, -0.1, -0.2]
+maxval = [0.05, 0.1, 0.2]
+
+[env.randomizations.obstacle_pos]
+fn = "uniform"
+[env.randomizations.obstacle_pos.kwargs]
+minval = [-0.15, -0.15, -0.05]
+maxval = [0.15, 0.15, 0.05]

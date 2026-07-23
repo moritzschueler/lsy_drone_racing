@@ -3,7 +3,7 @@ r"""Deployment controller that races trained multi-agent (self-play) racing PPO 
 Meant to be loaded twice (once per drone) via ``scripts/multi_sim.py``'s ``--controllers``
 comma-separated list, e.g.::
 
-    pixi run python scripts/multi_sim.py --config rl_multi_level0.toml \
+    pixi run python scripts/multi_sim.py --config multi_level0.toml \
         --controllers "rl_multi_agent_racing_controller.py,rl_multi_agent_racing_controller.py"
 
 ``multi_sim.py`` batches observations across drones and instantiates one controller per drone,

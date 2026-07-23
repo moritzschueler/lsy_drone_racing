@@ -89,8 +89,6 @@ class AttitudeController(Controller):
             [r_des, p_des, y_des, t_des] as a numpy array.
         """
         t = min(self._tick / self._freq, self._t_total)
-        if t >= self._t_total:  # Maximum duration reached
-            self._finished = True
 
         des_pos = self._des_pos_spline(t)
         des_vel = self._des_vel_spline(t)
@@ -140,12 +138,19 @@ class AttitudeController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Increment the tick counter.
+        """Advance the tick counter and report completion once the last gate has been passed.
+
+        Finished is derived from actual gate progress (``n_gates_passed`` reaching the length of the
+        configured gate order), not from the trajectory clock -- so the controller keeps flying until
+        the drone is physically through the whole track.
 
         Returns:
             True if the controller is finished, False otherwise.
         """
         self._tick += 1
+        n_gate_passes = np.asarray(obs["gate_sequence"]).shape[-1]
+        n_gates_passed = int(np.asarray(obs["n_gates_passed"]))
+        self._finished = n_gates_passed >= n_gate_passes
         return self._finished
 
     def episode_callback(self):

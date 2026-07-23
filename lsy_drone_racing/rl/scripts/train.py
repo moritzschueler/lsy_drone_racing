@@ -14,7 +14,7 @@ import numpy as np
 
 import wandb
 from lsy_drone_racing.rl.tasks import get_task
-from lsy_drone_racing.utils import load_config
+from lsy_drone_racing.utils import load_config, strip_env_randomization
 
 CHECKPOINT_DIR = Path(__file__).parents[1] / "checkpoints"
 
@@ -27,20 +27,26 @@ def _latest_checkpoint(task: str) -> Path | None:
 
 def main(
     task: str = "multi_agent_racing",
-    config: str = "rl_multi_level2_norand.toml",
+    config: str = "multi_level2.toml",
     wandb_enabled: bool = True,
     num_eval_iterations: int = 30,
+    no_randomization: bool = False,
     **kwargs: Any,
 ):
     """Train and/or evaluate a single PPO agent on the given task.
 
     Args:
         task: Task name (one of the keys in ``lsy_drone_racing.rl.tasks.TASKS``).
-        config: Env config file name under ``config/`` (e.g. ``level0.toml``).
+        config: Env config file name under ``config/`` (e.g. ``level0.toml``). Multi-drone tasks
+            need a multi-drone config, e.g. ``multi_level2.toml``.
         wandb_enabled: Whether to log to Weights & Biases.
         train: Whether to run training. If False, only evaluation runs.
         num_eval_iterations: Number of (headless) evaluation episodes to run after training.
             Rendering is handled separately by ``rl/scripts/render.py``.
+        no_randomization: If True, strip the config's ``[env.randomizations]`` /
+            ``[env.disturbances]`` blocks before building the env, training on the nominal track.
+            Needed to train self-play against scripted-PID opponents on a level whose gate/obstacle
+            randomization would otherwise crash them (see ``strip_env_randomization``).
         **kwargs: Any ``Args`` field override (e.g. num_envs=2048).
     """
     task_spec = get_task(task)
@@ -50,6 +56,8 @@ def main(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     env_config = load_config(Path(__file__).parents[3] / "config" / config)
+    if no_randomization:
+        strip_env_randomization(env_config)
 
     model_path = task_spec.train_fn(
         args, task_spec.make_env, env_config, checkpoint_dir, task, wandb_enabled
