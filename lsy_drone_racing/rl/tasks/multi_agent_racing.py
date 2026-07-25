@@ -107,24 +107,27 @@ class MultiAgentRacingArgs(RacingArgs):
     # Fraction of envs whose opponent(s) are PID/spline-controlled rather than drawn from the
     # self-play pool, resampled every episode. Requires control_mode == "attitude"; set both
     # opponent_pid_prob_start and opponent_pid_prob_end to 0 to disable entirely.
-    opponent_pid_prob_start: float = 0.9
+    opponent_pid_prob_start: float = 1.0
     # Target fraction once the anneal (below) completes -- lower than the start so self-play comes
     # to dominate opponent behavior as the pool matures.
-    opponent_pid_prob_end: float = 0.1
+    opponent_pid_prob_end: float = 0.5
     # Global steps over which opponent_pid_prob linearly anneals from *_start to *_end (held
     # constant at *_end afterwards).
     opponent_pid_decay_steps: int = 300_000_000
     # Per-episode PID speed multiplier range, sampled uniformly; 1.0 == the nominal
     # opponent_pid_t_total-second single pass.
     opponent_pid_speed_min: float = 0.6
-    opponent_pid_speed_max: float = 1.6
-    # Nominal (speed multiplier == 1.0) time to fly the waypoint spline once, in seconds.
-    opponent_pid_t_total: float = 18.0
+    opponent_pid_speed_max: float = 1.2
+    # Nominal (speed multiplier == 1.0) time to fly the waypoint spline once, in seconds. The
+    # opponent built from these is the gate/obstacle-aware navigator
+    # (trajectory_opponent.build_navigator_pid, ported from AttitudeController_1), not a
+    # fixed-waypoint path -- these defaults are that controller's tuned values.
+    opponent_pid_t_total: float = 11.0
     # Position-PID gains (kp, ki, kd) and integral-error clamp, identical defaults to
-    # lsy_drone_racing.control.attitude_controller.AttitudeController.
-    opponent_pid_kp: tuple[float, float, float] = (0.4, 0.4, 1.25)
-    opponent_pid_ki: tuple[float, float, float] = (0.05, 0.05, 0.05)
-    opponent_pid_kd: tuple[float, float, float] = (0.2, 0.2, 0.4)
+    # AttitudeController_1.
+    opponent_pid_kp: tuple[float, float, float] = (0.7, 0.7, 2.7)
+    opponent_pid_ki: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    opponent_pid_kd: tuple[float, float, float] = (0.4, 0.4, 0.8)
     opponent_pid_ki_range: tuple[float, float, float] = (2.0, 2.0, 0.4)
     # Random mid-track spawn for PID opponents: each PID episode starts at virtual trajectory time
     # t0 ~ U(frac_min, frac_max) * opponent_pid_t_total (clamped to stay before the last gate's
@@ -132,7 +135,7 @@ class MultiAgentRacingArgs(RacingArgs):
     # leader. frac_min == 0 keeps a share of ordinary pad starts in the mix; set both to 0 to
     # disable entirely (exact pad-start behavior, no teleport code traced).
     opponent_pid_start_frac_min: float = 0.0
-    opponent_pid_start_frac_max: float = 0.5
+    opponent_pid_start_frac_max: float = 0.8
 
 
 def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
