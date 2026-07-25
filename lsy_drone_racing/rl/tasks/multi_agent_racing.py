@@ -118,13 +118,16 @@ class MultiAgentRacingArgs(RacingArgs):
     # opponent_pid_t_total-second single pass.
     opponent_pid_speed_min: float = 0.6
     opponent_pid_speed_max: float = 1.6
-    # Nominal (speed multiplier == 1.0) time to fly the waypoint spline once, in seconds.
-    opponent_pid_t_total: float = 18.0
+    # Nominal (speed multiplier == 1.0) time to fly the waypoint spline once, in seconds. The
+    # opponent built from these is the gate/obstacle-aware navigator
+    # (trajectory_opponent.build_navigator_pid, ported from AttitudeController_1), not a
+    # fixed-waypoint path -- these defaults are that controller's tuned values.
+    opponent_pid_t_total: float = 11.0
     # Position-PID gains (kp, ki, kd) and integral-error clamp, identical defaults to
-    # lsy_drone_racing.control.attitude_controller.AttitudeController.
-    opponent_pid_kp: tuple[float, float, float] = (0.4, 0.4, 1.25)
-    opponent_pid_ki: tuple[float, float, float] = (0.05, 0.05, 0.05)
-    opponent_pid_kd: tuple[float, float, float] = (0.2, 0.2, 0.4)
+    # AttitudeController_1.
+    opponent_pid_kp: tuple[float, float, float] = (0.7, 0.7, 2.7)
+    opponent_pid_ki: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    opponent_pid_kd: tuple[float, float, float] = (0.4, 0.4, 0.8)
     opponent_pid_ki_range: tuple[float, float, float] = (2.0, 2.0, 0.4)
     # Random mid-track spawn for PID opponents: each PID episode starts at virtual trajectory time
     # t0 ~ U(frac_min, frac_max) * opponent_pid_t_total (clamped to stay before the last gate's
