@@ -98,15 +98,14 @@ def run(
                 )
                 path = out_dir / f"run{run_idx}_frame{shot:02d}.png"
                 Image.fromarray(np.asarray(img)).save(path)
-                logger.info("saved %s (t=%.2fs, gate=%s)", path, curr_time, obs["target_gate"])
+                logger.info("saved %s (t=%.2fs, gate=%s)", path, curr_time, obs["n_gates_passed"])
                 shot += 1
             if terminated or truncated or finished:
                 break
             i += 1
         ctrl.episode_callback()
-        gates = obs["target_gate"]
-        done = gates == -1
-        gates = len(cfg.env.track.gates) if done else gates
+        gates = int(obs["n_gates_passed"])
+        done = gates == obs["gate_sequence"].shape[0]
         logger.info(
             "episode %d: time=%.2fs finished=%s gates_passed=%s", run_idx, curr_time, done, gates
         )

@@ -46,21 +46,26 @@ class SpinUpRotors(Wrapper):
     ) -> SpinUpRotors:
         """Create a SpinUpRotors wrapper around the base environment.
 
-        ``n_drones > 1`` (multi-agent racing): the base env reports per-drone ``(n_envs, n_drones)``
-        done flags, but rotor warming is per-env (a world reset warms every drone in it), so the
-        done flags are reduced with ``any`` over the drone axis into the ``(n_envs,)`` mask
-        ``done_last_step`` and ``warm_rotors`` expect.
+        ``n_drones > 1`` (multi-agent racing): ``terminated``/``truncated`` (and thus
+        ``done_last_step``) keep their per-drone ``(n_envs, n_drones)`` shape throughout -- rotor
+        warming must stay per-drone too. A drone's own done flag only means *that drone* was just
+        (auto)reset; a sibling drone that's still racing is not, even in a world where one drone
+        finished/crashed before the other (autoreset only fires once *every* drone in a world is
+        done). Reducing with ``any`` over the drone axis here would (and previously did) warm --
+        i.e. forcibly overwrite to the hover constant -- a still-racing drone's real rotor speeds
+        the moment any other drone in its world became done, silently corrupting its dynamics for
+        the rest of the episode.
         """
         num_envs = base.num_envs
         multi = n_drones > 1
+        done_shape = (num_envs, n_drones) if multi else (num_envs,)
 
         def env_done(terminated: Array, truncated: Array) -> Array:
-            """Per-env done mask (n_envs,): reduce over the drone axis in multi-agent."""
-            done = terminated | truncated
-            return done.any(axis=-1) if multi else done
+            """Per-drone done mask, matching ``terminated``/``truncated``'s own shape."""
+            return terminated | truncated
 
         def warm_rotors(env: SpinUpRotors, mask: Array) -> SpinUpRotors:
-            """Seed rotor_vel to the hover value for the masked envs in the innermost env's data."""
+            """Seed rotor_vel to the hover value for the masked (env[, drone]) slots."""
             data = env.unwrapped.data
             states = data.sim_data.states
             target = jnp.full_like(states.rotor_vel, rotor_vel)
@@ -72,19 +77,19 @@ class SpinUpRotors(Wrapper):
             env: SpinUpRotors, *, seed: int | None = None, options: dict | None = None
         ) -> tuple[SpinUpRotors, tuple[Any, Any]]:
             base_env, (obs, info) = env.base.reset(env.base, seed=seed, options=options)
-            env = env.replace(base=base_env, done_last_step=jnp.zeros(num_envs, dtype=bool))
-            env = warm_rotors(env, jnp.ones(num_envs, dtype=bool))  # warm every drone
+            env = env.replace(base=base_env, done_last_step=jnp.zeros(done_shape, dtype=bool))
+            env = warm_rotors(env, jnp.ones(done_shape, dtype=bool))  # warm every drone
             return env, (obs, info)
 
         def step(env: SpinUpRotors, action: Array) -> tuple[SpinUpRotors, tuple[Any, ...]]:
             base_env, (obs, reward, terminated, truncated, info) = env.base.step(env.base, action)
             env = env.replace(base=base_env)
-            # Envs done on the previous step were just autoreset by this step -> warm them now,
+            # Drones done on the previous step were just autoreset by this step -> warm them now,
             # before their next action is applied. The mask makes "none done" a no-op.
             env = warm_rotors(env, env.done_last_step)
             env = env.replace(done_last_step=env_done(terminated, truncated))
             return env, (obs, reward, terminated, truncated, info)
 
         return cls(
-            base=base, done_last_step=jnp.zeros(num_envs, dtype=bool), step=step, reset=reset
+            base=base, done_last_step=jnp.zeros(done_shape, dtype=bool), step=step, reset=reset
         )
