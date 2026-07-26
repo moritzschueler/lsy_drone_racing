@@ -1,0 +1,173 @@
+# Multi-drone racing -- Level 2
+#
+# ONE config, two uses:
+#   * training : pixi run python -m lsy_drone_racing.rl.scripts.train --config multi_level2.toml
+#                Shared env params are read from env.kwargs[0] (via utils.env_param); the
+#                [[controller]] entries are ignored -- the opponent is the self-play pool + scripted
+#                PID, configured through the CLI / MultiAgentRacingArgs.
+#   * sim eval : pixi run python scripts/multi_sim.py --config multi_level2.toml
+#                One Python controller per drone, taken from the [[controller]] entries below (or
+#                --controllers "a.py,b.py"). Each drone may step at its own env.kwargs freq.
+#
+# | Level | Rand. Inertial | Rand. Gates/Obstacles | Rand. Track | Notes                 |
+# | :---: | :------------: | :-------------------: | :---------: | :-------------------: |
+# |   2   | *Yes*          | *Yes*                 | *No*        | Learning, re-planning |
+#
+# Pass --no_randomization (train.py / render.py) to strip the randomization/disturbance blocks for a
+# clean, deterministic race -- required so a scripted-PID opponent doesn't crash into shifted gates.
+
+# One [[controller]] per drone, in rank order (drone 0, drone 1)
+# `start_delay` (seconds, default 0.0) makes a drone rest inert on its pad -- zero thrust, no
+# command -- before its controller starts. Here the RL drone (0) rests 3 s so the PID drone (1)
+# leads and the RL policy has to catch up and overtake. Applied by rank in multi_sim.py; ignored by
+# training. Set both to 0.0 for a simultaneous start.
+[[controller]]
+file = "rl_multi_agent_racing_controller_1.py"
+start_delay = 0
+[[controller]]
+file = "rl_multi_agent_racing_controller_2.py"
+start_delay = 0
+
+[deploy]
+### Settings only relevant for deployment
+check_race_track = true
+check_drone_start_pos = true
+real_track_objects = true
+
+[[deploy.drones]]
+id = 10
+channel = 100
+drone_model = "cf21B_500"
+[[deploy.drones]]
+id = 20
+channel = 100
+drone_model = "cf21B_500"
+
+[sim]
+physics = "first_principles"
+drone_model = "cf21B_500"       # cf2x_L250, cf2x_P250, cf2x_T500, cf21B_500. This course: cf21B_500
+freq = 500                      # Simulation frequency, in Hz
+attitude_freq = 500             # Onboard attitude-controller frequency, in Hz
+render = true                   # Enable/disable Crazyflow's GUI
+camera = -1
+[[sim.cam_config]]
+distance = 5.0
+azimuth = 180.0
+elevation = -25.0
+lookat = [0.0, 0.0, 0.0]
+
+[env]
+id = "MultiDroneRacing-v0"
+seed = -1               # -1 for random seeds or a non-zero integer for reproducibility
+# Shared env parameters live in the per-drone [[env.kwargs]] list. multi_sim.py reads them per drone
+# (each controller may run at its own freq); training/render read the shared value from slot 0 via
+# utils.env_param. Keep slot 0 at the frequency the policy was trained at (50 Hz).
+[[env.kwargs]]
+freq = 50               # Env step frequency for drone 0, in Hz
+sensor_range = 0.7      # Range at which gate/obstacle exact poses become visible
+control_mode = "attitude"
+[[env.kwargs]]
+freq = 50               # Env step frequency for drone 1, in Hz
+sensor_range = 0.7
+control_mode = "attitude"
+
+[env.track]
+randomize = false
+
+# Order in which the gates have to be passed. Entries are signed gate numbers, not gate IDs:
+# `1` means gate ID 0 in forward direction, `-1` means the same gate in reverse direction.
+gate_order = [1, 2, 3, 4]
+
+# Tall gates: 1.195m height. Short gates: 0.695m height. Height is measured from the ground to the center of the gate.
+# Gates are square. Gates are 0.72m wide (outer dimensions of the frame) with a 0.4m wide opening.
+
+[[env.track.gates]]
+pos = [0.5 , 0.25, 0.7]
+rpy = [0.0, 0.0, -0.78]
+[[env.track.gates]]
+pos = [1.05, 0.75, 1.2]
+rpy = [0.0, 0.0, 2.35]
+[[env.track.gates]]
+pos = [-1.0, -0.25, 0.7]
+rpy = [0.0, 0.0, 3.14]
+[[env.track.gates]]
+pos = [0.0, -0.75, 1.2]
+rpy = [0.0, 0.0, 0.0]
+
+[[env.track.obstacles]]
+pos = [0.0, 0.75, 1.55]
+[[env.track.obstacles]]
+pos = [1.0, 0.25, 1.55]
+[[env.track.obstacles]]
+pos = [-1.5, -0.25, 1.55]
+[[env.track.obstacles]]
+pos = [-0.5, -0.75, 1.55]
+
+# Drone 0 = trainable ego / rank 0. Drone 1 = opponent / rank 1 (its pos is the scripted-PID
+# opponent's start, read as track.drones[1] by ippo.py / render.py).
+[[env.track.drones]]
+pos = [-1.5, 0.55, 0.01]
+rpy = [0.0, 0.0, 0.0]
+vel = [0, 0, 0]
+ang_vel = [0, 0, 0]
+[[env.track.drones]]
+pos = [-1.5, 0.95, 0.01]
+rpy = [0.0, 0.0, 0.0]
+vel = [0, 0, 0]
+ang_vel = [0, 0, 0]
+
+[env.track.safety_limits]
+pos_limit_low = [-2.5, -1.5, -1e-3]
+pos_limit_high = [2.5, 1.5, 2.0]
+
+[env.disturbances.action]
+fn = "normal"
+scale = 0.001
+
+[env.disturbances.dynamics]
+fn = "uniform"
+[env.disturbances.dynamics.kwargs]
+minval = [-0.1, -0.1, -0.1]
+maxval = [0.1, 0.1, 0.1]
+
+[env.randomizations.drone_pos]
+fn = "uniform"
+[env.randomizations.drone_pos.kwargs]
+minval = [-0.1, -0.1, 0.0]
+maxval = [0.1, 0.1, 0.02]
+
+[env.randomizations.drone_rpy]
+fn = "uniform"
+[env.randomizations.drone_rpy.kwargs]
+minval = [-0.1, -0.1, -0.1]
+maxval = [0.1, 0.1, 0.1]
+
+[env.randomizations.drone_mass]
+fn = "uniform"
+[env.randomizations.drone_mass.kwargs]
+minval = -0.005
+maxval = 0.005
+
+[env.randomizations.drone_inertia]
+fn = "uniform"
+[env.randomizations.drone_inertia.kwargs]
+minval = [-0.000001, -0.000001, -0.000001]
+maxval = [0.000001, 0.000001, 0.000001]
+
+[env.randomizations.gate_pos]
+fn = "uniform"
+[env.randomizations.gate_pos.kwargs]
+minval = [-0.05, -0.05, -0.1]
+maxval = [0.05, 0.05, 0.1]
+
+[env.randomizations.gate_rpy]
+fn = "uniform"
+[env.randomizations.gate_rpy.kwargs]
+minval = [-0.05, -0.1, -0.087]  # yaw: +/-5 deg (0.087 rad)
+maxval = [0.05, 0.1, 0.087]
+
+[env.randomizations.obstacle_pos]
+fn = "uniform"
+[env.randomizations.obstacle_pos.kwargs]
+minval = [-0.05, -0.05, -0.05]
+maxval = [0.05, 0.05, 0.05]
