@@ -71,7 +71,7 @@ class RacingEnv(struct.PyTreeNode):
     def steps(self) -> Array:
         return self.data.steps
 
-    def render(self) -> None:
+    def render(self, **kwargs: Any) -> Any:
         """Render the current functional state via the captured gym env's viewer.
 
         The pure rollout keeps its state in ``self.data``; the gym env renders from *its own*
@@ -79,6 +79,9 @@ class RacingEnv(struct.PyTreeNode):
         functional ``data`` into the gym env, then delegate to its ``render()`` (which lazily syncs
         the drone/gate poses into MuJoCo). Requires an env built with a live ``base_env`` (the
         render factory keeps one; headless training envs pass ``base_env=None``).
+
+        ``kwargs`` (e.g. ``mode="rgb_array"``) are forwarded to the gym env's ``render``; with
+        ``mode="rgb_array"`` the rendered frame is returned instead of drawing to the window.
         """
         if self.base_env is None:
             raise RuntimeError(
@@ -86,7 +89,7 @@ class RacingEnv(struct.PyTreeNode):
                 "env with a rendering-capable factory (base_env kept) rather than a headless one."
             )
         self.base_env.data = self.data
-        self.base_env.render()
+        return self.base_env.render(**kwargs)
 
     def close(self) -> None:
         """No-op: the underlying sim is released when this env is garbage-collected."""
@@ -176,12 +179,15 @@ class MultiRacingEnv(struct.PyTreeNode):
     def steps(self) -> Array:
         return self.data.steps
 
-    def render(self) -> None:
+    def render(self, **kwargs: Any) -> Any:
         """Render the current functional state, with a color marker above each drone.
 
         The viewer only ever shows world 0. Drone 0 (the trainable ego) gets a green marker;
         drones 1.. (opponents, self-play or scripted-PID) get a red marker, so the two are
         distinguishable at a glance -- the drones themselves are otherwise identical.
+
+        ``kwargs`` (e.g. ``mode="rgb_array"``) are forwarded to the gym env's ``render``; with
+        ``mode="rgb_array"`` the rendered frame (markers included) is returned for video capture.
         """
         if self.base_env is None:
             raise RuntimeError(
@@ -193,7 +199,7 @@ class MultiRacingEnv(struct.PyTreeNode):
         draw_points(self.base_env.sim, marker_pos[:1], rgba=_EGO_MARKER_RGBA, size=0.04)
         if self.n_drones > 1:
             draw_points(self.base_env.sim, marker_pos[1:], rgba=_OPPONENT_MARKER_RGBA, size=0.04)
-        self.base_env.render()
+        return self.base_env.render(**kwargs)
 
     def close(self) -> None:
         """No-op: the underlying sim is released when this env is garbage-collected."""
