@@ -61,7 +61,7 @@ from lsy_drone_racing.rl.git_provenance import pin_run_to_branch
 from lsy_drone_racing.rl.wrappers.trajectory_opponent import (
     SPAWN_TIME_MARGIN,
     TrajectoryPID,
-    build_trajectory_pid,
+    build_navigator_pid,
     teleport_opponents,
 )
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
@@ -187,7 +187,7 @@ def train_ippo(
         )
         drone_mass = load_params(config.sim.physics, config.sim.drone_model)["mass"]
         action_space = build_action_space(env_param(config, "control_mode"), config.sim.drone_model)
-        traj_pid = build_trajectory_pid(
+        traj_pid = build_navigator_pid(
             start_pos=np.asarray(config.env.track.drones[1]["pos"]),
             drone_mass=drone_mass,
             freq=env_param(config, "freq"),
@@ -200,6 +200,7 @@ def train_ippo(
             kd=args.opponent_pid_kd,
             ki_range=args.opponent_pid_ki_range,
             gates=config.env.track.gates,
+            obstacles=config.env.track.obstacles,
         )
         print(
             f"Scripted PID opponents: prob {args.opponent_pid_prob_start:.2f} -> "
