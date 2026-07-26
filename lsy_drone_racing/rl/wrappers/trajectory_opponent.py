@@ -139,6 +139,14 @@ class TrajectoryPID:
     # compare directly regardless of the per-episode speed multiplier). Only baked when ``gates``
     # is passed to ``build_trajectory_pid``; required by ``teleport_opponents``.
     gate_times: Array | None = None
+    # Desired body yaw (radians), constant for the whole trajectory. Defaults to 0 (the racing
+    # convention -- gates/track are laid out assuming zero-yaw flight, matching ``wrappers.reward.
+    # ZeroYaw``). A hover-hold PID (``render.py``'s ``ego_pid``) overrides this to the drone's
+    # actual spawn yaw so a randomized (``drone_rpy``) spawn attitude isn't fought as an "error" --
+    # otherwise the hold spends its first steps rotating to yaw 0, and the roll/pitch demand
+    # (computed assuming the body is already at ``des_yaw``) is briefly wrong while real yaw ≠
+    # ``des_yaw``, which showed up as unwanted lateral drift during the hold.
+    des_yaw: float = 0.0
 
     def _spline(self, t: Array) -> tuple[Array, Array]:
         """Desired (position, velocity) at ``t``, single-pass clamped to ``[0, t_total]``."""
@@ -189,7 +197,8 @@ class TrajectoryPID:
         thrust = jnp.sum(target_thrust * z_axis, axis=-1)
 
         z_des = target_thrust / jnp.linalg.norm(target_thrust, axis=-1, keepdims=True)
-        x_c = jnp.zeros_like(z_des).at[..., 0].set(1.0)  # des_yaw == 0 -> x_c_des = [1, 0, 0]
+        x_c = jnp.zeros_like(z_des)
+        x_c = x_c.at[..., 0].set(jnp.cos(self.des_yaw)).at[..., 1].set(jnp.sin(self.des_yaw))
         y_des = jnp.cross(z_des, x_c)
         y_des = y_des / jnp.linalg.norm(y_des, axis=-1, keepdims=True)
         x_des = jnp.cross(y_des, z_des)
@@ -221,6 +230,7 @@ def build_trajectory_pid(
     kd: tuple[float, float, float] = DEFAULT_KD,
     ki_range: tuple[float, float, float] = DEFAULT_KI_RANGE,
     gates: list[Any] | None = None,
+    des_yaw: float = 0.0,
 ) -> TrajectoryPID:
     """Fit the waypoint spline and package the batched-JAX PID config.
 
@@ -245,6 +255,8 @@ def build_trajectory_pid(
         gates: Optional ``config.env.track.gates`` entries (``"pos"``/``"rpy"``). When given, the
             spline's nominal gate-plane crossing times are baked into ``gate_times`` (needed for
             random mid-track spawns via ``teleport_opponents``).
+        des_yaw: Constant desired body yaw (radians), see ``TrajectoryPID.des_yaw``. Defaults to 0,
+            the racing convention; only the hover-hold PID overrides it.
     """
     assert control_mode == "attitude", (
         "the scripted PID opponent emits physical roll/pitch/yaw/thrust setpoints and needs "
@@ -257,6 +269,179 @@ def build_trajectory_pid(
         gate_times = jnp.asarray(
             _compute_gate_pass_times(spline, gates, t_total), dtype=jnp.float32
         )
+    return TrajectoryPID(
+        breakpoints=jnp.asarray(spline.x, dtype=jnp.float32),
+        coeffs=jnp.asarray(spline.c, dtype=jnp.float32),
+        t_total=float(t_total),
+        drone_mass=float(drone_mass),
+        freq=float(freq),
+        kp=jnp.asarray(kp, dtype=jnp.float32),
+        ki=jnp.asarray(ki, dtype=jnp.float32),
+        kd=jnp.asarray(kd, dtype=jnp.float32),
+        ki_range=jnp.asarray(ki_range, dtype=jnp.float32),
+        action_low=jnp.asarray(action_low, dtype=jnp.float32),
+        action_high=jnp.asarray(action_high, dtype=jnp.float32),
+        gate_times=gate_times,
+        des_yaw=float(des_yaw),
+    )
+
+
+# Waypoint geometry and gains for the gate/obstacle-aware navigator opponent (ported from the
+# reference host-side ``lsy_drone_racing.control.attitude_controller_variant.AttitudeController_1``,
+# which flies this exact track -- entry/gate/exit points offset off each gate's crossing normal,
+# plus a dip point near a nearby obstacle -- and clears ~50% of level2 runs end to end). Unlike
+# ``DEFAULT_WAYPOINTS`` (a fixed path independent of the track config), these are derived from
+# ``config.env.track.gates``/``obstacles`` at build time, so they stay correct for whichever track
+# config is passed to :func:`build_navigator_pid`. The per-gate obstacle indices/offsets are tuned
+# for -- and only valid on -- a 4-gate track laid out like level2/multi_level2.
+_NAV_GATE_IN_OFFSET = 0.23  # m along the gate normal, entry point
+_NAV_GATE_IN_OFFSET_PREV = 0.10  # m along the vector from the previous waypoint
+_NAV_GATE_OUT_OFFSET = 0.23  # m along the gate normal, exit point
+_NAV_GATE_OUT_OFFSET_NEXT = 0.10  # m along the vector toward the next gate
+_NAV_DIP_DEGREE = 120  # deg; above this incidence angle the exit point dips the other way
+_NAV_POINT_AT_OBSTACLE = (True, True, True, False)  # per-gate: add a dip waypoint near an obstacle
+_NAV_OBSTACLE_IND = (1, 0, 3, 0)  # per-gate index into obstacles_pos for the dip waypoint
+_NAV_OBSTACLE_OFFSET = np.array(
+    [[0.17, -0.17, 0.1], [0.2, -0.2, -0.1], [0.1, 0.2, 0.2], [0.0, 0.0, 0.0]]
+)
+DEFAULT_NAV_T_TOTAL = 11.0  # seconds, nominal (speed multiplier == 1.0) single-pass duration
+DEFAULT_NAV_KP = (0.7, 0.7, 2.7)
+DEFAULT_NAV_KI = (0.0, 0.0, 0.0)
+DEFAULT_NAV_KD = (0.4, 0.4, 0.8)
+DEFAULT_NAV_KI_RANGE = (2.0, 2.0, 0.4)
+
+
+def _build_navigator_waypoints(
+    start_pos: np.ndarray, gates_pos: np.ndarray, gates_quat: np.ndarray, obstacles_pos: np.ndarray
+) -> np.ndarray:
+    """Build the entry/gate/exit(/obstacle-dip) waypoint sequence for the navigator opponent.
+
+    Pure-numpy port of ``AttitudeController_1.create_waypoints``, taking the nominal track arrays
+    directly instead of a live observation dict -- this only ever runs once, host-side, at build
+    time (see :func:`build_navigator_pid`), exactly like ``_fit_position_spline`` above.
+    """
+    assert len(gates_pos) == 4, (
+        "the navigator opponent's per-gate obstacle indices/offsets are tuned for a 4-gate track "
+        f"like level2/multi_level2, got {len(gates_pos)} gates."
+    )
+    waypoints = [np.asarray(start_pos, dtype=np.float64)]
+    takeoff = waypoints[0].copy()
+    takeoff += [0.6, -0.1, 0.3]
+    waypoints.append(takeoff)
+
+    for i, (pos, quat) in enumerate(zip(gates_pos, gates_quat)):
+        normal = Rotation.from_quat(quat).apply([1.0, 0.0, 0.0])
+        vec_prev_to_gate = pos - waypoints[-1]
+        vec_prev_to_gate_norm = vec_prev_to_gate / np.linalg.norm(vec_prev_to_gate)
+
+        if i + 1 < len(gates_pos):
+            vec_gate_to_next_gate = gates_pos[i + 1] - pos
+            vec_gate_to_next_gate_norm = vec_gate_to_next_gate / np.linalg.norm(
+                vec_gate_to_next_gate
+            )
+        else:
+            vec_gate_to_next_gate_norm = vec_prev_to_gate_norm
+
+        cos_theta = np.dot(normal, vec_gate_to_next_gate_norm)
+        theta_dec = np.degrees(np.arccos(cos_theta))
+
+        gate_in_dir_vec = _NAV_GATE_IN_OFFSET_PREV * vec_prev_to_gate_norm
+        gate_out_dir_vec = _NAV_GATE_OUT_OFFSET_NEXT * vec_gate_to_next_gate_norm
+
+        length_normal_in = np.dot(gate_in_dir_vec, normal)
+        length_normal_out = np.dot(gate_out_dir_vec, normal)
+
+        add_normal_in = length_normal_in - _NAV_GATE_IN_OFFSET
+        add_normal_out = _NAV_GATE_OUT_OFFSET - length_normal_out
+
+        entry = pos - gate_in_dir_vec + add_normal_in * normal
+        if theta_dec < _NAV_DIP_DEGREE:
+            exit_ = pos + gate_out_dir_vec + add_normal_out * normal
+        else:
+            # Distance is in the opposite direction when theta_dec > 90.
+            add_normal_out = _NAV_GATE_OUT_OFFSET + length_normal_out
+            exit_ = pos + gate_out_dir_vec - add_normal_out * normal
+
+        waypoints.append(entry)
+        waypoints.append(pos)
+        waypoints.append(exit_)
+
+        if _NAV_POINT_AT_OBSTACLE[i]:
+            dip = obstacles_pos[_NAV_OBSTACLE_IND[i]].copy()
+            dip[2] = exit_[2]  # fly the dip at the previous waypoint's height
+            dip = dip + _NAV_OBSTACLE_OFFSET[i]
+            waypoints.append(dip)
+
+    return np.array(waypoints)
+
+
+def _fit_distance_spline(waypoints: np.ndarray, t_total: float) -> CubicSpline:
+    """Fit a not-a-knot cubic spline timed by cumulative waypoint distance, not equal spacing.
+
+    Matches ``AttitudeController_1.create_spline``: waypoints from the navigator builder are
+    unevenly spaced (a short obstacle-dip hop next to a long inter-gate leg), so distance-based
+    timing keeps the feed-forward velocity roughly constant instead of racing through short legs.
+    """
+    distances = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+    cumulative_dist = np.insert(np.cumsum(distances), 0, 0)
+    t = t_total * cumulative_dist / cumulative_dist[-1]
+    return CubicSpline(t, waypoints, axis=0)
+
+
+def build_navigator_pid(
+    start_pos: np.ndarray,
+    drone_mass: float,
+    freq: float,
+    control_mode: str,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+    gates: list[Any],
+    obstacles: list[Any],
+    t_total: float = DEFAULT_NAV_T_TOTAL,
+    kp: tuple[float, float, float] = DEFAULT_NAV_KP,
+    ki: tuple[float, float, float] = DEFAULT_NAV_KI,
+    kd: tuple[float, float, float] = DEFAULT_NAV_KD,
+    ki_range: tuple[float, float, float] = DEFAULT_NAV_KI_RANGE,
+) -> TrajectoryPID:
+    """Build the gate/obstacle-aware navigator opponent for a specific track config.
+
+    Unlike :func:`build_trajectory_pid`'s fixed ``DEFAULT_WAYPOINTS``, the waypoints here are
+    derived from ``gates``/``obstacles`` themselves (see :func:`_build_navigator_waypoints`), so
+    the resulting spline actually threads this track's gates and obstacles rather than a
+    once-tuned, track-independent path. The result is a plain :class:`TrajectoryPID`, so it plugs
+    into ``ippo.py``/``teleport_opponents`` exactly like :func:`build_trajectory_pid`'s output.
+
+    Args:
+        start_pos: The opponent drone's nominal track spawn position (3,).
+        drone_mass: Drone mass (kg), for gravity feed-forward.
+        freq: Env step frequency (Hz).
+        control_mode: Must be ``"attitude"``.
+        action_low: The env's physical (pre-``NormalizeActions``) action lower bound.
+        action_high: The matching physical action upper bound.
+        gates: ``config.env.track.gates`` entries (``"pos"``/``"rpy"``), raw list order.
+        obstacles: ``config.env.track.obstacles`` entries (``"pos"``), raw list order.
+        t_total: Nominal (speed multiplier 1.0) time to fly the spline once, in seconds.
+        kp: Proportional gain, defaulting to the reference navigator's tuned value.
+        ki: Integral gain, defaulting to the reference navigator's tuned value.
+        kd: Derivative gain, defaulting to the reference navigator's tuned value.
+        ki_range: Integral-error clamp, defaulting to the reference navigator's tuned value.
+    """
+    assert control_mode == "attitude", (
+        "the scripted PID opponent emits physical roll/pitch/yaw/thrust setpoints and needs "
+        f"control_mode='attitude', got '{control_mode}'."
+    )
+    gates_pos = np.array([g["pos"] for g in gates], dtype=np.float64)
+    gates_quat = Rotation.from_euler(
+        "xyz", np.array([g["rpy"] for g in gates], dtype=np.float64)
+    ).as_quat()
+    obstacles_pos = np.array([o["pos"] for o in obstacles], dtype=np.float64)
+
+    waypoints = _build_navigator_waypoints(
+        np.asarray(start_pos, dtype=np.float64), gates_pos, gates_quat, obstacles_pos
+    )
+    spline = _fit_distance_spline(waypoints, t_total)
+    gate_times = jnp.asarray(_compute_gate_pass_times(spline, gates, t_total), dtype=jnp.float32)
+
     return TrajectoryPID(
         breakpoints=jnp.asarray(spline.x, dtype=jnp.float32),
         coeffs=jnp.asarray(spline.c, dtype=jnp.float32),
