@@ -13,6 +13,7 @@ saves
 plots/
 c_generated_code/
 /build
+/videos
 
 # ProperDocs build output
 site/
