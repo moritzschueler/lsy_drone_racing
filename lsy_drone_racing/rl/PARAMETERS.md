@@ -274,10 +274,20 @@ advanced to match the gate it is approaching (so rank / segment-lead / victory s
 genuinely ahead). `t0` is always clamped below the last gate's pass time — the opponent never spawns
 already-finished.
 - **`track.gate_order` must be the plain forward sequence `[1, 2, ..., n_gates]` whenever PID
-  opponents are enabled** (`opponent_pid_prob_start`/`_end` > 0). The scripted PID flies a fixed,
+  opponents are enabled** (`opponent_pid_prob_start`/`_end` > 0). The scripted PID flies a
   single-pass, non-looping spline that crosses the physical gates in `config.env.track.gates`' raw
   list order; a permuted or repeating `gate_order` desyncs its real flight path from the
   `n_gates_passed` bookkeeping (asserted at startup in `ippo.py`, see there).
+- **The opponent is `trajectory_opponent.build_navigator_pid`** (ported from the reference
+  `AttitudeController_1`, gate/obstacle-aware), not the older fixed, track-independent
+  `build_trajectory_pid`/`DEFAULT_WAYPOINTS` path (still available, unused by default). Its
+  waypoints -- entry/gate/exit points off each gate's crossing normal plus an obstacle-dip point --
+  are derived from `config.env.track.gates`/`obstacles` at build time, so they track whichever
+  config is passed in rather than a once-tuned fixed path. Tuned for -- and only valid on -- a
+  4-gate track laid out like level2/multi_level2 (hardcoded per-gate obstacle indices/offsets).
+  `opponent_pid_t_total`/`_kp`/`_ki`/`_kd`/`_ki_range` default to this controller's tuned values
+  (`t_total=11.0`, `kp=(0.7, 0.7, 2.7)`, `ki=(0, 0, 0)`, `kd=(0.4, 0.4, 0.8)`,
+  `ki_range=(2.0, 2.0, 0.4)`), not `AttitudeController`'s.
 
 ### `opponent_pid_start_frac_min` (current **0.0**) / `opponent_pid_start_frac_max` (current **0.5**)
 
