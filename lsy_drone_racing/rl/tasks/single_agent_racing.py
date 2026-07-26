@@ -35,7 +35,7 @@ class RacingArgs(Args):
     layers any explicit ``--flag`` overrides on top via ``RacingArgs.create(**kwargs)``.
     """
 
-    total_timesteps: int = 800_000_000
+    total_timesteps: int = 300_000_000
     gamma: float = 0.99
     learning_rate: float = 3e-4
     target_kl: float = 0.03
