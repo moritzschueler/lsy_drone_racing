@@ -477,11 +477,20 @@ class RaceCoreEnv:
                 to follow.
         """
 
-    def render(self):
-        """Render the environment."""
+    def render(self, **kwargs: Any) -> Any:
+        """Render the environment.
+
+        Extra ``kwargs`` (e.g. ``mode="rgb_array"``, ``width``, ``height``) are forwarded to
+        ``Sim.render``; with ``mode="rgb_array"`` this returns the rendered frame as an HxWx3
+        uint8 array (for offscreen video capture) instead of drawing to the interactive window.
+        """
         if not self.data.sim_data.core.mjx_synced:
             self.data, self.sim.mjx_data = self._render_sync(self.data, self.sim.mjx_data)
-        self.sim.render(camera=self.settings.camera, cam_config=self.settings.cam_config)
+        # Fall back to the config's camera/cam_config, but let callers override the viewpoint (e.g.
+        # a top-down or per-gate camera) by passing ``camera``/``cam_config`` in ``kwargs``.
+        kwargs.setdefault("camera", self.settings.camera)
+        kwargs.setdefault("cam_config", self.settings.cam_config)
+        return self.sim.render(**kwargs)
 
     def close(self):
         """Close the environment by stopping the drone and landing back at the starting position."""
