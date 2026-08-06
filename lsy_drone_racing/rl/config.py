@@ -45,7 +45,7 @@ class Args:
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
     ent_coef: float = 0.007
     """coefficient of the entropy (initial value when anneal_ent_coef is set)"""
-    anneal_ent_coef: bool = False
+    anneal_ent_coef: bool = True
     """linearly anneal ent_coef from its initial value to 0 over training (like anneal_lr), so the
     policy explores early and sharpens late instead of growing more stochastic"""
     vf_coef: float = 0.7
