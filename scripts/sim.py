@@ -108,9 +108,7 @@ def simulate(
         finished = obs["n_gates_passed"] == obs["gate_sequence"].shape[0]
         ep_times.append(curr_time if finished else None)
 
-        gates_passed.append(
-            obs["target_gate"] if obs["target_gate"] != -1 else len(config.env.track.gates)
-        )
+        gates_passed.append(int(obs["n_gates_passed"]))
     print(f"Average number of gates passed: {round(sum(gates_passed) / n_runs, 1)}")
     # Close the environment
     env.close()
