@@ -73,6 +73,42 @@ def load_config(path: Path) -> ConfigDict:
         return ConfigDict(toml.load(f))
 
 
+def env_param(config: ConfigDict, key: str) -> Any:
+    """Read a shared env parameter (``freq``/``control_mode``/``sensor_range``) from either schema.
+
+    Multi-drone eval configs (the ``multi_sim.py`` schema) place these under a per-drone
+    ``[[env.kwargs]]`` list; single-drone and RL-training configs place them flat under ``[env]``.
+    The RL pipeline shares one policy across all drones and steps the whole env at a single rate, so
+    when the list form is present it reads the shared value from slot 0. This lets one
+    ``multi_levelN.toml`` feed both ``multi_sim.py`` (per-drone kwargs) and training (flat read).
+
+    Args:
+        config: The loaded race config.
+        key: The parameter name, e.g. ``"freq"``, ``"control_mode"`` or ``"sensor_range"``.
+    """
+    kwargs = config.env.get("kwargs")
+    if kwargs is not None:
+        return kwargs[0][key]
+    return config.env[key]
+
+
+def strip_env_randomization(config: ConfigDict) -> ConfigDict:
+    """Remove per-episode randomizations & disturbances in place, for deterministic runs.
+
+    Backs the ``--no_randomization`` flag on ``train.py``/``render.py``. The scripted-PID opponent
+    flies a fixed waypoint spline with little gate clearance, so it crashes into randomized gates;
+    clean renders / opponent demos need the nominal track. Deletes the ``[env.randomizations]`` and
+    ``[env.disturbances]`` blocks if present, so the env builders fall back to their ``None`` default.
+
+    Args:
+        config: The loaded race config to mutate.
+    """
+    for key in ("randomizations", "disturbances"):
+        if key in config.env:
+            del config.env[key]
+    return config
+
+
 def set_seeds(seed: int):
     """Seed everything."""
     random.seed(seed)

@@ -46,6 +46,7 @@ from lsy_drone_racing.rl.wrappers.observation import FlattenJaxObservation, Rela
 from lsy_drone_racing.rl.wrappers.racing_env import MultiRacingEnv
 from lsy_drone_racing.rl.wrappers.reward import ActionPenalty, NormalizeActions, ZeroYaw
 from lsy_drone_racing.rl.wrappers.takeoff import SpinUpRotors
+from lsy_drone_racing.utils import env_param
 
 if TYPE_CHECKING:
     from lsy_drone_racing.rl.config import Args
@@ -73,24 +74,24 @@ class MultiAgentRacingArgs(RacingArgs):
 
     # -- On-device self-play opponent pool (ring buffer) --
     # Number of past-ego snapshots kept on device
-    opponent_pool_size: int = 8
+    opponent_pool_size: int = 32
     # How often (in global steps) to snapshot the current ego params into the next ring-buffer slot
-    opponent_snapshot_interval: int = 5_000_000
+    opponent_snapshot_interval: int = 30_000_000
     # Global step at which opponents are activated
     opponent_start_step: int = 0
     # Recency-weighted sampling over the self-play pool: 0 = uniform over filled slots,
     # 1 = almost always the most recent.
-    opponent_recency_bias: float = 0.7
+    opponent_recency_bias: float = 0
 
     # -- Competition reward (ego vs. opponent shaping; see CompetitionReward) --
     # Master switch: set False to fall back to plain progress-based racing reward only.
     use_competition_reward: bool = True
     competition_rank_coef: float = 0.01
-    competition_segment_lead_coef: float = 0.01
-    competition_proximity_coef: float = 20.0
+    competition_segment_lead_coef: float = 0.0005
+    competition_proximity_coef: float = 0.0001
     competition_proximity_threshold: float = 0.2
-    competition_victory_coef: float = 100.0
-    competition_downwash_coef: float = 0.05
+    competition_victory_coef: float = 50.0
+    competition_downwash_coef: float = 1
     competition_downwash_base_radius: float = 0.2
     competition_downwash_expansion: float = 0.5
     competition_downwash_vertical_softening: float = 0.5
@@ -106,7 +107,7 @@ class MultiAgentRacingArgs(RacingArgs):
     # Fraction of envs whose opponent(s) are PID/spline-controlled rather than drawn from the
     # self-play pool, resampled every episode. Requires control_mode == "attitude"; set both
     # opponent_pid_prob_start and opponent_pid_prob_end to 0 to disable entirely.
-    opponent_pid_prob_start: float = 0.8
+    opponent_pid_prob_start: float = 0.3
     # Target fraction once the anneal (below) completes -- lower than the start so self-play comes
     # to dominate opponent behavior as the pool matures.
     opponent_pid_prob_end: float = 0.3
@@ -116,14 +117,17 @@ class MultiAgentRacingArgs(RacingArgs):
     # Per-episode PID speed multiplier range, sampled uniformly; 1.0 == the nominal
     # opponent_pid_t_total-second single pass.
     opponent_pid_speed_min: float = 0.6
-    opponent_pid_speed_max: float = 1.6
-    # Nominal (speed multiplier == 1.0) time to fly the waypoint spline once, in seconds.
-    opponent_pid_t_total: float = 18.0
+    opponent_pid_speed_max: float = 1.2
+    # Nominal (speed multiplier == 1.0) time to fly the waypoint spline once, in seconds. The
+    # opponent built from these is the gate/obstacle-aware navigator
+    # (trajectory_opponent.build_navigator_pid, ported from AttitudeController_1), not a
+    # fixed-waypoint path -- these defaults are that controller's tuned values.
+    opponent_pid_t_total: float = 11.0
     # Position-PID gains (kp, ki, kd) and integral-error clamp, identical defaults to
-    # lsy_drone_racing.control.attitude_controller.AttitudeController.
-    opponent_pid_kp: tuple[float, float, float] = (0.4, 0.4, 1.25)
-    opponent_pid_ki: tuple[float, float, float] = (0.05, 0.05, 0.05)
-    opponent_pid_kd: tuple[float, float, float] = (0.2, 0.2, 0.4)
+    # AttitudeController_1.
+    opponent_pid_kp: tuple[float, float, float] = (0.7, 0.7, 2.7)
+    opponent_pid_ki: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    opponent_pid_kd: tuple[float, float, float] = (0.4, 0.4, 0.8)
     opponent_pid_ki_range: tuple[float, float, float] = (2.0, 2.0, 0.4)
     # Random mid-track spawn for PID opponents: each PID episode starts at virtual trajectory time
     # t0 ~ U(frac_min, frac_max) * opponent_pid_t_total (clamped to stay before the last gate's
@@ -184,10 +188,10 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
 
     base = VecMultiDroneRaceEnv(
         num_envs=args.num_envs,
-        freq=config.env.freq,
+        freq=env_param(config, "freq"),
         sim_config=config.sim,
-        sensor_range=config.env.sensor_range,
-        control_mode=config.env.control_mode,
+        sensor_range=env_param(config, "sensor_range"),
+        control_mode=env_param(config, "control_mode"),
         track=config.env.track,
         disturbances=config.env.get("disturbances"),
         randomizations=config.env.get("randomizations"),
@@ -202,7 +206,9 @@ def make_multi_agent_env(args: Args, config: Any = None) -> Wrapper:
     env = MultiRacingEnv.create(
         base,
         single_observation_space=build_observation_space(n_gates, n_obstacles, n_gate_passes),
-        single_action_space=build_action_space(config.env.control_mode, config.sim.drone_model),
+        single_action_space=build_action_space(
+            env_param(config, "control_mode"), config.sim.drone_model
+        ),
     )
     env = LogRewardComponents.create(
         env,

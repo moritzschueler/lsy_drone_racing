@@ -21,7 +21,7 @@ from lsy_drone_racing.rl.wrappers.trajectory_opponent import (
     teleport_opponents,
 )
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
-from lsy_drone_racing.utils import load_config
+from lsy_drone_racing.utils import env_param, load_config, strip_env_randomization
 
 CHECKPOINT_DIR = Path(__file__).parents[1] / "checkpoints"
 
@@ -82,6 +82,7 @@ def main(
     opponent_pid_speed: float = 1.0,
     opponent_pid_start_frac: float = 0.0,
     show_trajectory: bool = True,
+    no_randomization: bool = False,
     **kwargs: Any,
 ):
     """Render the simulation for a single trained PPO agent on the given task.
@@ -102,6 +103,9 @@ def main(
             ``opponent == "pid"``.
         show_trajectory: If True (default), draw each drone's flown trail into the viewer -- the
             ego drone (0) in green and the opponent(s) (1..) in red. Set False to disable.
+        no_randomization: If True, strip the config's ``[env.randomizations]`` /
+            ``[env.disturbances]`` blocks for a clean, deterministic race -- needed so a scripted
+            PID opponent (``opponent="pid"``) doesn't crash into randomized gates.
     """
     assert opponent in ("self_play", "pid"), f"Unknown opponent mode '{opponent}'."
     task_spec = get_task(task)
@@ -126,6 +130,8 @@ def main(
         model_path = CHECKPOINT_DIR / task / checkpoint
 
     env_config = load_config(Path(__file__).parents[3] / "config" / config)
+    if no_randomization:
+        strip_env_randomization(env_config)
 
     eval_env: Wrapper = task_spec.make_env(args, env_config)
     action_dim = int(np.prod(eval_env.single_action_space.shape))
@@ -139,17 +145,19 @@ def main(
     traj_pid = None
     if opponent == "pid":
         assert n_drones > 1, "opponent='pid' needs a multi-drone task/config."
-        assert env_config.env.control_mode == "attitude", (
+        assert env_param(env_config, "control_mode") == "attitude", (
             f"opponent='pid' needs an attitude-control track config, got control_mode="
-            f"'{env_config.env.control_mode}'."
+            f"'{env_param(env_config, 'control_mode')}'."
         )
         drone_mass = load_params(env_config.sim.physics, env_config.sim.drone_model)["mass"]
-        action_space = build_action_space(env_config.env.control_mode, env_config.sim.drone_model)
+        action_space = build_action_space(
+            env_param(env_config, "control_mode"), env_config.sim.drone_model
+        )
         traj_pid = build_trajectory_pid(
             start_pos=np.asarray(env_config.env.track.drones[1]["pos"]),
             drone_mass=drone_mass,
-            freq=env_config.env.freq,
-            control_mode=env_config.env.control_mode,
+            freq=env_param(env_config, "freq"),
+            control_mode=env_param(env_config, "control_mode"),
             action_low=np.asarray(action_space.low),
             action_high=np.asarray(action_space.high),
             gates=env_config.env.track.gates,
@@ -185,7 +193,7 @@ def main(
         )
         action = mean.at[:, 1:].set(traj_pid.normalize(action_phys))
         env, (obs, _, terminated, truncated, _) = env.step(env, action)
-        traj_t = traj_t + opponent_pid_speed / env_config.env.freq
+        traj_t = traj_t + opponent_pid_speed / env_param(env_config, "freq")
         return env, obs, terminated, truncated, traj_t, i_error
 
     eval_env, (obs, _) = eval_env.reset(eval_env, seed=args.seed)

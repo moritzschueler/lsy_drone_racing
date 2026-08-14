@@ -32,9 +32,10 @@ The self-play pool itself is *not* gated: it is seeded with the initial ego para
 snapshotting/filling from step 0 regardless, so a real (if still early) opponent is ready to go the
 moment ``opponent_active`` flips.
 
-Deferred vs. the eventual design (documented so the gap is explicit):
-  * ``opponent_recency_bias`` is not yet applied -- pool slots are sampled uniformly over the filled
-    slots. Recency weighting is a drop-in change to the sampling distribution.
+Pool sampling is recency-weighted (``opponent_recency_bias``): a filled slot's age is its distance
+from ``write_ptr`` going backwards around the ring, and its sampling weight is
+``(1 - opponent_recency_bias) ** age`` -- 0 reduces to uniform over the filled slots, 1 collapses to
+always the single most-recently-written slot.
 """
 
 import dataclasses
@@ -60,11 +61,11 @@ from lsy_drone_racing.rl.git_provenance import pin_run_to_branch
 from lsy_drone_racing.rl.wrappers.trajectory_opponent import (
     SPAWN_TIME_MARGIN,
     TrajectoryPID,
-    build_trajectory_pid,
+    build_navigator_pid,
     teleport_opponents,
 )
 from lsy_drone_racing.rl.wrappers.wrapper_base import Wrapper
-from lsy_drone_racing.utils.utils import set_seeds
+from lsy_drone_racing.utils.utils import env_param, set_seeds
 
 # Env factory: (args, config) -> fully-wrapped functional multi-drone env (a ``Wrapper``).
 MakeEnv = Callable[[Args, Any], Wrapper]
@@ -165,10 +166,10 @@ def train_ippo(
     )
     traj_pid: TrajectoryPID | None = None
     if use_pid_opponents:
-        assert config.env.control_mode == "attitude", (
+        assert env_param(config, "control_mode") == "attitude", (
             "opponent_pid_prob_start/opponent_pid_prob_end mixing needs an attitude-control track "
             f"config (physical roll/pitch/yaw/thrust setpoints), got control_mode="
-            f"'{config.env.control_mode}'."
+            f"'{env_param(config, 'control_mode')}'."
         )
         # The scripted PID opponent flies a fixed, single-pass, non-looping spline that crosses
         # the physical gates in config.env.track.gates' raw list order (see
@@ -185,12 +186,12 @@ def train_ippo(
             "repeating gate order."
         )
         drone_mass = load_params(config.sim.physics, config.sim.drone_model)["mass"]
-        action_space = build_action_space(config.env.control_mode, config.sim.drone_model)
-        traj_pid = build_trajectory_pid(
+        action_space = build_action_space(env_param(config, "control_mode"), config.sim.drone_model)
+        traj_pid = build_navigator_pid(
             start_pos=np.asarray(config.env.track.drones[1]["pos"]),
             drone_mass=drone_mass,
-            freq=config.env.freq,
-            control_mode=config.env.control_mode,
+            freq=env_param(config, "freq"),
+            control_mode=env_param(config, "control_mode"),
             action_low=np.asarray(action_space.low),
             action_high=np.asarray(action_space.high),
             t_total=args.opponent_pid_t_total,
@@ -199,6 +200,7 @@ def train_ippo(
             kd=args.opponent_pid_kd,
             ki_range=args.opponent_pid_ki_range,
             gates=config.env.track.gates,
+            obstacles=config.env.track.obstacles,
         )
         print(
             f"Scripted PID opponents: prob {args.opponent_pid_prob_start:.2f} -> "
@@ -268,9 +270,11 @@ def train_ippo(
     opponent_start_step = int(args.opponent_start_step)
     # Snapshot cadence in iterations (each iteration advances the global step by batch_size).
     snapshot_every = max(1, round(args.opponent_snapshot_interval / batch_size))
+    recency_bias = float(args.opponent_recency_bias)
     print(
         f"Self-play pool: {pool_size} slots, snapshot every {snapshot_every} iterations "
-        f"(~{snapshot_every * batch_size} steps), uniform sampling over filled slots."
+        f"(~{snapshot_every * batch_size} steps), recency_bias={recency_bias:.2f} "
+        f"({'uniform' if recency_bias == 0.0 else 'recency-weighted'} sampling over filled slots)."
     )
     print(f"Opponent activates at global step {opponent_start_step} (action + competition reward).")
 
@@ -412,6 +416,7 @@ def train_ippo(
         params: nnx.State,
         pool: nnx.State,
         filled: Array,
+        write_ptr: Array,
         env: Wrapper,
         obs: Array,
         rng: Array,
@@ -431,7 +436,8 @@ def train_ippo(
         scripted PID trajectory-follower (see ``pid_actions``), concatenates the actions, and steps
         the multi-drone env. Opponent slot indices ``opp_idx`` and, when ``use_pid_opponents``, the
         per-slot PID phase/speed/integral-error/behavior-choice in ``traj_state`` are resampled per
-        env whenever the ego episode ends.
+        env whenever the ego episode ends, weighted by recency (see ``opponent_recency_bias`` on
+        ``Args``) via ``write_ptr``, the pool's next-write ring position.
 
         ``opponent_active`` (scalar bool, constant for the duration of this rollout) gates both the
         opponent's action -- a frozen no-op action is substituted while inactive, for *either*
@@ -439,6 +445,17 @@ def train_ippo(
         ``CompetitionReward``, which is stripped back out via the ``rew/comp_*`` breakdown in
         ``info`` while inactive.
         """
+        # Recency-weighted sampling distribution over pool slots, fixed for this whole rollout
+        # (write_ptr/filled only change between rollouts, via snapshot_pool). A filled slot's age is
+        # its distance from write_ptr going backwards around the ring (0 = most recently written);
+        # weight (1 - opponent_recency_bias) ** age reduces to uniform at bias 0 and collapses onto
+        # the single newest slot at bias 1 (0 ** 0 == 1 by convention, so that slot keeps weight 1).
+        pool_slot = jnp.arange(pool_size)
+        slot_age = (write_ptr - 1 - pool_slot) % pool_size
+        slot_weight = jnp.where(
+            pool_slot < filled, jnp.power(1.0 - recency_bias, slot_age.astype(jnp.float32)), 0.0
+        )
+        sample_probs = slot_weight / jnp.sum(slot_weight)
 
         def step(carry: tuple, _: Any) -> tuple[tuple, dict]:
             env, obs, rng, ep_ret, ep_len, opp_idx, ep_step, finish_step, traj_state = carry
@@ -456,7 +473,7 @@ def train_ippo(
                 )
                 use_pid = is_pid_opp & opponent_active
                 opp_action = jnp.where(use_pid[..., None], pid_action, opp_action_selfplay)
-                traj_t = traj_t + traj_speed / config.env.freq  # advance virtual trajectory time
+                traj_t = traj_t + traj_speed / env_param(config, "freq")  # advance virtual traj time
             else:
                 # Before opponent_start_step, freeze the opponent to a no-op action instead of
                 # racing against a still-largely-random self-play snapshot (mirrors
@@ -547,9 +564,12 @@ def train_ippo(
             # clears recorded finish steps so the next episode starts fresh.
             ep_step = jnp.where(env_done, 0, new_ep_step)
             finish_step = jnp.where(env_done[:, None], -1, finish_step)
-            # Resample opponents for envs whose ego episode just ended (uniform over filled slots).
+            # Resample opponents for envs whose ego episode just ended (recency-weighted over the
+            # filled slots, see sample_probs above).
             rng, skey = jax.random.split(rng)
-            resampled = jax.random.randint(skey, opp_idx.shape, 0, filled)
+            resampled = jax.random.choice(
+                skey, pool_size, shape=opp_idx.shape, p=sample_probs
+            ).astype(opp_idx.dtype)
             opp_idx = jnp.where(done[:, None], resampled, opp_idx)
             if use_pid_opponents:
                 # Resample the PID phase/speed/behavior-choice at the same episode boundary; the
@@ -727,6 +747,7 @@ def train_ippo(
                 params,
                 pool,
                 filled,
+                write_ptr,
                 env,
                 obs,
                 roll_rng,

@@ -13,6 +13,7 @@ saves
 plots/
 c_generated_code/
 /build
+/videos
 
 # ProperDocs build output
 site/
@@ -26,3 +27,5 @@ acados/
 *wandb/
 *.ckpt
 pixi.lock
+
+!lsy_drone_racing/rl/checkpoints/multi_agent_racing/multi_agent_racing_best.ckpt

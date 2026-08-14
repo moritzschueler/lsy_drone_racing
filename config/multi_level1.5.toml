@@ -1,32 +1,32 @@
-# Multi-drone racing -- Level 0
+# Multi-drone racing -- Level 2
 #
 # ONE config, two uses:
-#   * training : pixi run python -m lsy_drone_racing.rl.scripts.train --config multi_level0.toml
+#   * training : pixi run python -m lsy_drone_racing.rl.scripts.train --config multi_level2.toml
 #                Shared env params are read from env.kwargs[0] (via utils.env_param); the
 #                [[controller]] entries are ignored -- the opponent is the self-play pool + scripted
 #                PID, configured through the CLI / MultiAgentRacingArgs.
-#   * sim eval : pixi run python scripts/multi_sim.py --config multi_level0.toml
+#   * sim eval : pixi run python scripts/multi_sim.py --config multi_level2.toml
 #                One Python controller per drone, taken from the [[controller]] entries below (or
 #                --controllers "a.py,b.py"). Each drone may step at its own env.kwargs freq.
 #
-# | Level | Rand. Inertial | Rand. Gates/Obstacles | Rand. Track | Notes             |
-# | :---: | :------------: | :-------------------: | :---------: | :---------------: |
-# |   0   | *No*           | *No*                  | *No*        | Perfect knowledge |
+# | Level | Rand. Inertial | Rand. Gates/Obstacles | Rand. Track | Notes                 |
+# | :---: | :------------: | :-------------------: | :---------: | :-------------------: |
+# |   2   | *Yes*          | *Yes*                 | *No*        | Learning, re-planning |
 #
-# Pass --no_randomization (train.py / render.py) to also strip the dynamics/action disturbances for a
-# fully deterministic race.
+# Pass --no_randomization (train.py / render.py) to strip the randomization/disturbance blocks for a
+# clean, deterministic race -- required so a scripted-PID opponent doesn't crash into shifted gates.
 
-# One [[controller]] per drone, in rank order (drone 0, drone 1). Used by multi_sim.py; ignored by
-# training. Override with --controllers "a.py,b.py".
+# One [[controller]] per drone, in rank order (drone 0, drone 1)
 # `start_delay` (seconds, default 0.0) makes a drone rest inert on its pad -- zero thrust, no
-# command -- before its controller starts, e.g. raise one drone's to let the other lead and force a
-# catch-up. Applied by rank in multi_sim.py; ignored by training.
+# command -- before its controller starts. Here the RL drone (0) rests 3 s so the PID drone (1)
+# leads and the RL policy has to catch up and overtake. Applied by rank in multi_sim.py; ignored by
+# training. Set both to 0.0 for a simultaneous start.
 [[controller]]
-file = "rl_multi_agent_racing_controller.py"
-start_delay = 0.0
+file = "rl_multi_agent_racing_controller_1.py"
+start_delay = 0
 [[controller]]
-file = "rl_multi_agent_racing_controller.py"
-start_delay = 0.0
+file = "rl_multi_agent_racing_controller_2.py"
+start_delay = 0
 
 [deploy]
 ### Settings only relevant for deployment
@@ -80,6 +80,7 @@ gate_order = [1, 2, 3, 4]
 
 # Tall gates: 1.195m height. Short gates: 0.695m height. Height is measured from the ground to the center of the gate.
 # Gates are square. Gates are 0.72m wide (outer dimensions of the frame) with a 0.4m wide opening.
+
 [[env.track.gates]]
 pos = [0.5 , 0.25, 0.7]
 rpy = [0.0, 0.0, -0.78]
@@ -128,3 +129,45 @@ fn = "uniform"
 [env.disturbances.dynamics.kwargs]
 minval = [-0.1, -0.1, -0.1]
 maxval = [0.1, 0.1, 0.1]
+
+[env.randomizations.drone_pos]
+fn = "uniform"
+[env.randomizations.drone_pos.kwargs]
+minval = [-0.1, -0.1, 0.0]
+maxval = [0.1, 0.1, 0.02]
+
+[env.randomizations.drone_rpy]
+fn = "uniform"
+[env.randomizations.drone_rpy.kwargs]
+minval = [-0.1, -0.1, -0.1]
+maxval = [0.1, 0.1, 0.1]
+
+[env.randomizations.drone_mass]
+fn = "uniform"
+[env.randomizations.drone_mass.kwargs]
+minval = -0.005
+maxval = 0.005
+
+[env.randomizations.drone_inertia]
+fn = "uniform"
+[env.randomizations.drone_inertia.kwargs]
+minval = [-0.000001, -0.000001, -0.000001]
+maxval = [0.000001, 0.000001, 0.000001]
+
+[env.randomizations.gate_pos]
+fn = "uniform"
+[env.randomizations.gate_pos.kwargs]
+minval = [-0.05, -0.05, -0.1]
+maxval = [0.05, 0.05, 0.1]
+
+[env.randomizations.gate_rpy]
+fn = "uniform"
+[env.randomizations.gate_rpy.kwargs]
+minval = [-0.05, -0.1, -0.087]  # yaw: +/-5 deg (0.087 rad)
+maxval = [0.05, 0.1, 0.087]
+
+[env.randomizations.obstacle_pos]
+fn = "uniform"
+[env.randomizations.obstacle_pos.kwargs]
+minval = [-0.05, -0.05, -0.05]
+maxval = [0.05, 0.05, 0.05]

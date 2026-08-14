@@ -35,17 +35,17 @@ class RacingArgs(Args):
     layers any explicit ``--flag`` overrides on top via ``RacingArgs.create(**kwargs)``.
     """
 
-    total_timesteps: int = 800_000_000
+    total_timesteps: int = 500_000_000
     gamma: float = 0.99
     learning_rate: float = 3e-4
     target_kl: float = 0.03
     update_epochs: int = 4
     clip_coef: float = 0.2
     ent_coef: float = 0.008
-    anneal_ent_coef: bool = False  # decay entropy if True
+    anneal_ent_coef: bool = True  # decay entropy if True
     progress: tuple[str, float] = ("fancy", 5.0)  # Tuple of variant and coefficent
     progress_params: dict = field(default_factory=default_progress_params)
-    speed_coef: float = 0.05  # quadratic speed-hinge weight (0 disables); starting guess, tune
+    speed_coef: float = 0.0  # quadratic speed-hinge weight (0 disables); starting guess, tune
     speed_threshold: float = 2  # speed (m/s) above which the hinge penalizes; free below it
     d_act_coef: float = 0.000
     d_act_th_coef: float = 0.0005  # Coefficient for thrust change penalty (thrust smoothness)
@@ -385,7 +385,7 @@ def make_env(args: Args, config: dict = None) -> Any:
     )
     # Seed warm rotors on every (auto)reset so the drone starts in hover equilibrium instead of
     # falling with cold rotors.
-    env = SpinUpRotors(env)
+    #env = SpinUpRotors(env)
     env = ActionPenalty(
         env,
         act_coef=args.act_coef,
